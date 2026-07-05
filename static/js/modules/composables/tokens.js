@@ -9,7 +9,7 @@ const { ref, computed } = Vue;
 // UTC and rendered in the viewer's timezone instead of being mis-parsed as local.
 const parseServerInstant = (s) => {
     if (s == null) return new Date(NaN);
-    if (typeof s === 'string' && !/(?:Z|[+-]\d{2}:?\d{2})$/.test(s)) {
+    if (typeof s === 'string' && /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(s) && !/(?:Z|[+-]\d{2}:?\d{2})$/.test(s)) {
         s = s.replace(' ', 'T') + 'Z';
     }
     return new Date(s);

@@ -17,6 +17,8 @@ import os
 import re
 import json
 from datetime import datetime, date, timedelta
+
+from src.utils.dates import to_utc_naive
 from typing import Optional
 
 from flask import Blueprint, jsonify, request, current_app, send_file, redirect
@@ -1153,7 +1155,9 @@ def update_recording(recording_id):
     if 'meeting_date' in data:
         try:
             if data['meeting_date']:
-                recording.meeting_date = datetime.fromisoformat(data['meeting_date'].replace('Z', '+00:00'))
+                # meeting_date is stored as naive UTC (like created_at): convert
+                # zone-aware input to UTC before storing
+                recording.meeting_date = to_utc_naive(datetime.fromisoformat(data['meeting_date'].replace('Z', '+00:00')))
             else:
                 recording.meeting_date = None
             changed_fields.append('meeting_date')

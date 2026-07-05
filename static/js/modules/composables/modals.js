@@ -436,9 +436,23 @@ export function useModals(state, utils) {
         dateTimePickerTarget.value = target;
         dateTimePickerCallback.value = callback;
 
-        // Parse current value if exists
+        // Parse current value if exists. meeting_date is stored as naive UTC
+        // (same convention as created_at), so append 'Z' to naive datetime
+        // strings so the picker opens showing the viewer's LOCAL time — the
+        // same value the date chip displays (#320). Date-only values are
+        // parsed as local noon so the calendar date never shifts.
         if (currentValue) {
-            const date = new Date(currentValue);
+            let date;
+            if (typeof currentValue === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(currentValue)) {
+                const [y, m, d] = currentValue.split('-').map(Number);
+                date = new Date(y, m - 1, d, 12, 0, 0);
+            } else if (typeof currentValue === 'string'
+                       && /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(currentValue)
+                       && !/(?:Z|[+-]\d{2}:?\d{2})$/.test(currentValue)) {
+                date = new Date(currentValue.replace(' ', 'T') + 'Z');
+            } else {
+                date = new Date(currentValue);
+            }
             if (!isNaN(date.getTime())) {
                 pickerSelectedDate.value = date;
                 pickerMonth.value = date.getMonth();
@@ -571,7 +585,11 @@ export function useModals(state, utils) {
         date.setSeconds(0);
         date.setMilliseconds(0);
 
-        // Format as ISO string for storage (YYYY-MM-DDTHH:mm:ss)
+        // Convert the picked LOCAL time to a naive UTC ISO string
+        // (YYYY-MM-DDTHH:mm:ss) — the backend storage convention shared with
+        // created_at. The display side (parseServerInstant) converts it back
+        // to the viewer's timezone, so what the user picked is what they see,
+        // and repeated edits don't drift (#320).
         const isoString = date.toISOString().slice(0, 19);
 
         // Call the callback with the result

@@ -31,7 +31,7 @@ export function useSharing(state, utils) {
             // parsed as UTC; the toLocale* calls below then render it in the
             // viewer's own timezone.
             let normalized = dateString;
-            if (typeof normalized === 'string' && !/(?:Z|[+-]\d{2}:?\d{2})$/.test(normalized)) {
+            if (typeof normalized === 'string' && /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(normalized) && !/(?:Z|[+-]\d{2}:?\d{2})$/.test(normalized)) {
                 normalized = normalized.replace(' ', 'T') + 'Z';
             }
             const date = new Date(normalized);

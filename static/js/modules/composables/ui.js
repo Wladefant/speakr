@@ -296,45 +296,6 @@ export function useUI(state, utils, processedTranscription) {
         return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
     };
 
-    // Format display date. (Shadowed by app.modular.js's version; kept correct
-    // for INSTANT timestamps via parseServerInstant in case it's ever wired.)
-    const formatDisplayDate = (dateString) => {
-        if (!dateString) return '';
-        const date = utils.parseServerInstant(dateString);
-        return date.toLocaleDateString(undefined, {
-            year: 'numeric',
-            month: 'short',
-            day: 'numeric',
-            hour: '2-digit',
-            minute: '2-digit'
-        });
-    };
-
-    // Format short date
-    const formatShortDate = (dateString) => {
-        if (!dateString) return '';
-        const date = utils.parseServerInstant(dateString);
-        const now = new Date();
-        const diff = now - date;
-        const oneDay = 24 * 60 * 60 * 1000;
-
-        if (diff < oneDay) {
-            return date.toLocaleTimeString(undefined, {
-                hour: '2-digit',
-                minute: '2-digit'
-            });
-        } else if (diff < 7 * oneDay) {
-            return date.toLocaleDateString(undefined, {
-                weekday: 'short'
-            });
-        } else {
-            return date.toLocaleDateString(undefined, {
-                month: 'short',
-                day: 'numeric'
-            });
-        }
-    };
-
     // Format status
     const formatStatus = (status) => {
         if (!status || status === 'COMPLETED') return '';
@@ -2203,8 +2164,10 @@ export function useUI(state, utils, processedTranscription) {
         switchToRecordingView,
         setGlobalError,
         formatFileSize,
-        formatDisplayDate,
-        formatShortDate,
+        // formatDisplayDate / formatShortDate intentionally NOT exported: this
+        // composable is spread into the app scope AFTER app.modular.js's own
+        // versions, so exporting them here shadowed the calendar-aware
+        // implementations and made meeting_date render as a UTC instant (#320).
         formatStatus,
         getStatusClass,
         formatTime,

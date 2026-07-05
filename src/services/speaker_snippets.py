@@ -154,14 +154,24 @@ def _generate_dynamic_snippets(speaker_id, limit=3):
     if not speaker:
         return []
 
-    # Find recordings that have this speaker's name in transcription
-    # We'll look at the last 10 recordings and extract snippets from them
-    recordings = Recording.query.filter_by(user_id=speaker.user_id)\
+    # Find recordings whose transcription mentions this speaker's name.
+    # The name appears as a JSON string value in identified transcripts, so
+    # match its JSON-encoded form (both ascii-escaped and raw-unicode variants,
+    # since either may have been used when the transcript was saved).
+    base_query = Recording.query.filter_by(user_id=speaker.user_id)\
         .filter(Recording.transcription.isnot(None))\
         .filter(Recording.transcription != '')\
-        .filter(Recording.audio_deleted_at.is_(None))\
+        .filter(Recording.audio_deleted_at.is_(None))
+
+    name_variants = {json.dumps(speaker.name), json.dumps(speaker.name, ensure_ascii=False)}
+    recordings = base_query\
+        .filter(db.or_(*[Recording.transcription.contains(v) for v in name_variants]))\
         .order_by(Recording.created_at.desc())\
         .limit(10).all()
+
+    # Fall back to the most recent recordings if the name match found nothing
+    if not recordings:
+        recordings = base_query.order_by(Recording.created_at.desc()).limit(10).all()
 
     snippets = []
 

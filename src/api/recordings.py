@@ -11,7 +11,7 @@ import mimetypes
 import time
 import threading
 import subprocess
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from src.services.job_queue import job_queue
 from flask import Blueprint, render_template, request, redirect, url_for, flash, jsonify, send_file, Response, current_app, make_response
 from flask_login import login_required, current_user
@@ -73,6 +73,7 @@ def _resolve_transcription_model(value):
     default = SystemSetting.get_setting('transcription_default_model', None)
     return default or None
 from src.tasks.processing import format_transcription_for_llm, _resolve_timestamp_template_format
+from src.utils.dates import to_utc_naive
 from src.utils.ffmpeg_utils import FFmpegError, FFmpegNotFoundError
 from src.utils.titles import resolve_upload_title
 from src.services.speaker import update_speaker_usage, identify_unidentified_speakers_from_text
@@ -2006,9 +2007,11 @@ def save_metadata():
                 try:
                     date_str = data['meeting_date']
                     if date_str:
-                        # Try to parse as full ISO datetime first
+                        # Try to parse as full ISO datetime first. meeting_date is
+                        # stored as naive UTC (like created_at), so convert any
+                        # zone-aware input to UTC before storing.
                         try:
-                            recording.meeting_date = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+                            recording.meeting_date = to_utc_naive(datetime.fromisoformat(date_str.replace('Z', '+00:00')))
                         except (ValueError, AttributeError):
                             # Fall back to date-only format, preserve existing time if available
                             parsed_date = datetime.strptime(date_str, '%Y-%m-%d')
@@ -2663,8 +2666,9 @@ def upload_file():
         if user_meeting_date:
             try:
                 parsed = datetime.fromisoformat(user_meeting_date.replace('Z', '+00:00'))
-                # Strip timezone to store as naive datetime, consistent with other date sources
-                meeting_date = parsed.replace(tzinfo=None)
+                # meeting_date is stored as naive UTC: convert zone-aware input
+                # to UTC before stripping the timezone
+                meeting_date = to_utc_naive(parsed)
                 current_app.logger.info(f"Using user-provided meeting_date: {meeting_date}")
             except (ValueError, TypeError) as e:
                 current_app.logger.warning(f"Could not parse user meeting_date '{user_meeting_date}': {e}")
@@ -2672,16 +2676,19 @@ def upload_file():
         # Then try client-provided file lastModified (most reliable for uploads)
         if not meeting_date and file_last_modified:
             try:
-                # JavaScript lastModified is in milliseconds since epoch
+                # JavaScript lastModified is in milliseconds since epoch; convert
+                # to naive UTC (the storage convention) rather than server-local
+                # so the viewer's browser renders the file's original local time
+                # regardless of the server's timezone
                 timestamp_ms = int(file_last_modified)
-                meeting_date = datetime.fromtimestamp(timestamp_ms / 1000)
+                meeting_date = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc).replace(tzinfo=None)
                 current_app.logger.info(f"Using client file lastModified: {meeting_date}")
             except (ValueError, TypeError, OSError) as e:
                 current_app.logger.warning(f"Could not parse file_last_modified '{file_last_modified}': {e}")
 
         # Fall back to file metadata (creation_time, date tags, etc.)
         if not meeting_date:
-            meeting_date = get_creation_date(filepath, use_file_mtime=False)
+            meeting_date = to_utc_naive(get_creation_date(filepath, use_file_mtime=False))
             if meeting_date:
                 current_app.logger.info(f"Using file metadata creation date: {meeting_date}")
 

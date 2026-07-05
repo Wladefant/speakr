@@ -885,7 +885,13 @@
                     
                     const formatDate = (dateString) => {
                         if (!dateString) return '';
-                        const date = new Date(dateString);
+                        // meeting_date is naive UTC — parse via the instant
+                        // convention so the date renders in the viewer's timezone
+                        let s = dateString;
+                        if (typeof s === 'string' && /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(s) && !/(?:Z|[+-]\d{2}:?\d{2})$/.test(s)) {
+                            s = s.replace(' ', 'T') + 'Z';
+                        }
+                        const date = new Date(s);
                         return date.toLocaleDateString();
                     };
 
@@ -894,7 +900,7 @@
                     const formatInstant = (dateString) => {
                         if (!dateString) return '';
                         let s = dateString;
-                        if (typeof s === 'string' && !/(?:Z|[+-]\d{2}:?\d{2})$/.test(s)) {
+                        if (typeof s === 'string' && /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(s) && !/(?:Z|[+-]\d{2}:?\d{2})$/.test(s)) {
                             s = s.replace(' ', 'T') + 'Z';
                         }
                         const date = new Date(s);
