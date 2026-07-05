@@ -1388,8 +1388,8 @@
   },
   "sidebar": {
     "advancedSearch": "高级搜索",
+    "allRecordings": "所有录音",
     "archived": "已归档",
-    "shared": "已共享",
     "archivedRecordings": "已归档录音",
     "dateRange": "日期范围",
     "filters": "筛选器",
@@ -1400,10 +1400,14 @@
     "loadMore": "加载更多",
     "markAsRead": "标记为已读",
     "moveToInbox": "移至收件箱",
+    "needsSpeakers": "待标注发言人",
+    "needsSummary": "待生成摘要",
+    "needsTranscription": "待转录",
     "noRecordings": "没有录音",
     "older": "更早",
     "removeFromHighlighted": "取消标记",
     "searchRecordings": "搜索录音",
+    "shared": "已共享",
     "sharedWithMe": "分享给我",
     "sortBy": "排序方式",
     "sortByDate": "按日期排序",
@@ -1415,10 +1419,9 @@
     "today": "今天",
     "totalRecordings": "{{count}} 个录音",
     "totalRecordingsPlural": "{{count}} 个录音",
+    "unfiled": "未分类",
     "upcoming": "即将到来",
-    "yesterday": "昨天",
-    "allRecordings": "所有录音",
-    "unfiled": "未分类"
+    "yesterday": "昨天"
   },
   "speakers": {
     "filterBySpeaker": "按发言人筛选",

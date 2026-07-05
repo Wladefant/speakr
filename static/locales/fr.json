@@ -1388,6 +1388,7 @@
   },
   "sidebar": {
     "advancedSearch": "Recherche Avancée",
+    "allRecordings": "Tous les enregistrements",
     "archived": "Archivé",
     "archivedRecordings": "Enregistrements Archivés",
     "dateRange": "Plage de Dates",
@@ -1399,10 +1400,14 @@
     "loadMore": "Charger Plus",
     "markAsRead": "Marquer comme lu",
     "moveToInbox": "Déplacer vers la boîte de réception",
+    "needsSpeakers": "Orateurs à identifier",
+    "needsSummary": "Résumé manquant",
+    "needsTranscription": "Transcription manquante",
     "noRecordings": "Aucun enregistrement trouvé",
     "older": "Plus Ancien",
     "removeFromHighlighted": "Retirer des favoris",
     "searchRecordings": "Rechercher des enregistrements...",
+    "shared": "Partagé",
     "sharedWithMe": "Partagé avec Moi",
     "sortBy": "Trier Par",
     "sortByDate": "Date de Création",
@@ -1414,11 +1419,9 @@
     "today": "Aujourd'hui",
     "totalRecordings": "{{count}} enregistrement",
     "totalRecordingsPlural": "{{count}} enregistrements",
-    "upcoming": "À venir",
-    "yesterday": "Hier",
-    "allRecordings": "Tous les enregistrements",
     "unfiled": "Non classés",
-    "shared": "Partagé"
+    "upcoming": "À venir",
+    "yesterday": "Hier"
   },
   "speakers": {
     "filterBySpeaker": "Filtrer par intervenant",

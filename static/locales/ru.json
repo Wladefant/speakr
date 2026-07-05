@@ -1388,6 +1388,7 @@
   },
   "sidebar": {
     "advancedSearch": "Расширенный поиск",
+    "allRecordings": "Все записи",
     "archived": "Архивировано",
     "archivedRecordings": "Архивные записи",
     "dateRange": "Диапазон дат",
@@ -1399,10 +1400,14 @@
     "loadMore": "Загрузить ещё",
     "markAsRead": "Отметить как прочитанное",
     "moveToInbox": "Переместить во входящие",
+    "needsSpeakers": "Нужны спикеры",
+    "needsSummary": "Нужно резюме",
+    "needsTranscription": "Нужна транскрипция",
     "noRecordings": "Записей не найдено",
     "older": "Более старые",
     "removeFromHighlighted": "Убрать из избранного",
     "searchRecordings": "Поиск записей...",
+    "shared": "Общий",
     "sharedWithMe": "Доступные мне",
     "sortBy": "Сортировать по",
     "sortByDate": "Дата создания",
@@ -1414,11 +1419,9 @@
     "today": "Сегодня",
     "totalRecordings": "{{count}} запись",
     "totalRecordingsPlural": "{{count}} записей",
-    "upcoming": "Предстоящие",
-    "yesterday": "Вчера",
-    "allRecordings": "Все записи",
     "unfiled": "Без папки",
-    "shared": "Общий"
+    "upcoming": "Предстоящие",
+    "yesterday": "Вчера"
   },
   "speakers": {
     "filterBySpeaker": "Фильтр по спикеру",

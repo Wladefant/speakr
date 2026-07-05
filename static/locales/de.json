@@ -1388,8 +1388,8 @@
   },
   "sidebar": {
     "advancedSearch": "Erweiterte Suche",
+    "allRecordings": "Alle Aufnahmen",
     "archived": "Archiviert",
-    "shared": "Geteilt",
     "archivedRecordings": "Archivierte Aufnahmen",
     "dateRange": "Datumsbereich",
     "filters": "Filter",
@@ -1400,10 +1400,14 @@
     "loadMore": "Mehr laden",
     "markAsRead": "Als gelesen markieren",
     "moveToInbox": "In Posteingang verschieben",
+    "needsSpeakers": "Sprecher fehlen",
+    "needsSummary": "Zusammenfassung fehlt",
+    "needsTranscription": "Transkription fehlt",
     "noRecordings": "Keine Aufnahmen gefunden",
     "older": "Älter",
     "removeFromHighlighted": "Von Favoriten entfernen",
     "searchRecordings": "Aufnahmen suchen...",
+    "shared": "Geteilt",
     "sharedWithMe": "Mit mir geteilt",
     "sortBy": "Sortieren nach",
     "sortByDate": "Erstellungsdatum",
@@ -1415,10 +1419,9 @@
     "today": "Heute",
     "totalRecordings": "{{count}} Aufnahme",
     "totalRecordingsPlural": "{{count}} Aufnahmen",
+    "unfiled": "Nicht zugeordnet",
     "upcoming": "Bevorstehend",
-    "yesterday": "Gestern",
-    "allRecordings": "Alle Aufnahmen",
-    "unfiled": "Nicht zugeordnet"
+    "yesterday": "Gestern"
   },
   "speakers": {
     "filterBySpeaker": "Nach Sprecher filtern",
