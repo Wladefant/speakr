@@ -474,6 +474,17 @@ def exempt_status_endpoints():
     # Exempt job queue status polling (polled every 5-30 seconds during processing)
     if request.path == '/api/recordings/job-queue-status' and request.method == 'GET':
         return True
+    # Exempt server-side recording-session endpoints (#287). These are the
+    # RECOMMENDED path for multi-hour recordings, which stream one chunk every
+    # few seconds — at the default 5s cadence a recording emits ~720 chunks/hour,
+    # and the global IP limit (1000/hour, 5000/day) is shared with all the
+    # user's other requests, so a long session would otherwise start getting
+    # 429'd partway through and lose its streaming guarantee. The endpoints are
+    # login-protected, ownership-checked, and already bounded per user by
+    # RECORDING_SESSION_MAX_BYTES_PER_USER / RECORDING_SESSION_MAX_CHUNK_BYTES,
+    # so IP-based rate limiting is the wrong control here.
+    if request.path.startswith('/upload/session'):
+        return True
     return False
 
 csrf = CSRFProtect(app)

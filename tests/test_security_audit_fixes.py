@@ -216,6 +216,28 @@ def test_webhook_delivery_allows_public_host():
             assert error is None
 
 
+# ---------------------------------------------------------------------------
+# Long recordings must not be throttled by the global IP rate limit
+# ---------------------------------------------------------------------------
+
+
+def test_recording_session_chunk_uploads_are_rate_limit_exempt():
+    """The server-side recording-session endpoints (the recommended path for
+    multi-hour recordings) must be exempt from the global IP rate limit, or a
+    long session's ~720 chunks/hour would start getting 429'd partway through."""
+    from src.app import exempt_status_endpoints
+
+    chunk_path = "/upload/session/2b6a-uuid/chunks/842"
+    finalize_path = "/upload/session/2b6a-uuid/finalize"
+    with app.test_request_context(chunk_path, method="POST"):
+        assert exempt_status_endpoints() is True
+    with app.test_request_context(finalize_path, method="POST"):
+        assert exempt_status_endpoints() is True
+    # A regular (non-session) endpoint must NOT be blanket-exempted.
+    with app.test_request_context("/api/recordings", method="GET"):
+        assert exempt_status_endpoints() is not True
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
