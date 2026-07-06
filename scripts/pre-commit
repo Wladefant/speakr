@@ -36,9 +36,13 @@ fi
 if echo "$STAGED_FILES" | grep -qE '^(README\.md|VERSION)$'; then
     if [ -f README.md ] && [ -f VERSION ]; then
         # Extract version from README badge. Accepts X.Y.Z or X.Y.Z-suffix.
+        # A literal dash in the version (e.g. the "-alpha" suffix) is escaped
+        # as "--" in the shields.io badge so the badge renders instead of
+        # 404ing; collapse it back to a single dash for the VERSION file.
         README_VER=$(grep -oE 'shields\.io/badge/version-[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.-]*-[a-z]+\.svg' README.md \
             | head -1 \
-            | sed -E 's|shields\.io/badge/version-([0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.-]*)-[a-z]+\.svg|\1|')
+            | sed -E 's|shields\.io/badge/version-([0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.-]*)-[a-z]+\.svg|\1|' \
+            | sed 's|--|-|g')
 
         if [ -z "$README_VER" ]; then
             echo "Version-sync skipped: could not parse version from README badge."
