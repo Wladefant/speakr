@@ -6,10 +6,10 @@ Speakr is a powerful self-hosted transcription platform that helps you capture, 
   <img src="assets/images/screenshots/main-view-video.png" alt="Main Interface" style="border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
 </div>
 
-!!! success "Latest Release: v0.9.4-alpha — Transcription templates, timestamp toggles, and sharing privacy"
-    Transcription templates bundle a reusable initial prompt and hotwords, summarization and chat gain independent per-line timestamp toggles, and recipients of a shared recording now see only the tag or folder that granted them access. Failed uploads retry automatically across all browsers, recordings are reachable by direct `/recordings/<id>` links, and an opt-in prefix-cache prompt layout (with admin-visible cache reads) speeds up self-hosted backends.
+!!! success "Latest Release: v0.9.5-alpha — AssemblyAI connector, video capture, and recording filters"
+    AssemblyAI is now a built-in transcription connector, the System Audio and Mic + System recording modes can optionally record the shared tab, window, or screen as video (when video retention is enabled), and the sidebar gains filters for recordings that still need transcription, a summary, or speaker identification. This release also fixes speaker-page dates and voice samples, stops meeting dates drifting on each edit, restores length and seeking in the pre-upload review, and adds a round of security hardening (enforced auth rate limits, an access check on bulk toggle, webhook delivery re-validation, and bounded FFmpeg timeouts).
 
-    See the [full release notes](https://github.com/murtaza-nasir/speakr/releases/tag/v0.9.4-alpha) for details. Backwards compatible; database migrations run automatically on startup.
+    See the [full release notes](https://github.com/murtaza-nasir/speakr/releases/tag/v0.9.5-alpha) for details. Backwards compatible; database migrations run automatically on startup.
 
 ## Quick Navigation
 
@@ -127,6 +127,17 @@ Learn more about [audio synchronization features](user-guide/transcripts.md#audi
     Tags aren't just for organization - they transform content. Create a "Recipe" tag to convert cooking narration into formatted recipes. Use "Study Notes" tags to turn lecture recordings into organized outlines. Stack tags like "Client Meeting" + "Legal Review" for combined analysis. Learn more in the [Custom Prompts guide](admin-guide/prompts.md#creative-tag-prompt-use-cases).
 
 ## Latest Updates
+
+!!! info "Version 0.9.5-alpha - AssemblyAI connector, video capture, and recording filters"
+    A feature and hardening release. Backwards compatible; database migrations run automatically on startup.
+
+    - **AssemblyAI connector (#96)** - A built-in cloud transcription provider that diarizes and handles multi-hour files in a single job. Set `TRANSCRIPTION_CONNECTOR=assemblyai` and a key; hotwords and speaker hints are mapped through, and it uses its own base URL and model settings.
+    - **Tab / window / screen video capture (#303)** - With video retention enabled, the System Audio and Mic + System recording modes can also record the shared surface as video that plays back alongside the transcript. Transcription still uses only the audio.
+    - **Recording filters (#317)** - Sidebar toggles for recordings that still need transcription, a summary, or speaker identification, including ones whose processing failed. Contributed by @fxfitz.
+    - **Date and review fixes (#319, #320)** - The speaker page no longer shows invalid dates or empty voice samples, meeting dates stop drifting on each edit, and the pre-upload recording review shows the correct length and allows seeking.
+    - **Security and reliability** - Authentication rate limits are now enforced, the bulk toggle is access-checked, webhook delivery re-validates its target against DNS rebinding, FFmpeg work is bounded by a timeout, and long recording sessions are exempt from rate limiting.
+
+    Recommended for all deployments, especially any that accept uploads from untrusted users. See the [full release notes](https://github.com/murtaza-nasir/speakr/releases/tag/v0.9.5-alpha).
 
 !!! info "Version 0.9.4-alpha - Transcription templates, timestamp toggles, and sharing privacy"
     A feature release. Backwards compatible; database migrations run automatically on startup.

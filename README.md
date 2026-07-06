@@ -9,7 +9,7 @@
   <a href="https://www.gnu.org/licenses/agpl-3.0"><img alt="AGPL v3" src="https://img.shields.io/badge/License-AGPL_v3-blue.svg"></a>
   <a href="https://github.com/murtaza-nasir/speakr/actions/workflows/docker-publish.yml"><img alt="Docker Build" src="https://github.com/murtaza-nasir/speakr/actions/workflows/docker-publish.yml/badge.svg"></a>
   <a href="https://hub.docker.com/r/learnedmachine/speakr"><img alt="Docker Pulls" src="https://img.shields.io/docker/pulls/learnedmachine/speakr"></a>
-  <a href="https://github.com/murtaza-nasir/speakr/releases/latest"><img alt="Latest Version" src="https://img.shields.io/badge/version-0.9.4-alpha-brightgreen.svg"></a>
+  <a href="https://github.com/murtaza-nasir/speakr/releases/latest"><img alt="Latest Version" src="https://img.shields.io/badge/version-0.9.5-alpha-brightgreen.svg"></a>
 </p>
 
 <p align="center">
@@ -201,7 +201,11 @@ Complete documentation is available at **[murtaza-nasir.github.io/speakr](https:
 - [Troubleshooting](https://murtaza-nasir.github.io/speakr/troubleshooting) - Common issues and solutions
 - [FAQ](https://murtaza-nasir.github.io/speakr/faq) - Frequently asked questions
 
-## Latest Release (v0.9.4-alpha)
+## Latest Release (v0.9.5-alpha)
+
+**Adds a cloud transcription provider, in-app video capture, and recording filters, with a round of security and reliability hardening.** AssemblyAI is now a built-in transcription connector that diarizes and handles multi-hour files in a single job. When video retention is enabled, the System Audio and Mic + System recording modes can also record the shared tab, window, or screen as video that plays back alongside the transcript. The sidebar gains filters for recordings that still need transcription, a summary, or speaker identification (contributed by @fxfitz). This release also fixes the speaker page's invalid dates and missing voice samples, stops meeting dates from drifting on each edit, restores length and seeking in the pre-upload recording review, and exempts long recording sessions from rate limiting. On the security side, authentication rate limits are now actually enforced, the bulk inbox/highlight toggle is access-checked, webhook delivery re-validates its target against DNS rebinding, and all FFmpeg work is bounded by a timeout. **Full release notes on the [GitHub release page](https://github.com/murtaza-nasir/speakr/releases/tag/v0.9.5-alpha).**
+
+### v0.9.4-alpha (previous release)
 
 **A feature release focused on transcription control, sharing privacy, and upload reliability.** Transcription templates now bundle an initial prompt and hotwords that you save once and reuse from the upload modal, tags, folders, or your account default. Summarization and chat each gain an independent toggle for making per-line timestamps available to the model, so the AI can reference moments in long recordings. Recipients of a shared recording now see only the tag or folder that granted them access, never the owner's other labels. Failed uploads retry themselves automatically across all browsers, and any recording is reachable by a direct `/recordings/<id>` link. For self-hosted text backends with prefix caching, an opt-in option reshapes the title and summary prompts to reuse the transcript prefix, and the admin dashboard now reports prompt-cache reads so the saving is visible. This option stays off by default for now and may become the default in a future release. **Full release notes on the [GitHub release page](https://github.com/murtaza-nasir/speakr/releases/tag/v0.9.4-alpha).**
 
