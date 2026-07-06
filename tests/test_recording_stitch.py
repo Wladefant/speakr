@@ -469,6 +469,92 @@ def test_stitch_probe_overrides_client_claimed_mime():
     shutil.rmtree(upload_folder, ignore_errors=True)
 
 
+@_needs_webm
+def test_stitch_applies_review_pane_tags_and_tag_defaults():
+    """Tags picked in the recorder's Upload Settings panel arrive in the
+    finalize metadata; the stitch must create the RecordingTag associations
+    and resolve the first tag's ASR defaults into the transcribe metadata
+    (they were previously dropped)."""
+    from src.models import Tag, RecordingTag
+
+    upload_folder = tempfile.mkdtemp(prefix="speakr-stitch-tags-")
+    with app.app_context():
+        app.config["UPLOAD_FOLDER"] = upload_folder
+        user = _make_user()
+        tag = Tag(name=f"stitch-tag-{uuid.uuid4().hex[:6]}", user_id=user.id,
+                  default_language="de", default_hotwords="Speakr, WhisperX")
+        db.session.add(tag)
+        db.session.commit()
+
+        recording, session, sess_dir = _plant_session(upload_folder, user, 'audio/webm', chunk_count=2)
+        session.finalize_metadata = json.dumps({
+            "tags": [{"id": tag.id, "name": tag.name}],
+            "language": None,
+        })
+        db.session.commit()
+
+        src = os.path.join(upload_folder, 'src.webm')
+        _generate_webm(src, duration_seconds=3)
+        _split_into_chunks(src, sess_dir, n_parts=2)
+        os.remove(src)
+
+        recording_id, media_path, metadata = stitch_recording_session(session.id)
+
+        assoc = RecordingTag.query.filter_by(recording_id=recording_id, tag_id=tag.id).first()
+        assert assoc is not None, "review-pane tag was not attached to the recording"
+        assert metadata.get('language') == 'de', "first tag's default language not resolved"
+        assert metadata.get('hotwords') == 'Speakr, WhisperX'
+        assert metadata.get('tag_id') == tag.id
+
+        os.remove(media_path)
+        db.session.delete(assoc)
+        db.session.delete(db.session.get(RecordingSession, session.id))
+        db.session.delete(db.session.get(Recording, recording_id))
+        db.session.delete(tag)
+        db.session.delete(user)
+        db.session.commit()
+    shutil.rmtree(upload_folder, ignore_errors=True)
+
+
+@_needs_webm
+def test_stitch_skips_foreign_tags():
+    """A tag id belonging to another user in the finalize metadata must NOT
+    be attached (ownership check mirrors upload_file)."""
+    from src.models import Tag, RecordingTag
+
+    upload_folder = tempfile.mkdtemp(prefix="speakr-stitch-foreigntag-")
+    with app.app_context():
+        app.config["UPLOAD_FOLDER"] = upload_folder
+        user = _make_user()
+        other = _make_user()
+        foreign_tag = Tag(name=f"foreign-{uuid.uuid4().hex[:6]}", user_id=other.id)
+        db.session.add(foreign_tag)
+        db.session.commit()
+
+        recording, session, sess_dir = _plant_session(upload_folder, user, 'audio/webm', chunk_count=1)
+        session.finalize_metadata = json.dumps({"tags": [{"id": foreign_tag.id}]})
+        db.session.commit()
+
+        src = os.path.join(upload_folder, 'src.webm')
+        _generate_webm(src, duration_seconds=3)
+        _split_into_chunks(src, sess_dir, n_parts=1)
+        os.remove(src)
+
+        recording_id, media_path, metadata = stitch_recording_session(session.id)
+
+        assert RecordingTag.query.filter_by(recording_id=recording_id).count() == 0
+        assert metadata.get('tag_id') is None
+
+        os.remove(media_path)
+        db.session.delete(db.session.get(RecordingSession, session.id))
+        db.session.delete(db.session.get(Recording, recording_id))
+        db.session.delete(foreign_tag)
+        db.session.delete(other)
+        db.session.delete(user)
+        db.session.commit()
+    shutil.rmtree(upload_folder, ignore_errors=True)
+
+
 def test_stitch_raises_when_no_chunks_on_disk():
     upload_folder = tempfile.mkdtemp(prefix="speakr-stitch-nochunks-")
     with app.app_context():

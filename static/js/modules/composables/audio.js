@@ -119,6 +119,33 @@ export function useAudio(state, utils) {
         }
     }
 
+    // Fix duration/seeking on the finished-recording review players.
+    //
+    // A raw MediaRecorder blob is a "live" container: no duration metadata
+    // and no seek index, so <audio>/<video> report duration=Infinity — the
+    // length doesn't display and the seek bar is dead. (The server-side
+    // stitch fixes this for the STORED file with an ffmpeg remux pass; this
+    // is the client-side equivalent for the pre-upload review.) The standard
+    // fix: seek far past the end, which forces the browser to scan the
+    // stream, compute the real duration, and build its seek index; then snap
+    // back to the start. Wired to @loadedmetadata on both review players.
+    const normalizeLiveMediaDuration = (event) => {
+        const el = event && event.target;
+        if (!el || Number.isFinite(el.duration)) return;
+        const restore = () => {
+            el.removeEventListener('timeupdate', restore);
+            el.removeEventListener('seeked', restore);
+            if (el.currentTime > 0) el.currentTime = 0;
+        };
+        el.addEventListener('timeupdate', restore);
+        el.addEventListener('seeked', restore);
+        try {
+            el.currentTime = Number.MAX_SAFE_INTEGER;
+        } catch (_) {
+            restore();
+        }
+    };
+
     // Detach the live stream from the preview element (called on stop — the
     // tracks are ended at that point). recordingVideoActive stays true so the
     // finished-recording review pane knows to render a <video> player for the
@@ -1350,6 +1377,7 @@ export function useAudio(state, utils) {
         startRecording,
         stopRecording,
         discardRecording,
+        normalizeLiveMediaDuration,
         uploadRecordedAudio,
         uploadRecordedAudioIncognito,
         acceptRecordingDisclaimer,

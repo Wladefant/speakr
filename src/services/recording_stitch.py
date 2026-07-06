@@ -221,6 +221,81 @@ def _assemble_session_audio(chunk_paths: list, output_path: str, mime_type: str)
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+def _apply_finalize_metadata(recording, metadata):
+    """Attach the tags picked in the recorder's Upload Settings panel and
+    resolve tag/folder ASR-option defaults, mirroring ``upload_file``.
+
+    The finalize metadata carries ``tags`` (the tag objects selected in the
+    review pane), but the stitch path historically dropped them — tags chosen
+    before clicking Upload were silently lost. This creates the RecordingTag
+    associations (ownership-checked, order preserved) and fills any ASR
+    options the user left blank from the first tag's defaults, falling back
+    to the folder's defaults when no tags are selected — the same precedence
+    chain as a drag-drop upload. Mutates and returns ``metadata`` so the
+    transcribe kickoff sees the resolved options.
+    """
+    from src.models import Tag, RecordingTag
+    from src.models.organization import Folder, GroupMembership
+
+    raw_tags = metadata.get('tags') or []
+    tag_ids = []
+    for entry in raw_tags:
+        tid = entry.get('id') if isinstance(entry, dict) else entry
+        try:
+            tag_ids.append(int(tid))
+        except (TypeError, ValueError):
+            continue
+
+    selected_tags = []
+    for order, tid in enumerate(tag_ids, 1):
+        tag = db.session.get(Tag, tid)
+        if not tag:
+            continue
+        allowed = tag.user_id == recording.user_id or (
+            tag.group_id
+            and GroupMembership.query.filter_by(
+                group_id=tag.group_id, user_id=recording.user_id).first()
+        )
+        if not allowed:
+            logger.warning(
+                f"Skipping tag {tid} on recording {recording.id}: "
+                f"user {recording.user_id} has no access")
+            continue
+        if RecordingTag.query.filter_by(recording_id=recording.id, tag_id=tag.id).first():
+            selected_tags.append(tag)
+            continue
+        db.session.add(RecordingTag(
+            recording_id=recording.id,
+            tag_id=tag.id,
+            order=order,
+            added_at=datetime.utcnow(),
+        ))
+        selected_tags.append(tag)
+
+    first_tag = selected_tags[0] if selected_tags else None
+    folder = db.session.get(Folder, recording.folder_id) if recording.folder_id else None
+
+    def fill(key, attr):
+        if metadata.get(key):
+            return
+        if first_tag and getattr(first_tag, attr, None):
+            metadata[key] = getattr(first_tag, attr)
+        elif not selected_tags and folder and getattr(folder, attr, None):
+            metadata[key] = getattr(folder, attr)
+
+    fill('language', 'default_language')
+    fill('min_speakers', 'default_min_speakers')
+    fill('max_speakers', 'default_max_speakers')
+    fill('hotwords', 'default_hotwords')
+    fill('initial_prompt', 'default_initial_prompt')
+    fill('transcription_model', 'default_transcription_model')
+
+    if first_tag is not None:
+        metadata['tag_id'] = first_tag.id
+
+    return metadata
+
+
 def stitch_recording_session(session_id: str) -> Tuple[int, str]:
     """Stitch a session's chunks into a final audio file.
 
@@ -318,6 +393,10 @@ def stitch_recording_session(session_id: str) -> Tuple[int, str]:
     if not recording.meeting_date:
         recording.meeting_date = session.created_at
 
+    # Attach the tags picked in the review pane and resolve tag/folder
+    # ASR-option defaults into the metadata (same precedence as upload_file).
+    metadata = _apply_finalize_metadata(recording, metadata)
+
     session.status = 'finalized'
     session.finalized_at = datetime.utcnow()
     session.last_seen_at = datetime.utcnow()
@@ -354,6 +433,7 @@ def kickoff_transcription_for_stitched(
             'language': metadata.get('language') or metadata.get('asr_language'),
             'min_speakers': metadata.get('min_speakers'),
             'max_speakers': metadata.get('max_speakers'),
+            'tag_id': metadata.get('tag_id'),
             'hotwords': metadata.get('hotwords'),
             'initial_prompt': metadata.get('initial_prompt'),
             'transcription_model': metadata.get('transcription_model'),

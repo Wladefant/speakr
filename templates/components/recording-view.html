@@ -43,10 +43,12 @@
                      recordings keep the compact audio bar. -->
                 <div v-if="recordingVideoActive" class="max-w-2xl mx-auto">
                     <video :src="audioBlobURL" controls playsinline
+                           @loadedmetadata="normalizeLiveMediaDuration"
                            class="w-full max-h-64 md:max-h-80 rounded-lg bg-black object-contain"></video>
                 </div>
                 <div v-else class="audio-player-container">
-                    <audio :src="audioBlobURL" controls class="w-full">
+                    <audio :src="audioBlobURL" controls class="w-full"
+                           @loadedmetadata="normalizeLiveMediaDuration">
                         Your browser does not support the audio element.
                     </audio>
                 </div>
