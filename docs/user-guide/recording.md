@@ -43,6 +43,15 @@ Captures audio playing through your computer (or a specific browser tab) via the
 
 Records both your microphone AND system audio simultaneously, mixed into a single synchronized track. The recommended mode for online meetings where you're an active participant — it captures both sides of the conversation. Same share dialog as System Audio Recording, with the same Share system audio checkbox requirement.
 
+### Recording the Video Too (optional)
+
+When the server has video retention enabled (`VIDEO_RETENTION=true`), the two display-capture modes gain an **Also record video** checkbox under the recording buttons. With it ticked, Speakr keeps the shared tab, window, or screen as a video recording alongside the audio — useful for capturing screen shares in meetings without a separate screen recorder.
+
+- The recording view shows a live preview of the captured surface while recording, and the finished recording plays back with the docked video player (the same one used for uploaded video files).
+- Transcription always uses only the audio track; the video changes nothing about transcripts, summaries, or chat.
+- Video capture follows the same platform rules as system audio: whatever surface your browser lets you share (and deliver audio from) is what gets recorded. The choice persists across sessions.
+- Screen video is captured at a capped bitrate (2500 kbps by default, admin-tunable via `RECORDING_VIDEO_KBPS`), so an hour of capture is roughly 1 GB. Long video recordings work best with [server-side recording sessions](../admin-guide/recording-sessions.md) enabled.
+
 ## Platform Support Matrix
 
 The browser's `getDisplayMedia` API gates what system-audio capture modes actually work. Speakr detects your OS and browser and shows platform-aware hints inline, but the matrix is summarized here:

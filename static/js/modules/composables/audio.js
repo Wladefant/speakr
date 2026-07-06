@@ -14,6 +14,7 @@ export function useAudio(state, utils) {
         estimatedFileSize, actualBitrate, recordingNotes, recordingQuality,
         maxRecordingMB, fileSizeWarningShown, sizeCheckInterval, recordingDisclaimer,
         showRecordingDisclaimerModal, pendingRecordingMode, currentView, showUploadModal, showSystemAudioHelp, disableAudioProcessing,
+        recordSystemVideo, recordingVideoActive, videoRetentionEnabled,
         selectedMicDeviceId, selectedSecondaryDeviceId,
         isDarkMode, wakeLock, animationFrameId,
         activeStreams, visualizer, micVisualizer, systemVisualizer, canRecordAudio,
@@ -51,6 +52,11 @@ export function useAudio(state, utils) {
     let serverSessionUploader = null;
     let serverSessionMimeType = 'audio/webm';
     let serverSessionLastError = null;
+    // Mime type of the recording currently in memory (set at start, restored
+    // from IndexedDB metadata on crash recovery). The legacy single-shot
+    // upload path uses it to build the File with the right container type and
+    // extension — a video capture must not be uploaded as `audio/webm`.
+    let currentRecordingMimeType = 'audio/webm';
 
     function _serverRecordingChunksEnabled() {
         const el = document.getElementById('app');
@@ -72,6 +78,59 @@ export function useAudio(state, utils) {
         serverSessionId = null;
         serverSessionUploader = null;
         serverSessionLastError = null;
+    }
+
+    // Pick the best MediaRecorder container for the capture. Video captures
+    // prefer WebM (VP9 then VP8, both with Opus) because Chromium — the only
+    // engine that can share tab/system audio — muxes it natively; video/mp4
+    // is the Safari-family fallback. Audio captures keep the existing
+    // audio/webm;codecs=opus preference.
+    function _pickRecorderMime(wantsVideo) {
+        const candidates = wantsVideo
+            ? ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4']
+            : ['audio/webm;codecs=opus', 'audio/webm'];
+        for (const c of candidates) {
+            if (MediaRecorder.isTypeSupported(c)) return c;
+        }
+        return wantsVideo ? null : 'audio/webm';
+    }
+
+    // Video bitrate cap for tab/screen captures, from the page dataset
+    // (RECORDING_VIDEO_KBPS, default 2500). Screen content compresses well;
+    // 2.5 Mbps keeps an hour of capture near 1 GB instead of browser-default
+    // rates that can triple that.
+    function _videoBitsPerSecond() {
+        const el = document.getElementById('app');
+        const raw = el && el.dataset ? el.dataset.recordingVideoKbps : '';
+        const kbps = parseInt(raw, 10);
+        return (Number.isFinite(kbps) && kbps >= 100 && kbps <= 50000 ? kbps : 2500) * 1000;
+    }
+
+    // Attach the live display stream to the recording view's preview element.
+    // The <video> renders after currentView flips to 'recording', so retry
+    // briefly until it exists.
+    function _attachVideoPreview(stream, attempt = 0) {
+        const el = document.getElementById('recordingVideoPreview');
+        if (el) {
+            el.srcObject = stream;
+            el.play().catch(() => {});
+        } else if (attempt < 20) {
+            setTimeout(() => _attachVideoPreview(stream, attempt + 1), 100);
+        }
+    }
+
+    // Detach the live stream from the preview element (called on stop — the
+    // tracks are ended at that point). recordingVideoActive stays true so the
+    // finished-recording review pane knows to render a <video> player for the
+    // blob instead of the audio bar; it resets on discard/upload.
+    function _detachVideoPreview() {
+        const el = document.getElementById('recordingVideoPreview');
+        if (el) el.srcObject = null;
+    }
+
+    function _clearVideoPreview() {
+        _detachVideoPreview();
+        if (recordingVideoActive) recordingVideoActive.value = false;
     }
 
     // iOS detection
@@ -276,6 +335,7 @@ export function useAudio(state, utils) {
     const startRecordingInternal = async (mode, resumeContext = null) => {
         try {
             recordingMode.value = mode;
+            recordingVideoActive.value = false;
             audioChunks.value = [];
             // On resume, continue the on-screen timer and size estimate from
             // where the prior segment left off so both reflect the WHOLE
@@ -290,6 +350,16 @@ export function useAudio(state, utils) {
 
             let stream;
             let combinedStream;
+            // Opt-in tab/window/screen video capture (#303): only meaningful
+            // for the display-capture modes, and only when the server keeps
+            // video streams (VIDEO_RETENTION) — otherwise the pipeline would
+            // strip the video right back out at transcription time.
+            const wantsVideo = (mode === 'system' || mode === 'both')
+                && !!(recordSystemVideo && recordSystemVideo.value)
+                && !!(videoRetentionEnabled && videoRetentionEnabled.value);
+            // The display video track we keep for the recorder (null when the
+            // user did not opt in, or no video mime is supported).
+            let capturedVideoTrack = null;
 
             if (mode === 'microphone') {
                 if (!canRecordAudio.value) {
@@ -431,13 +501,22 @@ export function useAudio(state, utils) {
                     );
                 }
 
-                // Stop video track
-                stream.getVideoTracks().forEach(track => track.stop());
-                stream = new MediaStream([audioTrack]);
+                // Keep the display video track when the user opted into video
+                // capture; otherwise stop it immediately as before.
+                if (wantsVideo && stream.getVideoTracks().length > 0) {
+                    capturedVideoTrack = stream.getVideoTracks()[0];
+                    stream.getVideoTracks().slice(1).forEach(track => track.stop());
+                } else {
+                    stream.getVideoTracks().forEach(track => track.stop());
+                }
+                const audioOnlyStream = new MediaStream([audioTrack]);
+                stream = capturedVideoTrack
+                    ? new MediaStream([capturedVideoTrack, audioTrack])
+                    : audioOnlyStream;
                 activeStreams.value = [stream];
 
                 audioContext.value = new (window.AudioContext || window.webkitAudioContext)();
-                const source = audioContext.value.createMediaStreamSource(stream);
+                const source = audioContext.value.createMediaStreamSource(audioOnlyStream);
                 analyser.value = audioContext.value.createAnalyser();
                 analyser.value.fftSize = 256;
                 source.connect(analyser.value);
@@ -491,8 +570,14 @@ export function useAudio(state, utils) {
                     );
                 }
 
-                // Stop video tracks
-                displayStream.getVideoTracks().forEach(track => track.stop());
+                // Keep the display video track when the user opted into video
+                // capture; otherwise stop the video tracks as before.
+                if (wantsVideo && displayStream.getVideoTracks().length > 0) {
+                    capturedVideoTrack = displayStream.getVideoTracks()[0];
+                    displayStream.getVideoTracks().slice(1).forEach(track => track.stop());
+                } else {
+                    displayStream.getVideoTracks().forEach(track => track.stop());
+                }
 
                 // Create audio context and combine streams
                 audioContext.value = new (window.AudioContext || window.webkitAudioContext)();
@@ -514,15 +599,42 @@ export function useAudio(state, utils) {
 
                 combinedStream = destination.stream;
                 activeStreams.value = [micStream, displayStream];
-                stream = combinedStream;
+                // With video capture on, the recorder consumes the display
+                // video track plus the Web-Audio mixed mic+system track.
+                stream = capturedVideoTrack
+                    ? new MediaStream([capturedVideoTrack, ...combinedStream.getAudioTracks()])
+                    : combinedStream;
             }
 
-            // Determine best mime type
-            const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-                ? 'audio/webm;codecs=opus'
-                : 'audio/webm';
+            // Determine best mime type. A video capture needs a video
+            // container; if the browser can't mux one, fall back to
+            // audio-only rather than failing the recording.
+            let mimeType = _pickRecorderMime(!!capturedVideoTrack);
+            if (capturedVideoTrack && !mimeType) {
+                console.warn('[Recording] No supported video container; falling back to audio-only');
+                showToast(
+                    (utils.t && utils.t('toasts.videoRecordingUnsupported'))
+                        || 'This browser cannot record video — capturing audio only.',
+                    'fa-exclamation-triangle'
+                );
+                capturedVideoTrack.stop();
+                capturedVideoTrack = null;
+                stream = new MediaStream(stream.getAudioTracks());
+                mimeType = _pickRecorderMime(false);
+            }
+            currentRecordingMimeType = mimeType;
 
-            const recorder = new MediaRecorder(stream, { mimeType });
+            const recorderOptions = { mimeType };
+            if (capturedVideoTrack) {
+                recorderOptions.videoBitsPerSecond = _videoBitsPerSecond();
+            }
+            const recorder = new MediaRecorder(stream, recorderOptions);
+
+            // Live preview of the captured surface in the recording view.
+            if (capturedVideoTrack) {
+                recordingVideoActive.value = true;
+                _attachVideoPreview(new MediaStream([capturedVideoTrack]));
+            }
 
             // Start IndexedDB recording session - convert Vue reactive objects to plain objects
             try {
@@ -699,6 +811,7 @@ export function useAudio(state, utils) {
         if (mediaRecorder.value && isRecording.value) {
             mediaRecorder.value.stop();
             isRecording.value = false;
+            _detachVideoPreview();
 
             // Clear the recording timer
             if (recordingInterval.value) {
@@ -792,6 +905,7 @@ export function useAudio(state, utils) {
                 await hideRecordingNotification();
                 try { await RecordingDB.clearRecordingSession(); } catch (_) { /* ignore */ }
                 _resetServerSessionState();
+                _clearVideoPreview();
                 // The recording is already finalized server-side — there is
                 // nothing left to "finish" in the upload modal. Drop back to
                 // the main view and refresh the sidebar + processing-queue
@@ -810,7 +924,9 @@ export function useAudio(state, utils) {
         }
 
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const _rawRecordedFile = new File(audioChunks.value, `recording-${timestamp}.webm`, { type: 'audio/webm' });
+        const recordedMime = (currentRecordingMimeType || 'audio/webm').split(';')[0];
+        const recordedExt = recordedMime === 'video/mp4' ? 'mp4' : 'webm';
+        const _rawRecordedFile = new File(audioChunks.value, `recording-${timestamp}.${recordedExt}`, { type: recordedMime });
         // Prevent Vue from wrapping the binary File in a reactive proxy. See
         // upload.js for rationale (issue #280).
         const recordedFile = (typeof Vue !== 'undefined' && Vue.markRaw)
@@ -845,6 +961,7 @@ export function useAudio(state, utils) {
         // Release the in-memory audio resources so the recording view does not
         // keep showing the old waveform, but DO NOT clear the IndexedDB session
         // (that happens only on upload success — see upload.js).
+        _clearVideoPreview();
         if (audioBlobURL.value) {
             URL.revokeObjectURL(audioBlobURL.value);
         }
@@ -889,7 +1006,9 @@ export function useAudio(state, utils) {
         }
 
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const _rawRecordedFile = new File(audioChunks.value, `recording-${timestamp}.webm`, { type: 'audio/webm' });
+        const recordedMime = (currentRecordingMimeType || 'audio/webm').split(';')[0];
+        const recordedExt = recordedMime === 'video/mp4' ? 'mp4' : 'webm';
+        const _rawRecordedFile = new File(audioChunks.value, `recording-${timestamp}.${recordedExt}`, { type: recordedMime });
         // Prevent Vue from wrapping the binary File in a reactive proxy. See
         // upload.js for rationale (issue #280).
         const recordedFile = (typeof Vue !== 'undefined' && Vue.markRaw)
@@ -1006,6 +1125,7 @@ export function useAudio(state, utils) {
 
     // Discard recording
     const discardRecording = async () => {
+        _clearVideoPreview();
         if (audioBlobURL.value) {
             URL.revokeObjectURL(audioBlobURL.value);
         }
@@ -1194,7 +1314,10 @@ export function useAudio(state, utils) {
             // Restore chunks
             audioChunks.value = recovered.chunks;
 
-            // Create blob URL
+            // Create blob URL. Also restore the recording's mime type so the
+            // legacy upload path builds the File with the right container
+            // (a recovered video capture must not be renamed audio/webm).
+            currentRecordingMimeType = recovered.metadata.mimeType || 'audio/webm';
             const blob = new Blob(recovered.chunks, { type: recovered.metadata.mimeType });
             audioBlobURL.value = URL.createObjectURL(blob);
 

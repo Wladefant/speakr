@@ -74,9 +74,14 @@ def _ttl_hours():
 
 
 def _allowed_mime_types():
+    # video/webm and video/mp4 support the opt-in tab/window/screen video
+    # capture (#303): the recorder streams a video container through the
+    # same chunk pipeline, and the stitch worker's segment detection is
+    # container-based (EBML / ftyp magic), so it needs no video-specific
+    # handling.
     raw = os.environ.get(
         'RECORDING_SESSION_ALLOWED_MIME_TYPES',
-        'audio/webm,audio/ogg,audio/mp4,audio/mpeg,audio/wav,audio/x-m4a',
+        'audio/webm,audio/ogg,audio/mp4,audio/mpeg,audio/wav,audio/x-m4a,video/webm,video/mp4',
     )
     return {m.strip().lower() for m in raw.split(',') if m.strip()}
 

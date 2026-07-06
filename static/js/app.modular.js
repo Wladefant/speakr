@@ -386,6 +386,22 @@ document.addEventListener('DOMContentLoaded', async () => {
                 try { localStorage.setItem('disableAudioProcessing', v ? 'true' : 'false'); } catch (_) {}
             });
 
+            // Opt-in: also record the shared tab/window/screen VIDEO during
+            // system-audio and mic+system recordings (#303). Only offered when
+            // the server has VIDEO_RETENTION enabled, since the resulting
+            // video/webm recording relies on the existing video-retention
+            // pipeline to keep its video stream. Persisted in localStorage.
+            const recordSystemVideo = ref(
+                (typeof localStorage !== 'undefined' && localStorage.getItem('recordSystemVideo') === 'true')
+            );
+            watch(recordSystemVideo, (v) => {
+                try { localStorage.setItem('recordSystemVideo', v ? 'true' : 'false'); } catch (_) {}
+            });
+            // True while a video-capturing recording is live — drives the
+            // preview panel in the recording view (audio.js attaches the
+            // display stream to the <video id="recordingVideoPreview">).
+            const recordingVideoActive = ref(false);
+
             // Per-input-device state for the multi-source recording flow.
             // The user can pick a PRIMARY input (their mic) and an OPTIONAL
             // SECONDARY input (e.g. a Pulse monitor source / BlackHole / VB-
@@ -1607,6 +1623,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 isRecording, mediaRecorder, audioChunks, audioBlobURL, recordingTime, recordingInterval,
                 canRecordAudio, canRecordSystemAudio, systemAudioSupported, systemAudioError,
                 recordingNotes, showSystemAudioHelp, showSystemAudioHelpModal, disableAudioProcessing,
+                recordSystemVideo, recordingVideoActive,
                 inputAudioDevices, selectedMicDeviceId, selectedSecondaryDeviceId, refreshInputAudioDevices,
                 platformInfo, audioCaps, helpModalOsTab, virtualAudioDevices, refreshVirtualAudioDevices,
                 asrLanguage, asrMinSpeakers, asrMaxSpeakers,

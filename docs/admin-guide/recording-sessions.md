@@ -28,9 +28,10 @@ Environment variables, all optional:
 | `RECORDING_SESSION_TTL_HOURS` | `24` | Sessions whose `last_seen_at` is older than this are reaped. |
 | `RECORDING_SESSION_MAX_BYTES_PER_USER` | `5368709120` (5 GB) | Per-user cap on in-progress (non-finalized) sessions. Soft limit: concurrent chunk uploads on different sessions can overrun by up to a few chunk-sizes (16 MB each by default). Cross-process atomic enforcement would require Redis or Postgres advisory locks; the overrun is small and bounded by worker count. |
 | `RECORDING_SESSION_MAX_CHUNK_BYTES` | `16777216` (16 MB) | Per-chunk upload cap. Generous; MediaRecorder chunks are typically <1 MB. |
-| `RECORDING_SESSION_ALLOWED_MIME_TYPES` | `audio/webm,audio/ogg,audio/mp4,audio/mpeg,audio/wav,audio/x-m4a` | Comma-separated whitelist. |
+| `RECORDING_SESSION_ALLOWED_MIME_TYPES` | `audio/webm,audio/ogg,audio/mp4,audio/mpeg,audio/wav,audio/x-m4a,video/webm,video/mp4` | Comma-separated whitelist. The video types carry the optional tab/window/screen video capture. |
 | `RECORDING_SESSION_CLEANUP_INTERVAL_SECONDS` | `3600` | How often the background thread sweeps expired sessions. Set to `0` to disable. |
 | `RECORDING_MAX_HOURS` | `8` | Absolute ceiling on a single recording. Stops the recorder automatically at this duration regardless of size. |
+| `RECORDING_VIDEO_KBPS` | `2500` | Video bitrate cap (kbps) for the opt-in tab/window/screen video capture. At the default, an hour of capture is roughly 1 GB. |
 
 ## Reverse-proxy requirements
 

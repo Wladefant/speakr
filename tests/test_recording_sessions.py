@@ -100,6 +100,26 @@ def test_create_session_returns_session_id_and_makes_dir():
     shutil.rmtree(upload_folder, ignore_errors=True)
 
 
+def test_create_session_accepts_video_mime_types():
+    """video/webm and video/mp4 carry the opt-in tab/screen video capture
+    (#303) through the same chunk pipeline."""
+    upload_folder = _make_tmp_upload_folder()
+    with app.app_context():
+        app.config["UPLOAD_FOLDER"] = upload_folder
+        user = _setup_user("sess_video_mime")
+        client = app.test_client()
+        _login(client, user)
+        for mime in ("video/webm", "video/mp4"):
+            resp = client.post("/upload/session", json={"mime_type": mime})
+            assert resp.status_code == 201, resp.data
+            body = resp.get_json()
+            assert body["mime_type"] == mime
+            db.session.delete(db.session.get(RecordingSession, body["session_id"]))
+        db.session.delete(user)
+        db.session.commit()
+    shutil.rmtree(upload_folder, ignore_errors=True)
+
+
 def test_create_session_rejects_unsupported_mime_type():
     upload_folder = _make_tmp_upload_folder()
     with app.app_context():

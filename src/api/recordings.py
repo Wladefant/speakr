@@ -1509,6 +1509,15 @@ def index(recording_id=None):
         recording_chunk_seconds = 5
     recording_chunk_seconds = max(1, min(60, recording_chunk_seconds))
 
+    # Video bitrate cap (kbps) for the opt-in tab/window/screen video capture
+    # (#303). Screen content compresses well, so the 2500 kbps default keeps
+    # an hour of capture near 1 GB. Clamped to [100, 50000].
+    try:
+        recording_video_kbps = int(float(os.environ.get('RECORDING_VIDEO_KBPS', '2500')))
+    except (TypeError, ValueError):
+        recording_video_kbps = 2500
+    recording_video_kbps = max(100, min(50000, recording_video_kbps))
+
     return render_template('index.html',
                          use_asr_endpoint=USE_ASR_ENDPOINT,  # Backwards compat
                          connector_supports_diarization=connector_supports_diarization,
@@ -1522,7 +1531,8 @@ def index(recording_id=None):
                          is_team_admin=is_team_admin,
                          server_recording_chunks_enabled=server_recording_chunks_enabled,
                          recording_max_hours=recording_max_hours,
-                         recording_chunk_seconds=recording_chunk_seconds)
+                         recording_chunk_seconds=recording_chunk_seconds,
+                         recording_video_kbps=recording_video_kbps)
 
 
 

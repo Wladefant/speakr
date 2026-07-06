@@ -4,6 +4,17 @@
         <!-- Top: Visualizer and Status (Fixed) -->
         <div class="flex-shrink-0 p-3 md:p-6 text-center bg-[var(--bg-tertiary)] border-b border-[var(--border-primary)]">
             <div v-if="isRecording" class="w-full mx-auto mb-3 md:mb-4">
+                <!-- Live preview of the captured tab/window/screen when the
+                     user opted into video recording (#303). The stream is
+                     attached by audio.js (srcObject can't be template-bound). -->
+                <div v-if="recordingVideoActive" class="max-w-2xl mx-auto mb-2 md:mb-3">
+                    <video id="recordingVideoPreview"
+                           class="w-full max-h-48 md:max-h-64 rounded-lg bg-black object-contain"
+                           muted autoplay playsinline></video>
+                    <p class="text-[10px] text-[var(--text-muted)] mt-0.5">
+                        <i class="fas fa-video mr-1"></i>${ t('recording.videoPreviewLabel') }
+                    </p>
+                </div>
                 <!-- Dual visualizer for 'both' mode -->
                 <div v-if="recordingMode === 'both'" class="max-w-4xl mx-auto flex gap-2 md:gap-4">
                     <div class="w-1/2 min-h-[8rem] md:min-h-[12rem] h-32 md:h-48 flex flex-col bg-[var(--bg-primary)] rounded-lg p-1.5 md:p-2">
@@ -28,7 +39,13 @@
                 </div>
             </div>
             <div v-if="!isRecording && audioBlobURL" class="w-full mb-3 md:mb-4">
-                <div class="audio-player-container">
+                <!-- A video capture reviews as a video player; audio-only
+                     recordings keep the compact audio bar. -->
+                <div v-if="recordingVideoActive" class="max-w-2xl mx-auto">
+                    <video :src="audioBlobURL" controls playsinline
+                           class="w-full max-h-64 md:max-h-80 rounded-lg bg-black object-contain"></video>
+                </div>
+                <div v-else class="audio-player-container">
                     <audio :src="audioBlobURL" controls class="w-full">
                         Your browser does not support the audio element.
                     </audio>

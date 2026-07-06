@@ -249,6 +249,8 @@ Reduce eye strain with a full dark mode implementation that affects every interf
 
 When enabled (`VIDEO_RETENTION=true`), uploaded video files preserve their video stream for in-browser playback. Instead of extracting audio and discarding the video, Speakr keeps the original file and renders it with a native `<video>` player alongside the transcript. Audio is extracted to a temporary file for transcription only, then cleaned up automatically. All existing player controls (play/pause, seek, speed, volume) work identically with video since HTML5 `<video>` and `<audio>` share the same media API. HTTP Range requests enable efficient seeking without downloading the entire file. This feature is ideal for presentations, lectures, and screen recordings where the visual context adds value to the transcript. Default: `false` (current behavior preserved — video uploads extract audio only).
 
+Video retention also unlocks in-app **tab/window/screen video capture**: the System Audio and Mic + System recording modes gain an "Also record video" option that keeps the shared surface as a video recording — a live preview shows while recording, and the result plays back in the same docked video player. Transcription still uses only the audio track. See the [Recording guide](user-guide/recording.md#recording-the-video-too-optional) for details.
+
 <div style="max-width: 800px; margin: 2em auto;">
   <img src="assets/images/screenshots/main-view-video.png" alt="Video playback alongside transcript" style="border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
   <p style="text-align: center; margin-top: 0.5rem; font-style: italic; color: #666;">In-browser video playback alongside speaker-labeled transcript and summary</p>

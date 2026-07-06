@@ -68,6 +68,41 @@ _WEBM_OK = _have_webm_encoder()
 _needs_webm = pytest.mark.skipif(not _WEBM_OK, reason="ffmpeg build lacks WebM/Opus encoder")
 
 
+def _have_webm_video_encoder():
+    """True if this ffmpeg build can mux VP8/VP9 video WebM (guards the
+    video-capture stitch tests the same way _have_webm_encoder guards
+    the audio ones)."""
+    try:
+        r = subprocess.run(
+            ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+             '-f', 'lavfi', '-i', 'testsrc=duration=1:size=160x120:rate=10',
+             '-c:v', 'libvpx', '-f', 'webm',
+             os.path.join(tempfile.gettempdir(), f'_webmvprobe_{uuid.uuid4().hex}.webm')],
+            capture_output=True,
+        )
+        return r.returncode == 0
+    except FileNotFoundError:
+        return False
+
+
+_WEBM_VIDEO_OK = _have_webm_video_encoder()
+_needs_webm_video = pytest.mark.skipif(
+    not _WEBM_VIDEO_OK, reason="ffmpeg build lacks VP8/VP9 WebM encoder")
+
+
+def _generate_video_webm(path, duration_seconds=3):
+    """Write a real WebM file with a video AND audio stream — a stand-in for
+    one MediaRecorder run with tab/screen video capture enabled (#303)."""
+    cmd = [
+        'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+        '-f', 'lavfi', '-i', f'testsrc=duration={duration_seconds}:size=160x120:rate=10',
+        '-f', 'lavfi', '-i', f'sine=frequency=440:duration={duration_seconds}',
+        '-c:v', 'libvpx', '-c:a', 'libopus', '-ac', '1', '-ar', '48000',
+        '-f', 'webm', path,
+    ]
+    subprocess.run(cmd, check=True)
+
+
 def _generate_webm(path, duration_seconds=3, freq_hz=440):
     """Write a real WebM/Opus file — a stand-in for one MediaRecorder run."""
     cmd = [
@@ -158,6 +193,9 @@ def test_mime_to_extension_maps_known_types():
     assert _mime_to_extension('audio/ogg') == 'ogg'
     assert _mime_to_extension('audio/whatever') == 'webm'
     assert _mime_to_extension('') == 'webm'
+    # Tab/window/screen video capture (#303)
+    assert _mime_to_extension('video/webm') == 'webm'
+    assert _mime_to_extension('video/mp4') == 'mp4'
 
 
 def test_chunk_paths_returns_sorted_chunks():
@@ -367,6 +405,70 @@ def test_stitch_preserves_a_real_user_title():
     shutil.rmtree(upload_folder, ignore_errors=True)
 
 
+@_needs_webm_video
+def test_stitch_video_session_end_to_end():
+    """A video capture (#303) delivered as byte-fragments must stitch to a
+    playable video file: full duration preserved, .webm extension, and the
+    recording's mime resolved to video/* from the probe."""
+    upload_folder = tempfile.mkdtemp(prefix="speakr-stitch-video-")
+    with app.app_context():
+        app.config["UPLOAD_FOLDER"] = upload_folder
+        user = _make_user()
+        recording, session, sess_dir = _plant_session(upload_folder, user, 'video/webm', chunk_count=4)
+
+        src = os.path.join(upload_folder, 'src.webm')
+        _generate_video_webm(src, duration_seconds=6)
+        _split_into_chunks(src, sess_dir, n_parts=4)
+        os.remove(src)
+
+        recording_id, media_path, metadata = stitch_recording_session(session.id)
+
+        assert os.path.exists(media_path)
+        assert media_path.endswith('.webm')
+        duration = _probe_duration(media_path)
+        assert 5.5 <= duration <= 6.5, f"expected ~6s, got {duration}"
+
+        rec = db.session.get(Recording, recording_id)
+        assert rec.status == 'PENDING'
+        assert rec.mime_type and rec.mime_type.startswith('video/'), rec.mime_type
+
+        os.remove(media_path)
+        db.session.delete(db.session.get(RecordingSession, session.id))
+        db.session.delete(rec)
+        db.session.delete(user)
+        db.session.commit()
+    shutil.rmtree(upload_folder, ignore_errors=True)
+
+
+@_needs_webm_video
+def test_stitch_probe_overrides_client_claimed_mime():
+    """The session mime is a client claim; the stitched bytes are
+    authoritative. A session claiming audio/webm whose chunks actually carry
+    video must end up with a video/* recording mime (ffprobe-first policy)."""
+    upload_folder = tempfile.mkdtemp(prefix="speakr-stitch-liar-")
+    with app.app_context():
+        app.config["UPLOAD_FOLDER"] = upload_folder
+        user = _make_user()
+        recording, session, sess_dir = _plant_session(upload_folder, user, 'audio/webm', chunk_count=2)
+
+        src = os.path.join(upload_folder, 'src.webm')
+        _generate_video_webm(src, duration_seconds=3)
+        _split_into_chunks(src, sess_dir, n_parts=2)
+        os.remove(src)
+
+        recording_id, media_path, metadata = stitch_recording_session(session.id)
+
+        rec = db.session.get(Recording, recording_id)
+        assert rec.mime_type and rec.mime_type.startswith('video/'), rec.mime_type
+
+        os.remove(media_path)
+        db.session.delete(db.session.get(RecordingSession, session.id))
+        db.session.delete(rec)
+        db.session.delete(user)
+        db.session.commit()
+    shutil.rmtree(upload_folder, ignore_errors=True)
+
+
 def test_stitch_raises_when_no_chunks_on_disk():
     upload_folder = tempfile.mkdtemp(prefix="speakr-stitch-nochunks-")
     with app.app_context():
@@ -440,6 +542,11 @@ if __name__ == "__main__":
         test_stitch_multi_segment_resume_sums_durations_end_to_end()
     else:
         print("(skipping WebM end-to-end tests: no encoder)")
+    if _WEBM_VIDEO_OK:
+        test_stitch_video_session_end_to_end()
+        test_stitch_probe_overrides_client_claimed_mime()
+    else:
+        print("(skipping WebM video end-to-end tests: no VP8/VP9 encoder)")
     test_stitch_raises_when_no_chunks_on_disk()
     test_stitch_raises_when_session_missing()
     print("All stitch tests passed.")

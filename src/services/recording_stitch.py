@@ -87,6 +87,8 @@ def _mime_to_extension(mime_type: str) -> str:
         'audio/x-m4a': 'm4a',
         'audio/mpeg': 'mp3',
         'audio/wav': 'wav',
+        'video/webm': 'webm',
+        'video/mp4': 'mp4',
     }
     return mapping.get((mime_type or '').lower(), 'webm')
 
@@ -302,6 +304,17 @@ def stitch_recording_session(session_id: str) -> Tuple[int, str]:
     recording.original_filename = final_filename
     recording.file_size = file_size
     recording.status = 'PENDING'
+    # The session's mime_type is a client claim; the stitched bytes are
+    # authoritative. Re-derive the MIME from the validation probe above so a
+    # video capture is recognized as video (and vice versa) regardless of
+    # what the client declared — same ffprobe-first policy as the upload
+    # pipeline. Keep the claimed value when the probe was unavailable.
+    if probe is not None:
+        try:
+            from src.utils.mime import resolve_media_mime
+            recording.mime_type = resolve_media_mime(final_path, codec_info=probe)
+        except Exception as e:
+            logger.warning(f"Could not resolve stitched mime for {final_path}: {e}")
     if not recording.meeting_date:
         recording.meeting_date = session.created_at
 

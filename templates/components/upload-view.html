@@ -273,6 +273,21 @@
                     </button>
                 </div>
 
+                <!-- Opt-in video capture for the two display-capture modes
+                     (#303). Only offered when the server retains video
+                     streams (VIDEO_RETENTION) — without retention the
+                     pipeline would strip the video back out at
+                     transcription time, so the toggle would be a no-op. -->
+                <label v-if="canRecordSystemAudio && videoRetentionEnabled"
+                       class="flex items-start gap-2 mt-1 px-1 cursor-pointer">
+                    <input type="checkbox" v-model="recordSystemVideo" class="checkbox mt-0.5">
+                    <span class="text-[11px] flex-1" style="color: var(--text-secondary);">
+                        <i class="fas fa-video mr-1 text-[var(--text-muted)]"></i>
+                        <strong>${ t('recording.recordVideoTitle') }</strong>
+                        ${ t('recording.recordVideoHelp') }
+                    </span>
+                </label>
+
                 <!-- Compact platform-aware hint when full system audio is
                      not available on this OS / browser combination. -->
                 <div v-if="audioCaps && audioCaps.supportsTabAudio && !audioCaps.supportsSystemAudio"
