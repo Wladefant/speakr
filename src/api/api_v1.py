@@ -2206,7 +2206,7 @@ def assign_speakers(recording_id):
     except Exception as e:
         db.session.rollback()
         current_app.logger.error(f"Error assigning speakers for recording {recording_id}: {e}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'An unexpected error occurred'}), 500
 
 
 @api_v1_bp.route('/recordings/<int:recording_id>/speakers/identify', methods=['POST'])
@@ -2251,7 +2251,7 @@ def identify_speakers(recording_id):
         return jsonify({'error': str(ve)}), 503
     except Exception as e:
         current_app.logger.error(f"Error during auto speaker identification for recording {recording_id}: {e}", exc_info=True)
-        return jsonify({'error': f'An unexpected error occurred: {str(e)}'}), 500
+        return jsonify({'error': 'An unexpected error occurred'}), 500
 
 
 # =============================================================================

@@ -58,13 +58,27 @@ def init_auth_extensions(_bcrypt, _csrf, _limiter):
 
 
 def rate_limit(limit_string):
-    """Decorator that applies rate limiting if limiter is available."""
+    """Decorator that applies a per-endpoint Flask-Limiter limit.
+
+    The limiter is injected via init_auth_extensions AFTER this module is
+    imported (and after the routes below are decorated), so we can't wrap the
+    view with limiter.limit() at decoration time. Instead we apply and cache
+    it lazily on the first request. Previously this decorator was a no-op that
+    only stashed the limit string, so login/register/password-reset ran with
+    only the loose global default — a brute-force exposure.
+    """
     def decorator(f):
         from functools import wraps
+        state = {'limited': None}
+
         @wraps(f)
         def wrapper(*args, **kwargs):
+            if limiter is not None and getattr(limiter, 'enabled', True):
+                if state['limited'] is None:
+                    state['limited'] = limiter.limit(limit_string)(f)
+                return state['limited'](*args, **kwargs)
             return f(*args, **kwargs)
-        # Store the limit string for later application
+
         wrapper._rate_limit = limit_string
         return wrapper
     return decorator

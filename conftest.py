@@ -53,6 +53,12 @@ os.environ["SUMMARY_QUEUE_WORKERS"] = "0"
 # NB: do NOT force WEBHOOK_GLOBAL_ENABLED=false here — the webhook suite needs
 # delivery enabled (it mocks the actual HTTP POST), so leave the default (true).
 
+# Disable per-endpoint rate limiting under test: several auth tests POST
+# /login many times from the same client IP within one run, which the real
+# "10 per minute" login limit would reject with 429. Production leaves this
+# enabled (default true).
+os.environ.setdefault("RATELIMIT_ENABLED", "false")
+
 import pytest  # noqa: E402
 
 

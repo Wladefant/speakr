@@ -134,7 +134,11 @@ def _blank_column_condition(column):
 
 
 def _prefixed_column_condition(column, prefixes):
-    return db.or_(*[column.like(f'{prefix}%') for prefix in prefixes])
+    # Escape LIKE metacharacters in the literal prefixes so a '_' or '%' in a
+    # prefix (e.g. 'ERROR_JSON:') matches literally instead of as a wildcard.
+    def _esc(p):
+        return p.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+    return db.or_(*[column.like(f'{_esc(prefix)}%', escape='\\') for prefix in prefixes])
 
 
 def _transcription_error_condition():
@@ -4494,6 +4498,15 @@ def bulk_toggle():
             try:
                 recording = db.session.get(Recording, recording_id)
                 if not recording:
+                    continue
+
+                # Authorization: only act on recordings the user actually has
+                # access to. Without this, set_user_recording_status would
+                # create a per-user status row for ANY recording id (treating
+                # the caller as a "shared recipient"), leaking a cross-user
+                # existence oracle and polluting the table. Mirrors the single
+                # toggle_inbox / toggle_highlight endpoints.
+                if not has_recording_access(recording, current_user):
                     continue
 
                 # Use set_user_recording_status which handles both owners and shared users

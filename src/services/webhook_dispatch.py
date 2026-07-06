@@ -299,6 +299,20 @@ def _post_delivery(delivery: WebhookDelivery, webhook: Webhook) -> tuple:
     On network/timeout error, response_status is None and error is set.
     """
     body_bytes = (delivery.payload or '').encode('utf-8')
+
+    # Re-validate the URL at SEND time, not just at create/update. The
+    # create-time check can be defeated by DNS rebinding: register a webhook on
+    # a domain that resolves to a public IP when validated, then repoint it at
+    # 127.0.0.1 / 169.254.169.254 / an internal host before delivery. Re-running
+    # the resolve-and-block check immediately before the POST closes that window
+    # (the stored response preview is readable back via the deliveries API, so
+    # an internal target would otherwise be an exfiltration channel). A transient
+    # DNS failure is NOT treated as a block — no resolution means no connection
+    # and thus no SSRF; we let requests surface it as a normal network error.
+    safe, reason = is_url_safe_for_webhook(webhook.url, allow_http=bool(webhook.allow_http))
+    if not safe and 'resolves to a private' in reason:
+        return None, None, f'blocked at delivery: {reason}'[:500]
+
     signature = sign_payload(webhook.secret, body_bytes)
     headers = {
         'Content-Type': 'application/json',

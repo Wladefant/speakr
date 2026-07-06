@@ -174,11 +174,16 @@ _markdown_instance = markdown.Markdown(extensions=[
 ])
 
 # --- Rate Limiting Setup (will be configured after app creation) ---
-# TEMPORARILY INCREASED FOR TESTING - REVERT FOR PRODUCTION!
+# RATELIMIT_ENABLED (default true) lets the test suite and any deployment that
+# fronts its own rate limiting turn Flask-Limiter off. The per-endpoint auth
+# limits (login/register/password-reset) are applied via the rate_limit
+# decorator in src/api/auth.py and src/api/tokens.py.
+_RATELIMIT_ENABLED = os.environ.get('RATELIMIT_ENABLED', 'true').lower() != 'false'
 limiter = Limiter(
     get_remote_address,
     app=None,  # Defer initialization
-    default_limits=["5000 per day", "1000 per hour"]  # Increased from 200/day, 50/hour for testing
+    default_limits=["5000 per day", "1000 per hour"],
+    enabled=_RATELIMIT_ENABLED,
 )
 
 # --- Utility Functions ---

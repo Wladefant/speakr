@@ -234,12 +234,12 @@ class TestRetentionNotBroken(unittest.TestCase):
         self.assertIn('extract_audio_from_video(filepath)', video_block)
 
     def test_temp_audio_cleanup_still_present(self):
-        """Temp audio from retention is still cleaned up after transcription.
-        After the per-upload keep_audio_only override landed, the cleanup
-        branch checks effective_video_retention (env var AND per-recording
-        flag) rather than VIDEO_RETENTION directly."""
-        self.assertIn('is_video and effective_video_retention and audio_filepath', PROCESSING_MAIN)
-        self.assertIn('Cleaned up temp audio from video retention', PROCESSING_MAIN)
+        """Temp audio extracted from a video container is still cleaned up
+        after transcription. The condition was broadened to also cover the
+        legacy non-retention extract branch (which previously leaked), so it
+        no longer gates on effective_video_retention."""
+        self.assertIn('is_video and audio_filepath and audio_filepath != filepath', PROCESSING_MAIN)
+        self.assertIn('Cleaned up temp audio extracted from video', PROCESSING_MAIN)
 
 
 # ===========================================================================

@@ -296,13 +296,14 @@ def _apply_finalize_metadata(recording, metadata):
     return metadata
 
 
-def stitch_recording_session(session_id: str) -> Tuple[int, str]:
-    """Stitch a session's chunks into a final audio file.
+def stitch_recording_session(session_id: str) -> Tuple[int, str, dict]:
+    """Stitch a session's chunks into a final media file.
 
-    Returns ``(recording_id, audio_path)`` on success. Raises
-    :class:`StitchError` on any failure; the caller (job_queue worker)
-    is responsible for updating the Recording row's status and
-    surfacing the error to the user.
+    Returns ``(recording_id, media_path, metadata)`` on success, where
+    ``metadata`` is the parsed finalize metadata used to kick off the
+    downstream transcribe job. Raises :class:`StitchError` on any failure;
+    the caller (job_queue worker) is responsible for updating the Recording
+    row's status and surfacing the error to the user.
     """
     session = db.session.get(RecordingSession, session_id)
     if not session:

@@ -459,8 +459,8 @@ def share_recording_internal(recording_id):
 
     except Exception as e:
         db.session.rollback()
-        current_app.logger.error(f"Error sharing recording internally: {e}")
-        return jsonify({'error': str(e)}), 500
+        current_app.logger.error(f"Error sharing recording internally: {e}", exc_info=True)
+        return jsonify({'error': 'An unexpected error occurred'}), 500
 
 
 @shares_bp.route('/api/recordings/<int:recording_id>/shares-internal', methods=['GET'])
@@ -582,8 +582,8 @@ def revoke_internal_share(share_id):
 
     except Exception as e:
         db.session.rollback()
-        current_app.logger.error(f"Error revoking internal share: {e}")
-        return jsonify({'error': str(e)}), 500
+        current_app.logger.error(f"Error revoking internal share: {e}", exc_info=True)
+        return jsonify({'error': 'An unexpected error occurred'}), 500
 
 
 @shares_bp.route('/api/recordings/shared-with-me', methods=['GET'])

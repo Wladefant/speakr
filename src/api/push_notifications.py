@@ -2,7 +2,7 @@
 Push Notification API Endpoints
 Handles push notification subscriptions and delivery
 """
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, current_app
 from flask_login import login_required, current_user
 from src.database import db
 from src.models.push_subscription import PushSubscription
@@ -98,10 +98,10 @@ def subscribe():
 
     except Exception as e:
         db.session.rollback()
-        print(f"[Push] Subscription error: {e}")
+        current_app.logger.error(f"[Push] Subscription error: {e}", exc_info=True)
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': 'An unexpected error occurred'
         }), 500
 
 
@@ -142,10 +142,10 @@ def unsubscribe():
 
     except Exception as e:
         db.session.rollback()
-        print(f"[Push] Unsubscribe error: {e}")
+        current_app.logger.error(f"[Push] Unsubscribe error: {e}", exc_info=True)
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': 'An unexpected error occurred'
         }), 500
 
 

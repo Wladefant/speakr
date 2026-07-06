@@ -26,6 +26,14 @@ if TYPE_CHECKING:
 # Configure logging
 logger = logging.getLogger(__name__)
 
+# Wall-clock cap on ffmpeg/ffprobe subprocesses in the chunking path. Without
+# it a malformed/adversarial media file can stall the subprocess forever and
+# permanently wedge a job-queue worker. Shares the ffmpeg_utils env knob.
+try:
+    _SUBPROCESS_TIMEOUT_SECONDS = max(30, int(os.getenv('FFMPEG_TIMEOUT_SECONDS', '3600')))
+except (TypeError, ValueError):
+    _SUBPROCESS_TIMEOUT_SECONDS = 3600
+
 
 @dataclass
 class EffectiveChunkingConfig:
@@ -340,11 +348,11 @@ class AudioChunkingService:
             result = subprocess.run([
                 'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
                 '-of', 'default=noprint_wrappers=1:nokey=1', file_path
-            ], capture_output=True, text=True, check=True)
-            
+            ], capture_output=True, text=True, check=True, timeout=_SUBPROCESS_TIMEOUT_SECONDS)
+
             duration = float(result.stdout.strip())
             return duration
-        except (subprocess.CalledProcessError, ValueError, FileNotFoundError) as e:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError, FileNotFoundError) as e:
             logger.error(f"Error getting audio duration for {file_path}: {e}")
             return None
     
@@ -608,7 +616,11 @@ class AudioChunkingService:
                     chunk_path
                 ]
                 
-                result = subprocess.run(cmd, capture_output=True, text=True)
+                try:
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT_SECONDS)
+                except subprocess.TimeoutExpired:
+                    logger.error(f"ffmpeg timed out extracting chunk {chunk_index} after {_SUBPROCESS_TIMEOUT_SECONDS}s")
+                    continue
                 if result.returncode != 0:
                     logger.error(f"ffmpeg failed for chunk {chunk_index}: {result.stderr}")
                     continue
@@ -810,9 +822,9 @@ class AudioChunkingService:
                 '-show_format', '-show_streams', chunk_path
             ]
             
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=_SUBPROCESS_TIMEOUT_SECONDS)
             probe_data = json.loads(result.stdout)
-            
+
             audio_stream = None
             for stream in probe_data.get('streams', []):
                 if stream.get('codec_type') == 'audio':
@@ -984,7 +996,7 @@ def get_audio_duration_ffprobe(file_path: str) -> Optional[float]:
         result = subprocess.run([
             'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
             '-of', 'default=noprint_wrappers=1:nokey=1', file_path
-        ], capture_output=True, text=True, check=True)
+        ], capture_output=True, text=True, check=True, timeout=_SUBPROCESS_TIMEOUT_SECONDS)
         return float(result.stdout.strip())
     except Exception:
         return None
@@ -1129,7 +1141,11 @@ def extract_speaker_samples(
                 sample_path
             ]
 
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                logger.error(f"ffmpeg timed out extracting sample for speaker {speaker} after {_SUBPROCESS_TIMEOUT_SECONDS}s")
+                continue
             if result.returncode != 0:
                 logger.error(f"Failed to extract sample for speaker {speaker}: {result.stderr}")
                 continue

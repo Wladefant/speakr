@@ -850,12 +850,18 @@ Summarization Instructions:
                 db.session.commit()
                 current_app.logger.info(f"Summarization completed for recording {recording_id} in {recording.summarization_duration_seconds}s.")
 
-                # Apply auto-shares for group tags after processing completes
-                apply_team_tag_auto_shares(recording_id)
-
-                # Export to file if auto-export is enabled
-                if ENABLE_AUTO_EXPORT:
-                    export_recording(recording_id)
+                # Best-effort post-completion side effects. The recording is
+                # already committed COMPLETED with a good summary; if either of
+                # these throws it must NOT bubble to the outer except, which
+                # would overwrite the summary with an error and flip the row to
+                # FAILED (a genuinely-complete recording corrupted by a share/
+                # export hiccup).
+                try:
+                    apply_team_tag_auto_shares(recording_id)
+                    if ENABLE_AUTO_EXPORT:
+                        export_recording(recording_id)
+                except Exception as post_err:
+                    current_app.logger.error(f"Post-completion step failed for recording {recording_id} (recording stays COMPLETED): {post_err}")
             else:
                 current_app.logger.warning(f"Empty summary generated for recording {recording_id}")
                 recording.summary = "[Summary not generated]"
@@ -865,12 +871,14 @@ Summarization Instructions:
                 recording.summarization_duration_seconds = int(summarization_end_time - summarization_start_time)
                 db.session.commit()
 
-                # Apply auto-shares for group tags after processing completes
-                apply_team_tag_auto_shares(recording_id)
-
-                # Export to file if auto-export is enabled (even with empty summary, transcription may be useful)
-                if ENABLE_AUTO_EXPORT:
-                    export_recording(recording_id)
+                # Best-effort post-completion side effects (see the non-empty
+                # branch above): must not corrupt the completed recording.
+                try:
+                    apply_team_tag_auto_shares(recording_id)
+                    if ENABLE_AUTO_EXPORT:
+                        export_recording(recording_id)
+                except Exception as post_err:
+                    current_app.logger.error(f"Post-completion step failed for recording {recording_id} (recording stays COMPLETED): {post_err}")
 
             # Process chunks for semantic search after completion (if inquire mode is enabled).
             # Mirrors the non-summary path in generate_title_task; without this, Inquire
@@ -2122,12 +2130,19 @@ def transcribe_with_connector(app_context, recording_id, filepath, original_file
                 except OSError:
                     pass  # Best effort cleanup
 
-            # Clean up temp audio extracted from video when video retention is enabled
-            if is_video and effective_video_retention and audio_filepath and audio_filepath != filepath:
+            # Clean up temp audio extracted from a video container. This covers
+            # BOTH the video-retention branch and the legacy non-retention
+            # extract branch: in both, audio_filepath is a local temp file
+            # distinct from filepath (the retention branch keeps the video as
+            # filepath; the legacy branch already uploaded the extracted audio
+            # to storage), so the local copy is always safe to remove after
+            # transcription. Previously this was gated on effective_video_retention,
+            # leaking the legacy branch's _audio.* into UPLOAD_FOLDER.
+            if is_video and audio_filepath and audio_filepath != filepath:
                 try:
                     if os.path.exists(audio_filepath):
                         os.remove(audio_filepath)
-                        current_app.logger.info(f"Cleaned up temp audio from video retention: {audio_filepath}")
+                        current_app.logger.info(f"Cleaned up temp audio extracted from video: {audio_filepath}")
                 except OSError:
                     pass  # Best effort cleanup
 
@@ -2282,6 +2297,20 @@ def transcribe_with_connector(app_context, recording_id, filepath, original_file
                 except Exception:
                     pass  # Don't fail the error handling if we can't get timeout info
 
+            # Clean up derived temp files on the failure path too. The success
+            # path removes these below the retry loop, but a raised transcription
+            # error skips straight here — previously orphaning the converted MP3
+            # and the retained-video extracted audio (up to one per retry) in
+            # UPLOAD_FOLDER on the local backend.
+            for _tmp in (locals().get('converted_filepath'), locals().get('audio_filepath')):
+                if _tmp and _tmp != filepath:
+                    try:
+                        if os.path.exists(_tmp):
+                            os.remove(_tmp)
+                            current_app.logger.debug(f"Cleaned up temp file on failure path: {_tmp}")
+                    except OSError:
+                        pass
+
             # Don't set recording.status = 'FAILED' here - let the job queue handle it
             # The job queue will decide whether to retry or permanently fail,
             # and only set FAILED status when all retries are exhausted
@@ -2380,6 +2409,13 @@ def transcribe_incognito(filepath, original_filename, language=None, min_speaker
         'error': None
     }
 
+    # Derived temp files this function creates (extracted audio from video,
+    # converted audio). The route only deletes the original upload temp, so
+    # these must be cleaned here — otherwise every incognito request on a
+    # video/convertible file leaves decoded audio in /tmp, which is both a
+    # disk leak and a violation of the incognito no-retention guarantee.
+    _incognito_derived_files = []
+
     try:
         # Get the active connector
         registry = get_registry()
@@ -2422,6 +2458,8 @@ def transcribe_incognito(filepath, original_filename, language=None, min_speaker
                     actual_filepath = audio_filepath
                     actual_content_type = audio_mime_type
                     actual_filename = os.path.basename(audio_filepath)
+                    if audio_filepath and audio_filepath != filepath:
+                        _incognito_derived_files.append(audio_filepath)
                 except Exception as e:
                     current_app.logger.error(f"[Incognito] Failed to extract audio from video: {e}")
                     raise
@@ -2447,6 +2485,9 @@ def transcribe_incognito(filepath, original_filename, language=None, min_speaker
 
                 if conversion_result.was_converted:
                     current_app.logger.info(f"[Incognito] Audio converted: {conversion_result.original_codec} -> {conversion_result.final_codec}")
+                    out_path = conversion_result.output_path
+                    if out_path and out_path not in (filepath, actual_filepath):
+                        _incognito_derived_files.append(out_path)
                 actual_filepath = conversion_result.output_path
                 actual_content_type = conversion_result.mime_type
                 actual_filename = os.path.basename(conversion_result.output_path)
@@ -2527,6 +2568,19 @@ def transcribe_incognito(filepath, original_filename, language=None, min_speaker
         result['error'] = str(e)
         result['processing_time_seconds'] = int(time.time() - start_time)
         return result
+
+    finally:
+        # Delete the derived temp files (extracted/converted audio) this
+        # function created. The original upload temp is owned and removed by
+        # the route's finally; we must never delete `filepath` here.
+        for _tmp in _incognito_derived_files:
+            if _tmp and _tmp != filepath:
+                try:
+                    if os.path.exists(_tmp):
+                        os.remove(_tmp)
+                        current_app.logger.info(f"[Incognito] Derived temp file deleted: {_tmp}")
+                except OSError as _e:
+                    current_app.logger.error(f"[Incognito] Failed to delete derived temp file {_tmp}: {_e}")
 
 
 def _generate_incognito_title(transcription_text, user=None):

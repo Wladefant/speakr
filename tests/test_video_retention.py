@@ -89,14 +89,16 @@ class TestProcessingPipelineVideoRetention(unittest.TestCase):
         )
 
     def test_temp_audio_cleanup_after_transcription(self):
-        """Temp audio from video retention is cleaned up after transcription.
+        """Temp audio extracted from a video container is cleaned up after
+        transcription.
 
-        After the per-upload keep_audio_only override was added, the
-        cleanup branch checks the effective (per-recording) retention
-        flag rather than the global env var directly.
+        The cleanup condition was broadened to cover BOTH the retention branch
+        and the legacy non-retention extract branch (the latter previously
+        leaked its _audio.* into UPLOAD_FOLDER), so it no longer gates on
+        effective_video_retention.
         """
-        self.assertIn('is_video and effective_video_retention and audio_filepath', self.content)
-        self.assertIn('Cleaned up temp audio from video retention', self.content)
+        self.assertIn('is_video and audio_filepath and audio_filepath != filepath', self.content)
+        self.assertIn('Cleaned up temp audio extracted from video', self.content)
 
     def test_audio_filepath_initialized_to_none(self):
         """audio_filepath is initialized to None before the is_video check."""

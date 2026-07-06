@@ -14,6 +14,15 @@ DEFAULT_SAMPLE_RATE = os.getenv('AUDIO_SAMPLE_RATE', '44100')
 DEFAULT_CHANNELS = int(os.getenv('AUDIO_CHANNELS', '1'))  # Mono for speech
 DEFAULT_COMPRESSION_LEVEL = int(os.getenv('AUDIO_COMPRESSION_LEVEL', '2'))
 
+# Hard wall-clock cap on any single ffmpeg invocation. Without it a malformed
+# or adversarial media file can stall ffmpeg forever and permanently wedge a
+# job-queue worker thread. 1 hour is generous for conversion/extraction of
+# even multi-hour recordings while still guaranteeing eventual recovery.
+try:
+    FFMPEG_TIMEOUT_SECONDS = max(30, int(os.getenv('FFMPEG_TIMEOUT_SECONDS', '3600')))
+except (TypeError, ValueError):
+    FFMPEG_TIMEOUT_SECONDS = 3600
+
 
 class FFmpegError(Exception):
     """Custom exception for FFmpeg-related errors."""
@@ -433,15 +442,24 @@ def _run_ffmpeg_command(cmd: list, operation_description: str) -> None:
             cmd,
             check=True,
             capture_output=True,
-            text=True
+            text=True,
+            timeout=FFMPEG_TIMEOUT_SECONDS,
         )
         current_app.logger.debug(f"FFmpeg {operation_description} completed successfully")
-        
+
     except FileNotFoundError:
         error_msg = "FFmpeg not found. Please ensure FFmpeg is installed and in the system's PATH."
         current_app.logger.error(error_msg)
         raise FFmpegNotFoundError(error_msg)
-        
+
+    except subprocess.TimeoutExpired:
+        # subprocess.run already kills the process on timeout. Surface as a
+        # normal FFmpegError so the worker fails the job cleanly instead of
+        # hanging forever on a stalled/adversarial input.
+        error_msg = f"{operation_description} timed out after {FFMPEG_TIMEOUT_SECONDS}s"
+        current_app.logger.error(f"FFmpeg error: {error_msg}")
+        raise FFmpegError(error_msg)
+
     except subprocess.CalledProcessError as e:
         error_msg = f"{operation_description} failed: {e.stderr}"
         current_app.logger.error(f"FFmpeg error: {error_msg}")

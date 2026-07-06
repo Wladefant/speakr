@@ -7,6 +7,7 @@ structured information about their codecs, streams, and formats.
 
 import json
 import logging
+import os
 import subprocess
 from datetime import datetime
 from typing import Optional, Dict, Any, Tuple
@@ -37,12 +38,17 @@ def probe(filename: str, cmd: str = 'ffprobe', timeout: Optional[int] = None) ->
     args = [cmd, '-show_format', '-show_streams', '-of', 'json', filename]
     p = None
 
+    # Always bound the probe: a caller that passes no explicit timeout still
+    # must not be able to hang a worker forever on a stalled/adversarial file.
+    if timeout is None:
+        try:
+            timeout = max(10, int(os.getenv('FFPROBE_TIMEOUT_SECONDS', '60')))
+        except (TypeError, ValueError):
+            timeout = 60
+
     try:
         p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        communicate_kwargs = {}
-        if timeout is not None:
-            communicate_kwargs['timeout'] = timeout
-        out, err = p.communicate(**communicate_kwargs)
+        out, err = p.communicate(timeout=timeout)
         
         if p.returncode != 0:
             error_msg = err.decode('utf-8', errors='ignore')

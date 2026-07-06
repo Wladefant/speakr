@@ -32,12 +32,23 @@ def init_tokens_helpers(_bcrypt, _csrf, _limiter):
 
 
 def rate_limit(limit_string):
-    """Decorator that applies rate limiting if limiter is available."""
+    """Decorator that applies a per-endpoint Flask-Limiter limit.
+
+    Applied lazily because the limiter is injected after this module is
+    imported (see the matching helper in src/api/auth.py). Previously a no-op.
+    """
     def decorator(f):
         from functools import wraps
+        state = {'limited': None}
+
         @wraps(f)
         def wrapper(*args, **kwargs):
+            if limiter is not None and getattr(limiter, 'enabled', True):
+                if state['limited'] is None:
+                    state['limited'] = limiter.limit(limit_string)(f)
+                return state['limited'](*args, **kwargs)
             return f(*args, **kwargs)
+
         wrapper._rate_limit = limit_string
         return wrapper
     return decorator

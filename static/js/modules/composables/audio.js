@@ -160,6 +160,33 @@ export function useAudio(state, utils) {
         if (recordingVideoActive) recordingVideoActive.value = false;
     }
 
+    // Close the recording AudioContext and drop the analyser nodes. Browsers
+    // cap concurrent AudioContexts (~6 in Chromium); without this, a handful
+    // of record→stop cycles without a page reload exhausts the pool and
+    // `new AudioContext()` throws, killing recording until reload. Called on
+    // stop, discard, and the start-error path.
+    function _releaseAudioContext() {
+        if (audioContext.value) {
+            try { audioContext.value.close(); } catch (_) { /* already closed */ }
+            audioContext.value = null;
+        }
+        analyser.value = null;
+        if (micAnalyser) micAnalyser.value = null;
+        if (systemAnalyser) systemAnalyser.value = null;
+    }
+
+    // Stop any tracks still held on the pre-disclosure display stream. The
+    // display capture is acquired up front (Firefox transient-activation
+    // requirement) and parked in pendingDisplayStream; if start then fails
+    // before it's consumed, the browser's "sharing your screen" indicator
+    // would otherwise stay on with the tracks never released.
+    function _stopPendingDisplayStream() {
+        if (pendingDisplayStream) {
+            try { pendingDisplayStream.getTracks().forEach(t => t.stop()); } catch (_) {}
+            pendingDisplayStream = null;
+        }
+    }
+
     // iOS detection
     const isiOS = () => {
         return /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
@@ -830,6 +857,12 @@ export function useAudio(state, utils) {
                 });
                 activeStreams.value = [];
             }
+            // Also release the display stream grabbed before the failure point
+            // (e.g. 'both' mode where the mic getUserMedia rejects after the
+            // screen share was already acquired) and the AudioContext.
+            _stopPendingDisplayStream();
+            _clearVideoPreview();
+            _releaseAudioContext();
         }
     };
 
@@ -857,6 +890,10 @@ export function useAudio(state, utils) {
                 });
                 activeStreams.value = [];
             }
+
+            // Close the AudioContext so repeated record→stop cycles don't
+            // exhaust the browser's context pool.
+            _releaseAudioContext();
 
             // Release wake lock
             await releaseWakeLock();
@@ -1133,6 +1170,10 @@ export function useAudio(state, utils) {
             // Auto-select the incognito recording and switch to detail view
             selectedRecording.value = incognitoData;
             currentView.value = 'detail';
+            // discardRecording() re-opened the upload modal (its normal
+            // return-to-form behaviour); close it here so it doesn't cover the
+            // finished incognito recording. Every other incognito path does this.
+            if (showUploadModal) showUploadModal.value = false;
 
             // Reset incognito mode toggle
             incognitoMode.value = false;
@@ -1147,12 +1188,26 @@ export function useAudio(state, utils) {
             setGlobalError(`Incognito processing failed: ${error.message}`);
         } finally {
             incognitoProcessing.value = false;
+            // Reset the shared processing-progress state so it isn't left
+            // pinned at 100% / "ready" for the next operation.
+            processingProgress.value = 0;
+            processingMessage.value = '';
         }
     };
 
     // Discard recording
     const discardRecording = async () => {
         _clearVideoPreview();
+        _stopPendingDisplayStream();
+        _releaseAudioContext();
+        // Stop any still-live capture tracks (e.g. discarding while the tab
+        // stayed on the finished-review pane with tracks not yet stopped).
+        if (activeStreams.value.length > 0) {
+            activeStreams.value.forEach(stream => {
+                try { stream.getTracks().forEach(track => track.stop()); } catch (_) {}
+            });
+            activeStreams.value = [];
+        }
         if (audioBlobURL.value) {
             URL.revokeObjectURL(audioBlobURL.value);
         }
