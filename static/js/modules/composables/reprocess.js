@@ -383,12 +383,16 @@ export function useReprocess(state, utils) {
     // Progress Polling
     // =========================================
 
-    const startReprocessingPoll = (recordingId) => {
+    const startReprocessingPoll = (recordingId, options = {}) => {
         // Stop existing poll if any
         stopReprocessingPoll(recordingId);
 
         // Track if we've already fetched full data for SUMMARIZING status
         let hasFetchedForSummarizing = false;
+        // Fire options.onAudioReady exactly once, when the recording's audio
+        // first becomes playable (used by merge to remove deleted originals and
+        // enable the play button — see bulk-operations.js).
+        let audioReadyFired = false;
 
         const pollInterval = setInterval(async () => {
             try {
@@ -398,14 +402,16 @@ export function useReprocess(state, utils) {
 
                 const statusData = await response.json();
 
-                // Update status in recordings list
+                // Update status (and audio_ready, when the endpoint reports it)
+                // in the recordings list.
                 const index = recordings.value.findIndex(r => r.id === recordingId);
 
                 if (index !== -1) {
                     // Create new object to ensure Vue reactivity
                     recordings.value[index] = {
                         ...recordings.value[index],
-                        status: statusData.status
+                        status: statusData.status,
+                        ...(statusData.audio_ready !== undefined ? { audio_ready: statusData.audio_ready } : {})
                     };
                 }
 
@@ -413,8 +419,17 @@ export function useReprocess(state, utils) {
                 if (selectedRecording.value?.id === recordingId) {
                     selectedRecording.value = {
                         ...selectedRecording.value,
-                        status: statusData.status
+                        status: statusData.status,
+                        ...(statusData.audio_ready !== undefined ? { audio_ready: statusData.audio_ready } : {})
                     };
+                }
+
+                // One-shot callback when audio first becomes playable.
+                if (!audioReadyFired && statusData.audio_ready === true) {
+                    audioReadyFired = true;
+                    if (typeof options.onAudioReady === 'function') {
+                        try { options.onAudioReady(); } catch (e) { console.error('onAudioReady error:', e); }
+                    }
                 }
 
                 // Check if summarization has started (fetch transcript) or processing is complete

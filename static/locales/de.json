@@ -1875,6 +1875,7 @@
     "reprocessNote": "Das kombinierte Audio wird erneut transkribiert und zusammengefasst, um eine durchgehende Transkription und Zusammenfassung zu erstellen.",
     "merging": "Wird zusammengeführt…",
     "confirm": "Zusammenführen",
-    "videoNote": "Diese Aufnahmen enthalten Video. Beim Zusammenführen wird nur der Ton kombiniert; die zusammengeführte Aufnahme enthält kein Video."
+    "videoNote": "Diese Aufnahmen enthalten Video. Beim Zusammenführen wird nur der Ton kombiniert; die zusammengeführte Aufnahme enthält kein Video.",
+    "audioPreparing": "Der Ton wird noch vorbereitet. Er ist in Kürze abspielbar."
   }
 }

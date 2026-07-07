@@ -1875,6 +1875,7 @@
     "reprocessNote": "L'audio combiné sera de nouveau transcrit et résumé afin de produire une transcription et un résumé continus.",
     "merging": "Fusion…",
     "confirm": "Fusionner",
-    "videoNote": "Ces enregistrements contiennent de la vidéo. La fusion ne combine que l'audio ; l'enregistrement fusionné n'aura pas de vidéo."
+    "videoNote": "Ces enregistrements contiennent de la vidéo. La fusion ne combine que l'audio ; l'enregistrement fusionné n'aura pas de vidéo.",
+    "audioPreparing": "L'audio est en cours de préparation. Il sera lisible dans un instant."
   }
 }

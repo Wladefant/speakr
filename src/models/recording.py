@@ -350,6 +350,10 @@ class Recording(db.Model):
             'is_highlighted': self.is_highlighted,
             'audio_deleted_at': self.audio_deleted_at.isoformat() if self.audio_deleted_at else None,
             'audio_available': self.audio_deleted_at is None,
+            # True only when a playable audio file actually exists yet. A merge
+            # (issue #323) creates the row before its audio is stitched, so the
+            # UI uses this to keep the play button disabled until the file lands.
+            'audio_ready': bool(self.audio_path) and self.audio_deleted_at is None,
             'deletion_exempt': self.deletion_exempt,
             'folder_id': folder_id_ser,
             'folder': folder_ser,

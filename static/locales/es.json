@@ -1875,6 +1875,7 @@
     "reprocessNote": "El audio combinado se transcribirá y resumirá de nuevo para producir una transcripción y un resumen continuos.",
     "merging": "Combinando…",
     "confirm": "Combinar",
-    "videoNote": "Estas grabaciones incluyen vídeo. La combinación une solo el audio; la grabación combinada no tendrá vídeo."
+    "videoNote": "Estas grabaciones incluyen vídeo. La combinación une solo el audio; la grabación combinada no tendrá vídeo.",
+    "audioPreparing": "El audio aún se está preparando. Podrás reproducirlo en un momento."
   }
 }

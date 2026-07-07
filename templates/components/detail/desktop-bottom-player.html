@@ -116,8 +116,9 @@
         <div v-show="!videoFullscreen" class="flex items-center gap-3 min-w-0">
             <!-- Play/Pause -->
             <button @click="toggleAudioPlayback"
-                    class="w-10 h-10 flex items-center justify-center rounded-full player-play-button transition-all duration-200 flex-shrink-0 shadow-md hover:shadow-lg hover:scale-105"
-                    :title="audioIsPlaying ? t('tooltips.pause') : t('tooltips.play')">
+                    :disabled="selectedRecording && selectedRecording.audio_ready === false"
+                    class="w-10 h-10 flex items-center justify-center rounded-full player-play-button transition-all duration-200 flex-shrink-0 shadow-md hover:shadow-lg hover:scale-105 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:scale-100"
+                    :title="(selectedRecording && selectedRecording.audio_ready === false) ? t('mergeRecordings.audioPreparing') : (audioIsPlaying ? t('tooltips.pause') : t('tooltips.play'))">
                 <i :class="audioIsPlaying ? 'fas fa-pause' : 'fas fa-play'" class="text-base" :style="!audioIsPlaying ? 'margin-left: 2px' : ''"></i>
             </button>
 

@@ -1013,11 +1013,21 @@ export function useUI(state, utils, processedTranscription) {
     };
 
     const toggleAudioPlayback = () => {
+        // A merged recording exists before its audio is stitched; playing it
+        // then throws a media error. Block until the file is ready (#323).
+        if (selectedRecording.value && selectedRecording.value.audio_ready === false) {
+            showToast(t('mergeRecordings.audioPreparing'), 'fa-hourglass-half');
+            return;
+        }
+
         const audio = getAudioElement();
         if (!audio) return;
 
         if (audio.paused) {
-            audio.play();
+            // Swallow the play() rejection so a transient/unsupported media
+            // state does not surface as an uncaught DOMException in the console.
+            const p = audio.play();
+            if (p && typeof p.catch === 'function') p.catch(() => {});
         } else {
             audio.pause();
         }

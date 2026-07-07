@@ -3623,8 +3623,12 @@ def get_recording_status_only(recording_id):
         if not has_recording_access(recording, current_user):
             return jsonify({'error': 'You do not have permission to view this recording'}), 403
 
-        # Return only the status field
-        return jsonify({'status': recording.status})
+        # Return the status plus audio_ready so pollers can enable playback the
+        # moment a merge/stitch finishes writing the audio file (#323).
+        return jsonify({
+            'status': recording.status,
+            'audio_ready': bool(recording.audio_path) and recording.audio_deleted_at is None,
+        })
     except Exception as e:
         current_app.logger.error(f"Error fetching status for recording {recording_id}: {e}", exc_info=True)
         return jsonify({'error': 'An unexpected error occurred.'}), 500

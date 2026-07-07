@@ -1875,6 +1875,7 @@
     "reprocessNote": "O áudio combinado será transcrito e resumido novamente para produzir uma transcrição e um resumo contínuos.",
     "merging": "Mesclando…",
     "confirm": "Mesclar",
-    "videoNote": "Estas gravações incluem vídeo. A mesclagem combina apenas o áudio; a gravação mesclada não terá vídeo."
+    "videoNote": "Estas gravações incluem vídeo. A mesclagem combina apenas o áudio; a gravação mesclada não terá vídeo.",
+    "audioPreparing": "O áudio ainda está sendo preparado. Poderá ser reproduzido em instantes."
   }
 }

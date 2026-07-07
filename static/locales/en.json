@@ -1875,6 +1875,7 @@
     "reprocessNote": "The combined audio will be transcribed and summarized again to produce one continuous transcript and summary.",
     "merging": "Merging…",
     "confirm": "Merge recordings",
-    "videoNote": "These recordings include video. Merging combines the audio only; the merged recording will not have video."
+    "videoNote": "These recordings include video. Merging combines the audio only; the merged recording will not have video.",
+    "audioPreparing": "Audio is still being prepared. It will be playable in a moment."
   }
 }
