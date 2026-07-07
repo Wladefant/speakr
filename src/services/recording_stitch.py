@@ -421,23 +421,36 @@ def kickoff_transcription_for_stitched(
     user_id: int,
     metadata: dict,
 ) -> None:
-    """Enqueue the downstream transcribe job using the same precedence
-    chain as ``upload_file`` for the fields that apply to a recording
-    that already exists. Idempotent (the job_queue rejects duplicate
-    active jobs of the same type for the same recording)."""
+    """Enqueue the downstream transcribe job through the shared param resolver
+    so a stitched recording-session file honors the owner's tag/folder/account
+    defaults just like a normal upload. The session's own selections (captured in
+    ``metadata``) act as the per-request overrides. Idempotent (the job_queue
+    rejects duplicate active jobs of the same type for the same recording)."""
     from src.services.job_queue import job_queue
+    from src.services.transcription_defaults import resolve_transcription_params
+    from src.database import db
+    from src.models import Recording
+
+    recording = db.session.get(Recording, recording_id)
+
+    overrides = {
+        'min_speakers': metadata.get('min_speakers'),
+        'max_speakers': metadata.get('max_speakers'),
+        'hotwords': metadata.get('hotwords'),
+        'initial_prompt': metadata.get('initial_prompt'),
+        'transcription_model': metadata.get('transcription_model'),
+    }
+    session_language = metadata.get('language') or metadata.get('asr_language')
+    if session_language:
+        overrides['language'] = session_language
+    if metadata.get('tag_id') is not None:
+        overrides['tag_id'] = metadata.get('tag_id')
+
+    job_params = resolve_transcription_params(recording, overrides)
     job_queue.enqueue(
         user_id=user_id,
         recording_id=recording_id,
         job_type='transcribe',
-        params={
-            'language': metadata.get('language') or metadata.get('asr_language'),
-            'min_speakers': metadata.get('min_speakers'),
-            'max_speakers': metadata.get('max_speakers'),
-            'tag_id': metadata.get('tag_id'),
-            'hotwords': metadata.get('hotwords'),
-            'initial_prompt': metadata.get('initial_prompt'),
-            'transcription_model': metadata.get('transcription_model'),
-        },
+        params=job_params,
         is_new_upload=True,
     )

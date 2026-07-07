@@ -2277,27 +2277,27 @@ def start_transcription(recording_id):
 
     data = request.get_json() or {}
 
-    # Apply the same per-request model override path as the upload/reprocess
-    # web endpoints (issue #266). Validates against the admin-curated list +
-    # env allowlist and applies the admin-saved default when nothing was sent.
-    from src.api.recordings import _resolve_transcription_model
-    transcription_model = _resolve_transcription_model(data.get('transcription_model'))
-
-    params = {
-        'language': data.get('language'),
+    # Resolve the full transcribe param set through the shared chain so the API
+    # applies the same tag/folder/env/account defaults + admin model validation
+    # as the web upload/reprocess endpoints (issue #266).
+    from src.services.transcription_defaults import resolve_transcription_params
+    overrides = {
         'min_speakers': data.get('min_speakers'),
         'max_speakers': data.get('max_speakers'),
         'hotwords': data.get('hotwords'),
         'initial_prompt': data.get('initial_prompt'),
-        'transcription_model': transcription_model,
+        'transcription_model': data.get('transcription_model'),
     }
+    if 'language' in data:
+        overrides['language'] = data.get('language')
+    params = resolve_transcription_params(recording, overrides)
 
     # Queue the job
     job_id = job_queue.enqueue(
         user_id=current_user.id,
         recording_id=recording_id,
         job_type='reprocess_transcription',
-        params={k: v for k, v in params.items() if v is not None}
+        params=params
     )
 
     return jsonify({
@@ -2768,11 +2768,12 @@ def batch_transcribe_recordings():
             continue
 
         try:
+            from src.services.transcription_defaults import resolve_transcription_params
             job_id = job_queue.enqueue(
                 user_id=current_user.id,
                 recording_id=recording_id,
                 job_type='reprocess_transcription',
-                params={}
+                params=resolve_transcription_params(recording)
             )
             results.append({'id': recording_id, 'success': True, 'job_id': job_id})
         except Exception as e:

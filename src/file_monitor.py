@@ -481,14 +481,10 @@ class FileMonitor:
                 )
                 recording.audio_path = stored_object.locator
 
-                user_hotwords = (user.transcription_hotwords or '').strip() if getattr(user, 'transcription_hotwords', None) else None
-                user_initial_prompt = (user.transcription_initial_prompt or '').strip() if getattr(user, 'transcription_initial_prompt', None) else None
-                user_language = (user.transcription_language or '').strip() if getattr(user, 'transcription_language', None) else None
-
                 self.logger.info(f"Created recording record with ID: {recording.id} for user: {user.username}")
 
-                # Apply tag if specified
-                job_params = {}
+                # Apply tag if specified (so the recording carries it before we
+                # resolve transcribe params below).
                 if tag_id:
                     from src.models import Tag, RecordingTag
                     tag = db.session.get(Tag, tag_id)
@@ -502,29 +498,14 @@ class FileMonitor:
                         db.session.commit()
                         self.logger.info(f"Applied tag '{tag.name}' (id={tag_id}) to recording {recording.id}")
 
-                        # Pass tag settings to job params
-                        if tag.default_hotwords:
-                            job_params['hotwords'] = tag.default_hotwords
-                        if tag.default_initial_prompt:
-                            job_params['initial_prompt'] = tag.default_initial_prompt
-                        if tag.default_language:
-                            job_params['language'] = tag.default_language
-                        if tag.default_min_speakers:
-                            job_params['min_speakers'] = tag.default_min_speakers
-                        if tag.default_max_speakers:
-                            job_params['max_speakers'] = tag.default_max_speakers
-                        if tag.custom_prompt:
-                            job_params['custom_prompt'] = tag.custom_prompt
-                        job_params['tag_id'] = tag_id
-
-                if 'language' not in job_params and user_language:
-                    job_params['language'] = user_language
-                if 'hotwords' not in job_params and user_hotwords:
-                    job_params['hotwords'] = user_hotwords
-                if 'initial_prompt' not in job_params and user_initial_prompt:
-                    job_params['initial_prompt'] = user_initial_prompt
-
                 db.session.commit()
+
+                # Resolve transcribe params through the shared chain so an
+                # auto-processed file honors the same tag/folder/env/account
+                # defaults (speaker hints, model, hotwords, prompt) as a normal
+                # upload — previously this path only forwarded a thin subset.
+                from src.services.transcription_defaults import resolve_transcription_params
+                job_params = resolve_transcription_params(recording)
 
                 # Queue for background processing
                 from src.services.job_queue import job_queue

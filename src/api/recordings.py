@@ -26,52 +26,14 @@ from src.utils import *
 from src.config.app_config import ASR_MIN_SPEAKERS, ASR_MAX_SPEAKERS, ASR_DIARIZE, USE_NEW_TRANSCRIPTION_ARCHITECTURE
 
 
-def _resolve_transcription_model(value):
-    """Apply admin-curated allowlist + default to a candidate model name.
-
-    Resolution:
-      1. If the caller passed a non-empty value:
-         a. If the admin saved a visible-models list in system_setting and the
-            value is in it, accept.
-         b. Else if TRANSCRIPTION_MODELS_AVAILABLE is set and the value is in
-            it, accept.
-         c. Else if neither list is configured, accept (no allowlist enforced).
-         d. Otherwise, drop the value with a warning.
-      2. If the caller passed nothing, fall back to the admin-saved default
-         model (system_setting key `transcription_default_model`) when set.
-    Returns the validated model id or None.
-    """
-    from src.config.app_config import TRANSCRIPTION_MODELS_AVAILABLE
-    import json as _json
-
-    candidate = (value or '').strip() or None
-    visible = []
-    try:
-        raw = SystemSetting.get_setting('transcription_models_visible_json', None)
-        if raw:
-            parsed = _json.loads(raw)
-            if isinstance(parsed, list):
-                visible = [
-                    (item['value'] if isinstance(item, dict) else item)
-                    for item in parsed if item
-                ]
-    except Exception:
-        visible = []
-
-    if candidate:
-        in_db_list = bool(visible) and candidate in visible
-        in_env_list = bool(TRANSCRIPTION_MODELS_AVAILABLE) and candidate in TRANSCRIPTION_MODELS_AVAILABLE
-        if visible or TRANSCRIPTION_MODELS_AVAILABLE:
-            if not (in_db_list or in_env_list):
-                current_app.logger.warning(
-                    f"Ignoring transcription_model={candidate!r} — not in admin-curated list or TRANSCRIPTION_MODELS_AVAILABLE"
-                )
-                candidate = None
-        return candidate
-
-    # Fall back to admin-saved default when no override flowed through.
-    default = SystemSetting.get_setting('transcription_default_model', None)
-    return default or None
+# Model validation + the full default-resolution chain now live in one shared
+# module so every ingestion path (upload, reprocess, merge, stitch, share,
+# auto-process) resolves transcription params identically. Kept as an alias so
+# existing references in this file keep working.
+from src.services.transcription_defaults import (
+    resolve_transcription_model as _resolve_transcription_model,
+    resolve_transcription_params,
+)
 from src.tasks.processing import format_transcription_for_llm, _resolve_timestamp_template_format
 from src.utils.dates import to_utc_naive
 from src.utils.ffmpeg_utils import FFmpegError, FFmpegNotFoundError
@@ -1269,105 +1231,21 @@ def reprocess_transcription(recording_id):
         start_time = datetime.utcnow()
         app_context = current_app._get_current_object().app_context()
 
-        # Build job parameters - language handling:
-        # - If 'language' key exists with a value (e.g., 'es'), use that language
-        # - If 'language' key exists but is empty string, keep as empty string (signals auto-detect)
-        # - If 'language' key doesn't exist at all, fall back to user's default (backwards compat)
-        if 'language' in data:
-            # User explicitly chose a language (or auto-detect with empty string)
-            language = data.get('language')  # Could be 'es', '', or None
-        else:
-            # Language not provided - use user's default (backwards compatibility)
-            language = recording.owner.transcription_language if recording.owner else None
-
-        min_speakers = data.get('min_speakers') or None
-        max_speakers = data.get('max_speakers') or None
-        hotwords = (data.get('hotwords') or '').strip() or None
-        initial_prompt = (data.get('initial_prompt') or '').strip() or None
-        transcription_model = (data.get('transcription_model') or '').strip() or None
-
-        # Convert to int if provided
-        if min_speakers:
-            try:
-                min_speakers = int(min_speakers)
-            except (ValueError, TypeError):
-                min_speakers = None
-        if max_speakers:
-            try:
-                max_speakers = int(max_speakers)
-            except (ValueError, TypeError):
-                max_speakers = None
-
-        # Apply precedence chain mirroring upload_file():
-        #   user input > tag defaults > folder defaults > env defaults > user defaults
-
-        # Tag defaults (highest priority after user input). Use the first tag's
-        # defaults when present.
-        if recording.tags:
-            for tag_association in sorted(recording.tag_associations, key=lambda x: x.order):
-                tag = tag_association.tag
-                if min_speakers is None and tag.default_min_speakers:
-                    min_speakers = tag.default_min_speakers
-                if max_speakers is None and tag.default_max_speakers:
-                    max_speakers = tag.default_max_speakers
-                if not hotwords and tag.default_hotwords:
-                    hotwords = tag.default_hotwords
-                if not initial_prompt and tag.default_initial_prompt:
-                    initial_prompt = tag.default_initial_prompt
-                if not transcription_model and tag.default_transcription_model:
-                    transcription_model = tag.default_transcription_model
-                if (min_speakers is not None and max_speakers is not None
-                        and hotwords and initial_prompt and transcription_model):
-                    break
-
-        # Folder defaults (only if recording has no tags providing the value)
-        if recording.folder:
-            folder = recording.folder
-            if min_speakers is None and folder.default_min_speakers:
-                min_speakers = folder.default_min_speakers
-            if max_speakers is None and folder.default_max_speakers:
-                max_speakers = folder.default_max_speakers
-            if not hotwords and folder.default_hotwords:
-                hotwords = folder.default_hotwords
-            if not initial_prompt and folder.default_initial_prompt:
-                initial_prompt = folder.default_initial_prompt
-            if not transcription_model and folder.default_transcription_model:
-                transcription_model = folder.default_transcription_model
-
-        # Environment variable defaults
-        if min_speakers is None and ASR_MIN_SPEAKERS:
-            try:
-                min_speakers = int(ASR_MIN_SPEAKERS)
-            except (ValueError, TypeError):
-                min_speakers = None
-        if max_speakers is None and ASR_MAX_SPEAKERS:
-            try:
-                max_speakers = int(ASR_MAX_SPEAKERS)
-            except (ValueError, TypeError):
-                max_speakers = None
-
-        # User defaults (lowest priority). The recording owner's account-level
-        # hotwords / initial_prompt apply when no tag/folder/env value was set.
-        owner = recording.owner
-        if owner:
-            if not hotwords and owner.transcription_hotwords:
-                hotwords = owner.transcription_hotwords
-            if not initial_prompt and owner.transcription_initial_prompt:
-                initial_prompt = owner.transcription_initial_prompt
-
-        # Validate against admin-curated list and apply admin default when
-        # nothing else in the chain set a model. See _resolve_transcription_model.
-        transcription_model = _resolve_transcription_model(transcription_model)
-
-        # Enqueue the job with all parameters
-        job_params = {
-            'language': language,
-            'min_speakers': min_speakers,
-            'max_speakers': max_speakers,
-            'hotwords': hotwords,
-            'initial_prompt': initial_prompt,
-            'transcription_model': transcription_model,
+        # Resolve the full transcribe param set through the shared chain:
+        # per-request override > tag > folder > env > owner > admin default.
+        # The 'language' key is only forwarded when explicitly present so an
+        # empty string still means auto-detect and an absent key falls back to
+        # the owner's default (see resolve_transcription_params).
+        overrides = {
+            'min_speakers': data.get('min_speakers'),
+            'max_speakers': data.get('max_speakers'),
+            'hotwords': data.get('hotwords'),
+            'initial_prompt': data.get('initial_prompt'),
+            'transcription_model': data.get('transcription_model'),
         }
+        if 'language' in data:
+            overrides['language'] = data.get('language')
+        job_params = resolve_transcription_params(recording, overrides)
 
         job_id = job_queue.enqueue(
             user_id=current_user.id,
@@ -2443,14 +2321,11 @@ def share_target():
     db.session.add(recording)
     db.session.commit()
 
-    # Enqueue transcription with user's defaults. Mirrors the precedence
-    # chain in upload_file for the fields that apply when no tag/folder
-    # context is available.
-    job_params = {
-        'language': current_user.transcription_language,
-        'hotwords': current_user.transcription_hotwords,
-        'initial_prompt': current_user.transcription_initial_prompt,
-    }
+    # Enqueue transcription through the shared resolver so a shared file honors
+    # the same account defaults (and any future tag/folder context) as every
+    # other ingestion path. A share sheet carries no tag/folder, so this
+    # resolves to the owner's account-level defaults.
+    job_params = resolve_transcription_params(recording)
     try:
         job_queue.enqueue(
             user_id=current_user.id,

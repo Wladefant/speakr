@@ -596,14 +596,19 @@ class TestProcessFile(unittest.TestCase):
         assoc = RecordingTag.query.filter_by(recording_id=rec.id, tag_id=tag.id).first()
         self.assertIsNotNone(assoc)
 
+        # Auto-process now resolves transcribe params through the shared
+        # resolver (resolve_transcription_params), the same chain uploads use.
         params = enqueued[0]['params']
         self.assertEqual(params['hotwords'], 'Foo, Bar')
         self.assertEqual(params['initial_prompt'], 'a prompt')
         self.assertEqual(params['language'], 'es')
         self.assertEqual(params['min_speakers'], 2)
         self.assertEqual(params['max_speakers'], 4)
-        self.assertEqual(params['custom_prompt'], 'summarize this')
         self.assertEqual(params['tag_id'], tag.id)
+        # custom_prompt is a SUMMARY concern: the auto-summary resolves
+        # tag.custom_prompt from the recording's applied tag directly, so it is
+        # deliberately not forwarded in the (transcribe) job params.
+        self.assertNotIn('custom_prompt', params)
 
     def test_process_file_logs_conversion_and_compression(self):
         # convert_if_needed reporting was_converted/was_compressed exercises the

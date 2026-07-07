@@ -288,16 +288,12 @@ def run_merge_job(recording, params):
                 current_app.logger.warning(f"Failed to delete source recording {rec.id} after merge: {e}")
         db.session.commit()
 
-    # Queue transcription using the user's defaults.
-    from src.models import User
-    owner = db.session.get(User, recording.user_id)
-    first_tag = recording.tags[0] if recording.tags else None
-    job_params = {
-        'language': owner.transcription_language if owner else None,
-        'hotwords': owner.transcription_hotwords if owner else None,
-        'initial_prompt': owner.transcription_initial_prompt if owner else None,
-        'tag_id': first_tag.id if first_tag else None,
-    }
+    # Queue transcription with the SAME resolved params a normal upload gets, so
+    # the merged file honors all of the owner's tag/folder/account preferences
+    # (speaker-count hints, hotwords, initial prompt, transcription model) and
+    # therefore diarization + auto speaker labelling behave identically (#323).
+    from src.services.transcription_defaults import resolve_transcription_params
+    job_params = resolve_transcription_params(recording)
     job_queue.enqueue(
         user_id=recording.user_id,
         recording_id=recording.id,
