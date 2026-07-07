@@ -1876,6 +1876,16 @@
     "merging": "Combinando…",
     "confirm": "Combinar",
     "videoNote": "Estas grabaciones incluyen vídeo. La combinación une solo el audio; la grabación combinada no tendrá vídeo.",
-    "audioPreparing": "El audio aún se está preparando. Podrás reproducirlo en un momento."
+    "audioPreparing": "El audio aún se está preparando. Podrás reproducirlo en un momento.",
+    "remove": "Quitar",
+    "addRecording": "Añadir una grabación",
+    "searchRecordings": "Buscar grabaciones…",
+    "noCandidates": "No hay grabaciones disponibles para añadir",
+    "moreOptions": "Más opciones",
+    "mergeWithExisting": "Combinar con una grabación existente…",
+    "noClip": "No hay audio grabado para combinar.",
+    "uploadedMergeManually": "Tu clip se ha subido. Selecciónalo junto con otra grabación de la lista para combinarlos.",
+    "preparingClip": "Preparando tu clip: las opciones de combinación se abrirán cuando esté listo.",
+    "clipNotReady": "No se pudo preparar el clip para la combinación."
   }
 }

@@ -397,13 +397,31 @@
                 </button>
             </div>
             <div v-if="!isRecording && audioBlobURL" class="flex flex-col sm:flex-row gap-3 justify-center">
-                <!-- Normal Upload Button -->
-                <button v-if="!incognitoMode || !enableIncognitoMode"
-                        @click="uploadRecordedAudio"
-                        class="flex-1 px-6 py-3 bg-[var(--bg-button)] text-[var(--text-button)] rounded-lg hover:bg-[var(--bg-button-hover)] transition-colors flex items-center justify-center gap-2">
-                    <i class="fas fa-upload"></i>
-                    <span v-text="t('help.uploadRecordingNotes')"></span>
-                </button>
+                <!-- Normal Upload Button (split: main uploads, caret opens options) -->
+                <div v-if="!incognitoMode || !enableIncognitoMode" class="flex-1 flex relative">
+                    <button @click="uploadRecordedAudio"
+                            class="flex-1 px-6 py-3 bg-[var(--bg-button)] text-[var(--text-button)] rounded-l-lg hover:bg-[var(--bg-button-hover)] transition-colors flex items-center justify-center gap-2">
+                        <i class="fas fa-upload"></i>
+                        <span v-text="t('help.uploadRecordingNotes')"></span>
+                    </button>
+                    <button @click="showUploadSplitMenu = !showUploadSplitMenu"
+                            class="px-3 bg-[var(--bg-button)] text-[var(--text-button)] rounded-r-lg hover:bg-[var(--bg-button-hover)] transition-colors border-l border-white/25 flex items-center justify-center"
+                            :title="t('mergeRecordings.moreOptions')">
+                        <i class="fas fa-chevron-down text-xs"></i>
+                    </button>
+                    <!-- Click-away backdrop -->
+                    <div v-if="showUploadSplitMenu" @click="showUploadSplitMenu = false" class="fixed inset-0 z-40"></div>
+                    <!-- Options menu (opens upward; the bar is pinned to the bottom) -->
+                    <div v-if="showUploadSplitMenu"
+                         class="absolute bottom-full right-0 mb-1 surface-raised z-50 overflow-hidden whitespace-nowrap rounded-md"
+                         style="min-width: 260px;">
+                        <button @click="showUploadSplitMenu = false; mergeRecordedWithExisting()"
+                                class="w-full text-left px-3 py-2.5 text-sm hover:bg-[var(--bg-tertiary)] transition-colors flex items-center gap-2">
+                            <i class="fas fa-object-group text-purple-500"></i>
+                            <span v-text="t('mergeRecordings.mergeWithExisting')"></span>
+                        </button>
+                    </div>
+                </div>
                 <!-- Incognito Upload Button -->
                 <button v-else
                         @click="uploadRecordedAudioIncognito"

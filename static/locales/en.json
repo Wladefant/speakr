@@ -1876,6 +1876,16 @@
     "merging": "Merging…",
     "confirm": "Merge recordings",
     "videoNote": "These recordings include video. Merging combines the audio only; the merged recording will not have video.",
-    "audioPreparing": "Audio is still being prepared. It will be playable in a moment."
+    "audioPreparing": "Audio is still being prepared. It will be playable in a moment.",
+    "remove": "Remove",
+    "addRecording": "Add a recording",
+    "searchRecordings": "Search recordings…",
+    "noCandidates": "No recordings available to add",
+    "moreOptions": "More options",
+    "mergeWithExisting": "Merge with an existing recording…",
+    "noClip": "No recorded audio to merge.",
+    "uploadedMergeManually": "Your clip was uploaded. Select it and another recording in the list to merge them.",
+    "preparingClip": "Preparing your clip — the merge options will open when it's ready.",
+    "clipNotReady": "The clip could not be prepared for merging."
   }
 }

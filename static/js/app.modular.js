@@ -715,6 +715,9 @@ document.addEventListener('DOMContentLoaded', async () => {
             const legendExpanded = ref(false);
             const highlightedSpeaker = ref(null);
             const showDownloadMenu = ref(false);
+            // Split-button menu on the recording-view "Upload Recording & Notes"
+            // action (offers "merge with an existing recording").
+            const showUploadSplitMenu = ref(false);
             // Preferred transcript download format ('txt' | 'md'), persisted.
             const transcriptDownloadFormat = ref(localStorage.getItem('transcriptDownloadFormat') === 'md' ? 'md' : 'txt');
             watch(transcriptDownloadFormat, (val) => {
@@ -1686,7 +1689,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
                 // Transcription
                 transcriptionViewMode, legendExpanded, highlightedSpeaker, showDownloadMenu,
-                transcriptDownloadFormat,
+                transcriptDownloadFormat, showUploadSplitMenu,
                 currentPlayingSegmentIndex, followPlayerMode, processingIndicatorMinimized,
 
                 // Chat
@@ -2407,6 +2410,11 @@ document.addEventListener('DOMContentLoaded', async () => {
                 exitSelectionMode: bulkSelectionComposable.exitSelectionMode,
                 startReprocessingPoll: reprocessComposable.startReprocessingPoll
             });
+
+            // Bridge merge-modal opener to the audio composable so the
+            // "merge this recording with an existing one" split-button action in
+            // the recording view can seed and open the merge modal after upload.
+            utils.openMergeWith = bulkOperationsComposable.openMergeWith;
 
             // =========================================================================
             // VIRTUAL SCROLL SETUP (for performance with long transcriptions)

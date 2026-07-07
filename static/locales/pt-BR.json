@@ -1876,6 +1876,16 @@
     "merging": "Mesclando…",
     "confirm": "Mesclar",
     "videoNote": "Estas gravações incluem vídeo. A mesclagem combina apenas o áudio; a gravação mesclada não terá vídeo.",
-    "audioPreparing": "O áudio ainda está sendo preparado. Poderá ser reproduzido em instantes."
+    "audioPreparing": "O áudio ainda está sendo preparado. Poderá ser reproduzido em instantes.",
+    "remove": "Remover",
+    "addRecording": "Adicionar uma gravação",
+    "searchRecordings": "Pesquisar gravações…",
+    "noCandidates": "Nenhuma gravação disponível para adicionar",
+    "moreOptions": "Mais opções",
+    "mergeWithExisting": "Mesclar com uma gravação existente…",
+    "noClip": "Nenhum áudio gravado para mesclar.",
+    "uploadedMergeManually": "Seu clipe foi enviado. Selecione-o e outra gravação da lista para mesclá-los.",
+    "preparingClip": "Preparando seu clipe — as opções de mesclagem abrirão quando estiver pronto.",
+    "clipNotReady": "Não foi possível preparar o clipe para a mesclagem."
   }
 }

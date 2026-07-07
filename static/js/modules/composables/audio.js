@@ -1055,6 +1055,67 @@ export function useAudio(state, utils) {
         }
     };
 
+    // Poll a recording until its audio is settled and it is mergeable
+    // (COMPLETED), then return its full dict. Used by mergeRecordedWithExisting.
+    const _pollUntilMergeable = async (recordingId, { timeoutMs = 15 * 60 * 1000, intervalMs = 3000 } = {}) => {
+        const start = Date.now();
+        while (Date.now() - start < timeoutMs) {
+            try {
+                const resp = await fetch(`/recording/${recordingId}/status`);
+                if (resp.ok) {
+                    const s = await resp.json();
+                    if (s.status === 'COMPLETED' && s.audio_ready !== false) {
+                        const full = await fetch(`/api/recordings/${recordingId}`);
+                        return full.ok ? await full.json() : null;
+                    }
+                    if (s.status === 'FAILED') return null;
+                }
+            } catch (_) { /* transient; keep polling */ }
+            await new Promise(r => setTimeout(r, intervalMs));
+        }
+        return null;
+    };
+
+    // Split-button action: upload the just-recorded clip, then open the merge
+    // modal seeded with it so the user can combine it with existing
+    // recording(s). The merge service only accepts settled sources, so we upload
+    // first and wait for the clip to finish processing before opening the modal.
+    const mergeRecordedWithExisting = async () => {
+        const t = (k, p) => (utils.t ? utils.t(k, p) : k);
+        if (!audioBlobURL.value) {
+            setGlobalError(t('mergeRecordings.noClip') || 'No recorded audio to merge.');
+            return;
+        }
+
+        let result;
+        try {
+            result = await uploadRecordedAudio();
+        } catch (e) {
+            setGlobalError(`Upload failed: ${e.message}`);
+            return;
+        }
+
+        const newId = result && result.recording_id;
+        if (!newId) {
+            // Legacy single-shot path or a failure — the clip uploaded normally
+            // but we can't chain a merge automatically.
+            showToast?.(t('mergeRecordings.uploadedMergeManually'), 'fa-info-circle', 6000);
+            return;
+        }
+
+        showToast?.(t('mergeRecordings.preparingClip'), 'fa-spinner');
+        const rec = await _pollUntilMergeable(newId);
+        if (!rec) {
+            setGlobalError(t('mergeRecordings.clipNotReady'));
+            return;
+        }
+
+        if (utils.openMergeWith) {
+            // Default to replacing the sources (the chosen behavior for this flow).
+            utils.openMergeWith([rec], { deleteOriginals: true });
+        }
+    };
+
     // Upload recorded audio in incognito mode
     const uploadRecordedAudioIncognito = async () => {
         if (!audioBlobURL.value) {
@@ -1434,6 +1495,7 @@ export function useAudio(state, utils) {
         discardRecording,
         normalizeLiveMediaDuration,
         uploadRecordedAudio,
+        mergeRecordedWithExisting,
         uploadRecordedAudioIncognito,
         acceptRecordingDisclaimer,
         cancelRecordingDisclaimer,

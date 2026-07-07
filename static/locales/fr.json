@@ -1876,6 +1876,16 @@
     "merging": "Fusion…",
     "confirm": "Fusionner",
     "videoNote": "Ces enregistrements contiennent de la vidéo. La fusion ne combine que l'audio ; l'enregistrement fusionné n'aura pas de vidéo.",
-    "audioPreparing": "L'audio est en cours de préparation. Il sera lisible dans un instant."
+    "audioPreparing": "L'audio est en cours de préparation. Il sera lisible dans un instant.",
+    "remove": "Retirer",
+    "addRecording": "Ajouter un enregistrement",
+    "searchRecordings": "Rechercher des enregistrements…",
+    "noCandidates": "Aucun enregistrement à ajouter",
+    "moreOptions": "Plus d'options",
+    "mergeWithExisting": "Fusionner avec un enregistrement existant…",
+    "noClip": "Aucun audio enregistré à fusionner.",
+    "uploadedMergeManually": "Votre extrait a été téléversé. Sélectionnez-le ainsi qu'un autre enregistrement de la liste pour les fusionner.",
+    "preparingClip": "Préparation de votre extrait — les options de fusion s'ouvriront dès qu'il sera prêt.",
+    "clipNotReady": "Impossible de préparer l'extrait pour la fusion."
   }
 }

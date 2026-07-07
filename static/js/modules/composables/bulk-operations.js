@@ -33,6 +33,23 @@ export function useBulkOperations({
     const mergeTitle = ref('');
     const mergeDeleteOriginals = ref(false);
     const mergeInProgress = ref(false);
+    // In-modal "add recording" picker (lets the user append existing recordings
+    // to the merge from within the modal — used by the normal merge and by the
+    // merge-from-recording flow that seeds the modal with a just-recorded clip).
+    const mergeAddPickerOpen = ref(false);
+    const mergeAddSearch = ref('');
+    // Only completed recordings with settled audio are mergeable, and not ones
+    // already in the list. Filtered by the search box.
+    const mergeCandidates = computed(() => {
+        const inList = new Set(mergeOrderedList.value.map(r => r.id));
+        const q = mergeAddSearch.value.trim().toLowerCase();
+        return recordings.value.filter(r =>
+            !inList.has(r.id) &&
+            r.status === 'COMPLETED' &&
+            r.audio_ready !== false &&
+            (!q || (r.title || '').toLowerCase().includes(q))
+        );
+    });
 
     // Get CSRF token
     const getCsrfToken = () => {
@@ -282,6 +299,34 @@ export function useBulkOperations({
 
     const closeBulkMergeModal = () => {
         showBulkMergeModal.value = false;
+        mergeAddPickerOpen.value = false;
+        mergeAddSearch.value = '';
+    };
+
+    // Open the merge modal seeded with a specific set of recordings and options.
+    // Used by the "merge this recording with an existing one" flow (upload view)
+    // — it seeds the just-recorded clip and defaults to replacing the sources.
+    const openMergeWith = (seedRecordings, { deleteOriginals = false, title = '' } = {}) => {
+        mergeOrderedList.value = (seedRecordings || []).slice();
+        mergeTitle.value = title || '';
+        mergeDeleteOriginals.value = !!deleteOriginals;
+        mergeAddPickerOpen.value = false;
+        mergeAddSearch.value = '';
+        showBulkMergeModal.value = true;
+    };
+
+    const addMergeCandidate = (recording) => {
+        if (!recording) return;
+        if (mergeOrderedList.value.some(r => r.id === recording.id)) return;
+        mergeOrderedList.value = [...mergeOrderedList.value, recording];
+        mergeAddSearch.value = '';
+        mergeAddPickerOpen.value = false;
+    };
+
+    const removeMergeItem = (index) => {
+        const next = mergeOrderedList.value.slice();
+        next.splice(index, 1);
+        mergeOrderedList.value = next;
     };
 
     const moveMergeItem = (index, direction) => {
@@ -557,6 +602,9 @@ export function useBulkOperations({
         mergeTitle,
         mergeDeleteOriginals,
         mergeInProgress,
+        mergeAddPickerOpen,
+        mergeAddSearch,
+        mergeCandidates,
 
         // Bulk Delete
         openBulkDeleteModal,
@@ -576,6 +624,9 @@ export function useBulkOperations({
         // Merge
         openBulkMergeModal,
         closeBulkMergeModal,
+        openMergeWith,
+        addMergeCandidate,
+        removeMergeItem,
         moveMergeItem,
         executeBulkMerge,
 

@@ -1876,6 +1876,16 @@
     "merging": "正在合并…",
     "confirm": "合并",
     "videoNote": "这些录音包含视频。合并仅会合并音频；合并后的录音将不包含视频。",
-    "audioPreparing": "音频仍在准备中，稍后即可播放。"
+    "audioPreparing": "音频仍在准备中，稍后即可播放。",
+    "remove": "移除",
+    "addRecording": "添加录音",
+    "searchRecordings": "搜索录音…",
+    "noCandidates": "没有可添加的录音",
+    "moreOptions": "更多选项",
+    "mergeWithExisting": "与现有录音合并…",
+    "noClip": "没有可合并的录音。",
+    "uploadedMergeManually": "您的片段已上传。请在列表中选择它和另一条录音以进行合并。",
+    "preparingClip": "正在准备您的片段——准备就绪后将打开合并选项。",
+    "clipNotReady": "无法准备该片段以进行合并。"
   }
 }
