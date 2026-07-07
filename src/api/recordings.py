@@ -2697,61 +2697,27 @@ def upload_file():
             except (ValueError, TypeError):
                 max_speakers = None
 
-        # Apply precedence hierarchy: user input > tag defaults > folder defaults > environment variables > user defaults > auto-detect
-
-        # Apply folder defaults first (lower priority than tags)
-        if selected_folder and not selected_tags:
-            # Only apply folder defaults if no tags are selected (tags take priority)
-            if not language and selected_folder.default_language:
-                language = selected_folder.default_language
-            if min_speakers is None and selected_folder.default_min_speakers:
-                min_speakers = selected_folder.default_min_speakers
-            if max_speakers is None and selected_folder.default_max_speakers:
-                max_speakers = selected_folder.default_max_speakers
-            if not hotwords and selected_folder.default_hotwords:
-                hotwords = selected_folder.default_hotwords
-            if not initial_prompt and selected_folder.default_initial_prompt:
-                initial_prompt = selected_folder.default_initial_prompt
-            if not transcription_model and selected_folder.default_transcription_model:
-                transcription_model = selected_folder.default_transcription_model
-
-        # Apply tag defaults if tags are selected and values are not explicitly provided by user
-        # Use first tag's defaults (highest priority - overrides folder)
-        if selected_tags:
-            first_tag = selected_tags[0]
-            if not language and first_tag.default_language:
-                language = first_tag.default_language
-            if min_speakers is None and first_tag.default_min_speakers:
-                min_speakers = first_tag.default_min_speakers
-            if max_speakers is None and first_tag.default_max_speakers:
-                max_speakers = first_tag.default_max_speakers
-            if not hotwords and first_tag.default_hotwords:
-                hotwords = first_tag.default_hotwords
-            if not initial_prompt and first_tag.default_initial_prompt:
-                initial_prompt = first_tag.default_initial_prompt
-            if not transcription_model and first_tag.default_transcription_model:
-                transcription_model = first_tag.default_transcription_model
-
-        # Apply environment variable defaults if still no values are set
-        if min_speakers is None and ASR_MIN_SPEAKERS:
-            try:
-                min_speakers = int(ASR_MIN_SPEAKERS)
-            except (ValueError, TypeError):
-                min_speakers = None
-        if max_speakers is None and ASR_MAX_SPEAKERS:
-            try:
-                max_speakers = int(ASR_MAX_SPEAKERS)
-            except (ValueError, TypeError):
-                max_speakers = None
-
-        # Fall back to user defaults if still not set
-        if not language and current_user.transcription_language:
-            language = current_user.transcription_language
-            current_app.logger.info(f"Using user's default transcription language: {language}")
-        if not hotwords and current_user.transcription_hotwords:
-            hotwords = current_user.transcription_hotwords
-        if not initial_prompt and current_user.transcription_initial_prompt:
-            initial_prompt = current_user.transcription_initial_prompt
+        # Resolve the full transcribe param set through the shared chain used by
+        # every ingestion path: per-request form value > tag > folder > env >
+        # account default (see resolve_transcription_params). Folder defaults
+        # fill any gaps a tag left open (rather than being ignored when a tag is
+        # present), and an empty language falls through the chain rather than
+        # forcing auto-detect. The resolver also applies the admin-curated model
+        # validation/default, so no separate _resolve_transcription_model call is
+        # needed below.
+        resolved_params = resolve_transcription_params(
+            overrides={
+                'language': language,
+                'min_speakers': min_speakers,
+                'max_speakers': max_speakers,
+                'hotwords': hotwords,
+                'initial_prompt': initial_prompt,
+                'transcription_model': transcription_model,
+            },
+            tags=selected_tags,
+            folder=selected_folder,
+            owner=current_user,
+        )
 
         # Create initial database entry
         now = datetime.utcnow()
@@ -2848,21 +2814,9 @@ def upload_file():
 
         current_app.logger.info(f"Initial recording record created with ID: {recording.id}")
 
-        # Validate against admin-curated list and apply admin default when
-        # nothing else in the chain set a model.
-        transcription_model = _resolve_transcription_model(transcription_model)
-
         # --- Queue transcription job ---
-        first_tag = selected_tags[0] if selected_tags else None
-        job_params = {
-            'language': language,
-            'min_speakers': min_speakers,
-            'max_speakers': max_speakers,
-            'tag_id': first_tag.id if first_tag else None,
-            'hotwords': hotwords,
-            'initial_prompt': initial_prompt,
-            'transcription_model': transcription_model,
-        }
+        # Params were already resolved (incl. admin model validation) above.
+        job_params = resolved_params
 
         current_app.logger.info(f"Queueing transcription for recording {recording.id} with params: {job_params}")
         job_queue.enqueue(

@@ -94,21 +94,37 @@ def test_explicit_override_beats_everything():
         assert p["min_speakers"] == 4          # coerced from string
 
 
-def test_explicit_empty_language_is_autodetect_not_owner_default():
+def test_empty_language_falls_through_to_defaults():
     with app.app_context():
         user = _mk_user(transcription_language="fr")
         rec = _mk_recording(user)
-        # 'language' present but empty => auto-detect, must NOT fall back to 'fr'
-        p = resolve_transcription_params(rec, {"language": ""})
-        assert p["language"] == ""
+        # An empty/blank language is NOT a terminal auto-detect; it falls through
+        # the chain to the account default 'fr'.
+        assert resolve_transcription_params(rec, {"language": ""})["language"] == "fr"
+        assert resolve_transcription_params(rec, {"language": "   "})["language"] == "fr"
+        # Absent language behaves the same.
+        assert resolve_transcription_params(rec, {"hotwords": "x"})["language"] == "fr"
 
 
-def test_absent_language_falls_back_to_owner_default():
+def test_auto_detect_only_when_no_default_anywhere():
     with app.app_context():
-        user = _mk_user(transcription_language="fr")
+        user = _mk_user()  # no account default language
         rec = _mk_recording(user)
-        p = resolve_transcription_params(rec, {"hotwords": "x"})  # no language key
-        assert p["language"] == "fr"
+        # Nothing in the chain sets a language => auto-detect (None).
+        assert resolve_transcription_params(rec, {"language": ""})["language"] is None
+
+
+def test_resolver_accepts_explicit_tags_folder_owner_without_recording():
+    # Upload resolves before the recording row exists.
+    with app.app_context():
+        user = _mk_user(transcription_hotwords="acct_hw")
+        tag = Tag(name=f"t_{uuid.uuid4().hex[:6]}", user_id=user.id, default_language="de")
+        db.session.add(tag)
+        db.session.commit()
+        p = resolve_transcription_params(tags=[tag], folder=None, owner=user)
+        assert p["language"] == "de"
+        assert p["hotwords"] == "acct_hw"
+        assert p["tag_id"] == tag.id
 
 
 def test_explicit_tag_id_none_is_respected():

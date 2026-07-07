@@ -86,22 +86,26 @@ def resolve_transcription_model(value):
     return default or None
 
 
-def resolve_transcription_params(recording, overrides=None):
+def resolve_transcription_params(recording=None, overrides=None, *, tags=None, folder=None, owner=None):
     """Resolve the complete transcribe job params for a recording.
 
     Args:
-        recording: the Recording (provides .tags / .tag_associations / .folder /
-            .owner for the default chain).
+        recording: the Recording, when one already exists — its .tags / .folder /
+            .owner supply the default chain. May be omitted by callers that
+            resolve BEFORE the row exists (upload), which instead pass ``tags``,
+            ``folder`` and ``owner`` explicitly.
         overrides: optional dict of already-parsed per-request values. Recognized
             keys: ``language``, ``min_speakers``, ``max_speakers``, ``hotwords``,
-            ``initial_prompt``, ``transcription_model``, ``tag_id``. Any key that
-            is absent or None/empty is filled from the recording's tag -> folder
-            -> env -> owner defaults.
-
-            ``language`` is special: if the key is PRESENT (even as '' meaning
-            auto-detect) it is used verbatim; if ABSENT, the owner's default
-            language is used. ``tag_id`` is special: if the key is PRESENT (even
-            as None) it is respected; if ABSENT, the first tag's id is used.
+            ``initial_prompt``, ``transcription_model``, ``tag_id``. Any value
+            that is absent or None/empty falls through the tag -> folder -> env
+            -> owner chain. ``language`` follows the SAME rule as every other
+            field: a real value wins, an empty/blank value is not "auto-detect"
+            but simply unset and falls through the chain (auto-detect only
+            results when nothing in the chain sets a language). ``tag_id`` is
+            special: if the key is PRESENT (even as None) it is respected; if
+            ABSENT, the first tag's id is used.
+        tags / folder / owner: explicit context, used when ``recording`` is not
+            passed. Ordered ``tags`` list; ``folder`` and ``owner`` objects.
 
     Returns:
         dict with keys language, min_speakers, max_speakers, tag_id, hotwords,
@@ -111,6 +115,17 @@ def resolve_transcription_params(recording, overrides=None):
     from src.config.app_config import ASR_MIN_SPEAKERS, ASR_MAX_SPEAKERS
 
     overrides = overrides or {}
+
+    # Derive context from the recording when given; otherwise the caller (upload,
+    # which resolves before the row exists) supplies tags/folder/owner directly.
+    if recording is not None:
+        if tags is None:
+            tags = recording.tags
+        if folder is None:
+            folder = recording.folder
+        if owner is None:
+            owner = recording.owner
+    tags = list(tags) if tags else []
 
     def _override_str(key):
         v = overrides.get(key)
@@ -123,39 +138,29 @@ def resolve_transcription_params(recording, overrides=None):
     hotwords = _override_str('hotwords')
     initial_prompt = _override_str('initial_prompt')
     transcription_model = _override_str('transcription_model')
+    # language behaves like every other field: a real override wins; an empty or
+    # blank value falls through the tag -> folder -> owner chain.
+    language = _override_str('language')
 
-    owner = recording.owner
-
-    # language: an explicit override key (including '' for auto-detect) wins and
-    # skips the default chain entirely. Otherwise language resolves through the
-    # same tag -> folder -> owner chain as every other field.
-    language_explicit = 'language' in overrides
-    language = overrides.get('language') if language_explicit else None
-
-    # Tag defaults — first tag (by association order) that supplies each value.
-    first_tag = None
-    if recording.tags:
-        for assoc in sorted(recording.tag_associations, key=lambda x: x.order):
-            tag = assoc.tag
-            if first_tag is None:
-                first_tag = tag
-            if not language_explicit and not language and tag.default_language:
-                language = tag.default_language
-            if min_speakers is None and tag.default_min_speakers:
-                min_speakers = tag.default_min_speakers
-            if max_speakers is None and tag.default_max_speakers:
-                max_speakers = tag.default_max_speakers
-            if not hotwords and tag.default_hotwords:
-                hotwords = tag.default_hotwords
-            if not initial_prompt and tag.default_initial_prompt:
-                initial_prompt = tag.default_initial_prompt
-            if not transcription_model and tag.default_transcription_model:
-                transcription_model = tag.default_transcription_model
+    # Tag defaults — first tag (by order) that supplies each value.
+    first_tag = tags[0] if tags else None
+    for tag in tags:
+        if not language and tag.default_language:
+            language = tag.default_language
+        if min_speakers is None and tag.default_min_speakers:
+            min_speakers = tag.default_min_speakers
+        if max_speakers is None and tag.default_max_speakers:
+            max_speakers = tag.default_max_speakers
+        if not hotwords and tag.default_hotwords:
+            hotwords = tag.default_hotwords
+        if not initial_prompt and tag.default_initial_prompt:
+            initial_prompt = tag.default_initial_prompt
+        if not transcription_model and tag.default_transcription_model:
+            transcription_model = tag.default_transcription_model
 
     # Folder defaults.
-    folder = recording.folder
     if folder:
-        if not language_explicit and not language and folder.default_language:
+        if not language and folder.default_language:
             language = folder.default_language
         if min_speakers is None and folder.default_min_speakers:
             min_speakers = folder.default_min_speakers
@@ -176,7 +181,7 @@ def resolve_transcription_params(recording, overrides=None):
 
     # Owner (account-level) defaults.
     if owner:
-        if not language_explicit and not language and owner.transcription_language:
+        if not language and owner.transcription_language:
             language = owner.transcription_language
         if not hotwords and owner.transcription_hotwords:
             hotwords = owner.transcription_hotwords
