@@ -337,17 +337,36 @@ def download_transcript_with_template(recording_id):
             # Join lines
             formatted_transcript = '\n'.join(output_lines)
 
+        # Output format: 'txt' (default) or 'md'. Markdown wraps the templated
+        # body with a title heading so it renders as a proper document, and
+        # swaps the extension + content-type. The transcript body itself is the
+        # same templated text in both cases (the template lines are valid
+        # markdown as-is).
+        output_format = (request.args.get('format') or 'txt').lower()
+        if output_format not in ('txt', 'md'):
+            output_format = 'txt'
+
+        if output_format == 'md':
+            title = recording.title or 'Transcript'
+            body = f"# {title}\n\n{formatted_transcript}\n"
+            response = make_response(body)
+            ext = 'md'
+            content_type = 'text/markdown; charset=utf-8'
+        else:
+            response = make_response(formatted_transcript)
+            ext = 'txt'
+            content_type = 'text/plain; charset=utf-8'
+
         # Create response
-        response = make_response(formatted_transcript)
         if is_diarized and template:
-            filename = f"{recording.title or 'transcript'}_{template.name}.txt"
+            filename = f"{recording.title or 'transcript'}_{template.name}.{ext}"
         elif is_diarized:
-            filename = f"{recording.title or 'transcript'}_formatted.txt"
+            filename = f"{recording.title or 'transcript'}_formatted.{ext}"
         else:
             # Plain text transcription
-            filename = f"{recording.title or 'transcript'}.txt"
+            filename = f"{recording.title or 'transcript'}.{ext}"
         filename = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', filename)
-        response.headers['Content-Type'] = 'text/plain; charset=utf-8'
+        response.headers['Content-Type'] = content_type
         response.headers['Content-Disposition'] = f'attachment; filename="{filename}"'
 
         return response
@@ -720,6 +739,112 @@ def download_notes_word(recording_id):
         current_app.logger.error(f"Error generating notes Word document: {e}")
         return jsonify({'error': 'Failed to generate Word document'}), 500
 
+
+
+@recordings_bp.route('/api/recordings/export-existing', methods=['POST'])
+@login_required
+def export_existing_recordings():
+    """Export the current user's already-processed recordings to disk.
+
+    Auto-export only fires when a recording finishes processing, so anything
+    transcribed before the feature was enabled never got written. This endpoint
+    lets a user backfill those files to the configured AUTO_EXPORT_DIR on demand.
+    It reuses the same writer as auto-export (`export_recording`), so the output
+    format, per-user directory, and template resolution are all identical.
+    """
+    from src.file_exporter import ENABLE_AUTO_EXPORT, export_recording
+
+    if not ENABLE_AUTO_EXPORT:
+        return jsonify({'error': 'Auto-export is not enabled on this server'}), 400
+
+    try:
+        # Candidate recordings: owned by the user and holding exportable content.
+        recordings = Recording.query.filter(
+            Recording.user_id == current_user.id,
+            Recording.status == 'COMPLETED'
+        ).filter(
+            (Recording.transcription.isnot(None)) | (Recording.summary.isnot(None))
+        ).all()
+
+        recording_ids = [r.id for r in recordings]
+        total = len(recording_ids)
+
+        exported = 0
+        failed = 0
+        # export_recording opens its own app context and re-fetches by id, so it
+        # is safe to call per-recording from within this request.
+        for rid in recording_ids:
+            try:
+                if export_recording(rid):
+                    exported += 1
+                else:
+                    failed += 1
+            except Exception as e:
+                current_app.logger.error(f"Bulk export failed for recording {rid}: {e}")
+                failed += 1
+
+        return jsonify({
+            'exported': exported,
+            'failed': failed,
+            'total': total,
+        })
+
+    except Exception as e:
+        current_app.logger.error(f"Error during bulk export: {e}")
+        return jsonify({'error': 'Failed to export recordings'}), 500
+
+
+@recordings_bp.route('/api/recordings/merge', methods=['POST'])
+@login_required
+def merge_recordings_endpoint():
+    """Merge two or more of the current user's recordings into a new one.
+
+    Body (JSON):
+      - recording_ids (list[int], required, ordered): sources to merge, in the
+        order they should be concatenated.
+      - title (str, optional): title for the merged recording.
+      - delete_originals (bool, optional): delete the sources after a successful
+        merge (default False).
+
+    Validation happens in-request; the audio concat runs later on a worker
+    (job_type 'merge'), so a long merge never blocks the request. The merged
+    recording is created immediately in PROCESSING and queued for the normal
+    transcription + summarization pipeline. See src/services/recording_merge.py.
+    """
+    from src.services.recording_merge import create_merge_recording, MergeError
+
+    data = request.get_json(silent=True) or {}
+    raw_ids = data.get('recording_ids')
+
+    if not isinstance(raw_ids, list) or len(raw_ids) < 2:
+        return jsonify({'error': 'Select at least two recordings to merge'}), 400
+
+    try:
+        recording_ids = [int(rid) for rid in raw_ids]
+    except (ValueError, TypeError):
+        return jsonify({'error': 'Invalid recording ids'}), 400
+
+    title = data.get('title')
+    delete_originals = bool(data.get('delete_originals', False))
+
+    try:
+        recording = create_merge_recording(
+            current_user,
+            recording_ids,
+            title=title,
+            delete_originals=delete_originals,
+        )
+    except MergeError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        current_app.logger.error(f"Error merging recordings: {e}")
+        return jsonify({'error': 'Failed to merge recordings'}), 500
+
+    return jsonify({
+        'success': True,
+        'recording_id': recording.id,
+        'recording': recording.to_dict(viewer_user=current_user),
+    })
 
 
 @recordings_bp.route('/recording/<int:recording_id>/generate_summary', methods=['POST'])

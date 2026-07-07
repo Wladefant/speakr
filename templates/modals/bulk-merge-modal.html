@@ -1,0 +1,76 @@
+<!-- Bulk Merge Modal (issue #323) -->
+<div v-if="showBulkMergeModal" @click.self="closeBulkMergeModal" class="modal-overlay">
+    <div class="modal-panel modal-panel--md">
+        <div class="modal-header">
+            <i class="fas fa-object-group text-2xl text-purple-500"></i>
+            <div class="flex-1">
+                <h3 class="modal-title" v-text="t('mergeRecordings.title')"></h3>
+                <div class="modal-subtitle" v-text="t('mergeRecordings.subtitle')"></div>
+            </div>
+            <button @click="closeBulkMergeModal" class="modal-close" :title="t('buttons.close')"><i class="fas fa-times"></i></button>
+        </div>
+        <div class="modal-body">
+            <p class="t-meta mb-4" v-text="t('mergeRecordings.orderHint')"></p>
+
+            <!-- Ordered source list -->
+            <div class="space-y-2 mb-5">
+                <div v-for="(rec, index) in mergeOrderedList" :key="rec.id"
+                     class="flex items-center gap-3 p-3 rounded-md border border-[var(--border-primary)] bg-[var(--bg-secondary)]">
+                    <span class="flex-shrink-0 w-6 h-6 rounded-full bg-[var(--bg-tertiary)] text-[var(--text-secondary)] text-xs flex items-center justify-center font-medium">${ index + 1 }</span>
+                    <div class="flex-1 min-w-0">
+                        <div class="t-body-strong truncate">${ rec.title || t('mergeRecordings.untitled') }</div>
+                        <div class="t-meta truncate" v-if="rec.meeting_date">${ formatDisplayDate(rec.meeting_date) }</div>
+                    </div>
+                    <div class="flex flex-col gap-0.5 flex-shrink-0">
+                        <button @click="moveMergeItem(index, -1)" :disabled="index === 0"
+                                class="px-2 py-0.5 text-xs rounded hover:bg-[var(--bg-tertiary)] transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                                :title="t('mergeRecordings.moveUp')">
+                            <i class="fas fa-chevron-up"></i>
+                        </button>
+                        <button @click="moveMergeItem(index, 1)" :disabled="index === mergeOrderedList.length - 1"
+                                class="px-2 py-0.5 text-xs rounded hover:bg-[var(--bg-tertiary)] transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                                :title="t('mergeRecordings.moveDown')">
+                            <i class="fas fa-chevron-down"></i>
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Title -->
+            <div class="mb-4">
+                <label class="block text-sm font-medium text-[var(--text-secondary)] mb-1" v-text="t('mergeRecordings.titleLabel')"></label>
+                <input type="text" v-model="mergeTitle"
+                       class="w-full px-3 py-2 bg-[var(--bg-input)] text-[var(--text-primary)] border border-[var(--border-primary)] rounded-md focus:outline-none focus:ring-2 focus:ring-[var(--ring-focus)]"
+                       :placeholder="t('mergeRecordings.titlePlaceholder')">
+            </div>
+
+            <!-- Delete originals -->
+            <label class="flex items-start gap-3 p-3 rounded-md border border-[var(--border-primary)] cursor-pointer hover:bg-[var(--bg-tertiary)] transition-colors">
+                <input type="checkbox" v-model="mergeDeleteOriginals" class="mt-1">
+                <div>
+                    <span class="t-body-strong" v-text="t('mergeRecordings.deleteOriginals')"></span>
+                    <p class="t-meta mt-0.5" v-text="t('mergeRecordings.deleteOriginalsHint')"></p>
+                </div>
+            </label>
+
+            <div class="banner banner--warn mt-4" style="display: flex; align-items: flex-start; gap: var(--sp-2);">
+                <i class="fas fa-info-circle" style="margin-top: 2px;"></i>
+                <div class="t-meta" v-text="t('mergeRecordings.reprocessNote')"></div>
+            </div>
+
+            <!-- Shown only when a video source is selected: the merged output is audio-only. -->
+            <div v-if="mergeOrderedList.some(r => (r.mime_type || '').startsWith('video'))"
+                 class="banner banner--warn mt-2" style="display: flex; align-items: flex-start; gap: var(--sp-2);">
+                <i class="fas fa-video" style="margin-top: 2px;"></i>
+                <div class="t-meta" v-text="t('mergeRecordings.videoNote')"></div>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button @click="closeBulkMergeModal" class="btn btn--ghost" v-text="t('buttons.cancel')"></button>
+            <button @click="executeBulkMerge" class="btn btn--primary" :disabled="mergeInProgress || mergeOrderedList.length < 2">
+                <i class="fas" :class="mergeInProgress ? 'fa-spinner fa-spin' : 'fa-object-group'"></i>
+                <span v-text="mergeInProgress ? t('mergeRecordings.merging') : t('mergeRecordings.confirm')"></span>
+            </button>
+        </div>
+    </div>
+</div>

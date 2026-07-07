@@ -742,7 +742,13 @@
     "templateDescription": "Description",
     "templateName": "Nom du modèle",
     "title": "Modèles d'exportation",
-    "viewGuide": "Voir le guide des modèles"
+    "viewGuide": "Voir le guide des modèles",
+    "bulkExportTitle": "Exporter les enregistrements existants",
+    "bulkExportDescription": "Écrit tous vos enregistrements traités dans le répertoire d'exportation. Utile pour les enregistrements créés avant l'activation de l'exportation automatique.",
+    "bulkExportButton": "Tout exporter sur le disque",
+    "bulkExportRunning": "Exportation…",
+    "bulkExportResult": "{{exported}} enregistrement(s) sur {{total}} exporté(s).",
+    "bulkExportFailed": "Échec de l'exportation des enregistrements."
   },
   "fileSize": {
     "bytes": "{{count}} B",
@@ -1619,7 +1625,8 @@
     "template": "Modèle",
     "templateName": "Nom du Modèle",
     "title": "Modèles de Transcription",
-    "viewGuide": "Voir le Guide des Modèles"
+    "viewGuide": "Voir le Guide des Modèles",
+    "format": "Format"
   },
   "initialPromptTemplates": {
     "tabTitle": "Modèles de transcription",
@@ -1852,5 +1859,22 @@
     "noUsersFound": "Aucun utilisateur trouvé",
     "add": "Ajouter",
     "notSharedYet": "Pas encore partagé"
+  },
+  "mergeRecordings": {
+    "title": "Fusionner les enregistrements",
+    "action": "Fusionner",
+    "subtitle": "Combiner en un seul enregistrement",
+    "orderHint": "Les enregistrements seront joints dans cet ordre. Réorganisez-les pour correspondre au déroulement de la conversation.",
+    "untitled": "Enregistrement sans titre",
+    "moveUp": "Monter",
+    "moveDown": "Descendre",
+    "titleLabel": "Titre (facultatif)",
+    "titlePlaceholder": "Laissez vide pour utiliser le titre du premier enregistrement",
+    "deleteOriginals": "Supprimer les enregistrements d'origine",
+    "deleteOriginalsHint": "Supprime les enregistrements sources après la création de l'enregistrement fusionné. Désactivé par défaut.",
+    "reprocessNote": "L'audio combiné sera de nouveau transcrit et résumé afin de produire une transcription et un résumé continus.",
+    "merging": "Fusion…",
+    "confirm": "Fusionner",
+    "videoNote": "Ces enregistrements contiennent de la vidéo. La fusion ne combine que l'audio ; l'enregistrement fusionné n'aura pas de vidéo."
   }
 }

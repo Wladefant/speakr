@@ -15,7 +15,7 @@ export function useUI(state, utils, processedTranscription) {
         editingNotes, tempNotesContent, transcriptionViewMode,
         notesMarkdownEditor, markdownEditorInstance, autoSaveTimer, csrfToken,
         summaryMarkdownEditor, recordingNotesEditor, recordingMarkdownEditorInstance,
-        recordingNotes, showDownloadMenu, currentPlayingSegmentIndex, followPlayerMode,
+        recordingNotes, showDownloadMenu, transcriptDownloadFormat, currentPlayingSegmentIndex, followPlayerMode,
         playbackRate, showSpeedMenu, playbackSpeeds, modalPlaybackRate, speedMenuPosition,
         videoFullscreen, fullscreenControlsVisible, fullscreenControlsTimer, videoCollapsed,
         regeneratingTitle,
@@ -1708,6 +1708,8 @@ export function useUI(state, utils, processedTranscription) {
                 }
             }
 
+            const fmt = transcriptDownloadFormat.value === 'md' ? 'md' : 'txt';
+
             // If templateId is 'none', download raw transcript without any template
             if (templateId === 'none') {
                 let rawText = '';
@@ -1726,11 +1728,14 @@ export function useUI(state, utils, processedTranscription) {
                     rawText = selectedRecording.value.transcription;
                 }
 
-                const blob = new Blob([rawText], { type: 'text/plain;charset=utf-8' });
+                const title = selectedRecording.value.title || 'transcript';
+                const content = fmt === 'md' ? `# ${title}\n\n${rawText}\n` : rawText;
+                const mime = fmt === 'md' ? 'text/markdown;charset=utf-8' : 'text/plain;charset=utf-8';
+                const blob = new Blob([content], { type: mime });
                 const downloadUrl = URL.createObjectURL(blob);
                 const a = document.createElement('a');
                 a.href = downloadUrl;
-                a.download = `${selectedRecording.value.title || 'transcript'}_raw.txt`;
+                a.download = `${title}_raw.${fmt}`;
                 document.body.appendChild(a);
                 a.click();
                 document.body.removeChild(a);
@@ -1742,8 +1747,8 @@ export function useUI(state, utils, processedTranscription) {
 
             // Download the transcript with the selected template
             const url = templateId
-                ? `/recording/${selectedRecording.value.id}/download/transcript?template_id=${templateId}`
-                : `/recording/${selectedRecording.value.id}/download/transcript`;
+                ? `/recording/${selectedRecording.value.id}/download/transcript?template_id=${templateId}&format=${fmt}`
+                : `/recording/${selectedRecording.value.id}/download/transcript?format=${fmt}`;
 
             const response = await fetch(url);
             if (!response.ok) {
@@ -1752,7 +1757,7 @@ export function useUI(state, utils, processedTranscription) {
 
             const blob = await response.blob();
             const contentDisposition = response.headers.get('content-disposition');
-            let filename = 'transcript.txt';
+            let filename = `transcript.${fmt}`;
             if (contentDisposition) {
                 const matches = contentDisposition.match(/filename="([^"]+)"/);
                 if (matches && matches[1]) {
@@ -1784,15 +1789,16 @@ export function useUI(state, utils, processedTranscription) {
         }
 
         try {
+            const fmt = transcriptDownloadFormat.value === 'md' ? 'md' : 'txt';
             // Download using the default template (server will use user's default)
-            const response = await fetch(`/recording/${selectedRecording.value.id}/download/transcript`);
+            const response = await fetch(`/recording/${selectedRecording.value.id}/download/transcript?format=${fmt}`);
             if (!response.ok) {
                 throw new Error(t('messages.transcriptDownloadFailed'));
             }
 
             const blob = await response.blob();
             const contentDisposition = response.headers.get('content-disposition');
-            let filename = 'transcript.txt';
+            let filename = `transcript.${fmt}`;
             if (contentDisposition) {
                 const matches = contentDisposition.match(/filename="([^"]+)"/);
                 if (matches && matches[1]) {

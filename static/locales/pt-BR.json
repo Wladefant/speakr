@@ -742,7 +742,13 @@
     "templateDescription": "Descrição",
     "templateName": "Nome do Modelo",
     "title": "Modelos de Exportação",
-    "viewGuide": "Ver Guia de Modelo"
+    "viewGuide": "Ver Guia de Modelo",
+    "bulkExportTitle": "Exportar gravações existentes",
+    "bulkExportDescription": "Grava todas as suas gravações processadas no diretório de exportação. Útil para gravações criadas antes de a exportação automática ser ativada.",
+    "bulkExportButton": "Exportar tudo para o disco",
+    "bulkExportRunning": "Exportando…",
+    "bulkExportResult": "{{exported}} de {{total}} gravações exportadas.",
+    "bulkExportFailed": "Falha ao exportar as gravações."
   },
   "fileSize": {
     "bytes": "{{count}} B",
@@ -1619,7 +1625,8 @@
     "template": "Modelo",
     "templateName": "Nome do Modelo",
     "title": "Modelos de Transcrição",
-    "viewGuide": "Ver Guia de Modelo"
+    "viewGuide": "Ver Guia de Modelo",
+    "format": "Formato"
   },
   "initialPromptTemplates": {
     "tabTitle": "Modelos de transcrição",
@@ -1852,5 +1859,22 @@
     "noUsersFound": "Nenhum usuário encontrado",
     "add": "Adicionar",
     "notSharedYet": "Ainda não compartilhado"
+  },
+  "mergeRecordings": {
+    "title": "Mesclar gravações",
+    "action": "Mesclar",
+    "subtitle": "Combinar em uma única gravação",
+    "orderHint": "As gravações serão unidas nesta ordem. Reordene-as para corresponder à sequência da conversa.",
+    "untitled": "Gravação sem título",
+    "moveUp": "Mover para cima",
+    "moveDown": "Mover para baixo",
+    "titleLabel": "Título (opcional)",
+    "titlePlaceholder": "Deixe em branco para usar o título da primeira gravação",
+    "deleteOriginals": "Excluir gravações originais",
+    "deleteOriginalsHint": "Remove as gravações de origem após a criação da mesclada. Desativado por padrão.",
+    "reprocessNote": "O áudio combinado será transcrito e resumido novamente para produzir uma transcrição e um resumo contínuos.",
+    "merging": "Mesclando…",
+    "confirm": "Mesclar",
+    "videoNote": "Estas gravações incluem vídeo. A mesclagem combina apenas o áudio; a gravação mesclada não terá vídeo."
   }
 }

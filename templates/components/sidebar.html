@@ -629,6 +629,13 @@
             <i class="fas fa-redo text-[var(--text-muted)]"></i>
         </button>
 
+        <button v-if="selectedCount >= 2"
+                @click="openBulkMergeModal"
+                class="w-10 h-10 flex items-center justify-center bg-[var(--bg-tertiary)] hover:bg-[var(--bg-input)] rounded-lg transition-colors border border-[var(--border-secondary)]"
+                :title="t('mergeRecordings.title')">
+            <i class="fas fa-object-group text-purple-500"></i>
+        </button>
+
         <div class="border-t border-[var(--border-primary)] my-1"></div>
 
         <button @click="openBulkDeleteModal"

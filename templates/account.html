@@ -1408,6 +1408,23 @@
                                 </button>
                             </div>
 
+                            {% if enable_auto_export %}
+                            <!-- Bulk export existing recordings to the auto-export directory -->
+                            <div class="bg-[var(--bg-secondary)] rounded-lg border border-[var(--border-primary)] p-6">
+                                <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+                                    <div class="min-w-0">
+                                        <h3 class="text-lg font-semibold text-[var(--text-primary)]" data-i18n="exportTemplates.bulkExportTitle">Export existing recordings</h3>
+                                        <p class="text-sm text-[var(--text-secondary)]" data-i18n="exportTemplates.bulkExportDescription">Write all of your processed recordings to the export directory. Useful for recordings created before auto-export was enabled.</p>
+                                        <p id="bulkExportStatus" class="text-sm mt-2 hidden"></p>
+                                    </div>
+                                    <button id="bulkExportBtn" class="inline-flex items-center px-4 py-2 bg-[var(--bg-button)] text-[var(--text-button)] rounded-md hover:bg-[var(--bg-button-hover)] focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[var(--border-focus)] transition-colors duration-200 whitespace-nowrap disabled:opacity-60 disabled:cursor-not-allowed">
+                                        <i class="fas fa-file-export mr-2"></i>
+                                        <span data-i18n="exportTemplates.bulkExportButton">Export all to disk</span>
+                                    </button>
+                                </div>
+                            </div>
+                            {% endif %}
+
                             <!-- Export Templates Grid -->
                             <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
                                 <!-- Export Templates List (Left) -->
@@ -7684,6 +7701,48 @@ curl "https://your-speakr-instance.com/api/recordings?token=YOUR_TOKEN_HERE"</co
             } catch (error) {
                 console.error('Error creating default export template:', error);
                 showToast('Failed to create default export template', 'error');
+            }
+        });
+
+        // Bulk-export existing recordings to the auto-export directory. Reuses
+        // the same server-side writer as auto-export; only present when the
+        // server has auto-export enabled (the card is Jinja-gated).
+        document.getElementById('bulkExportBtn')?.addEventListener('click', async (e) => {
+            const btn = e.currentTarget;
+            const statusEl = document.getElementById('bulkExportStatus');
+            const original = btn.innerHTML;
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i><span>' + t('exportTemplates.bulkExportRunning') + '</span>';
+            if (statusEl) { statusEl.classList.add('hidden'); }
+            try {
+                const csrfToken = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
+                const response = await fetch('/api/recordings/export-existing', {
+                    method: 'POST',
+                    headers: { 'X-CSRFToken': csrfToken }
+                });
+                const result = await response.json();
+                if (!response.ok) {
+                    throw new Error(result.error || t('exportTemplates.bulkExportFailed'));
+                }
+                const msg = t('exportTemplates.bulkExportResult', { exported: result.exported, total: result.total });
+                if (statusEl) {
+                    statusEl.textContent = msg;
+                    statusEl.classList.remove('hidden', 'text-red-500');
+                    statusEl.style.color = 'var(--text-secondary)';
+                }
+                showToast(msg, 'success');
+            } catch (error) {
+                console.error('Bulk export error:', error);
+                const msg = (error && error.message) || t('exportTemplates.bulkExportFailed');
+                if (statusEl) {
+                    statusEl.textContent = msg;
+                    statusEl.classList.remove('hidden');
+                    statusEl.style.color = 'var(--color-danger, #ef4444)';
+                }
+                showToast(t('exportTemplates.bulkExportFailed'), 'error');
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = original;
             }
         });
 

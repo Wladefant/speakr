@@ -715,6 +715,11 @@ document.addEventListener('DOMContentLoaded', async () => {
             const legendExpanded = ref(false);
             const highlightedSpeaker = ref(null);
             const showDownloadMenu = ref(false);
+            // Preferred transcript download format ('txt' | 'md'), persisted.
+            const transcriptDownloadFormat = ref(localStorage.getItem('transcriptDownloadFormat') === 'md' ? 'md' : 'txt');
+            watch(transcriptDownloadFormat, (val) => {
+                localStorage.setItem('transcriptDownloadFormat', val === 'md' ? 'md' : 'txt');
+            });
             const currentPlayingSegmentIndex = ref(null);
             const followPlayerMode = ref(false);
             const processingIndicatorMinimized = ref(false);
@@ -1681,6 +1686,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
                 // Transcription
                 transcriptionViewMode, legendExpanded, highlightedSpeaker, showDownloadMenu,
+                transcriptDownloadFormat,
                 currentPlayingSegmentIndex, followPlayerMode, processingIndicatorMinimized,
 
                 // Chat

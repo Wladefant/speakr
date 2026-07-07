@@ -35,7 +35,7 @@ POLL_INTERVAL = 1.0  # seconds between checking for new jobs
 # get_position_in_queue places it — no separate worker pool or queue needed.
 # Every consumer routes via "SUMMARY_JOBS if ... else TRANSCRIPTION_JOBS", so
 # membership in this list is the single source of truth for the whole pipeline.
-TRANSCRIPTION_JOBS = ['transcribe', 'reprocess_transcription', 'stitch']
+TRANSCRIPTION_JOBS = ['transcribe', 'reprocess_transcription', 'stitch', 'merge']
 SUMMARY_JOBS = ['summarize', 'reprocess_summary']
 
 
@@ -344,6 +344,8 @@ class FairJobQueue:
                     self._run_reprocess_summary(job, recording, params)
                 elif job_type == 'stitch':
                     self._run_stitch(job, recording, params)
+                elif job_type == 'merge':
+                    self._run_merge(job, recording, params)
                 else:
                     raise ValueError(f"Unknown job type: {job_type}")
 
@@ -561,6 +563,25 @@ class FairJobQueue:
             user_id=recording.user_id,
             metadata=metadata,
         )
+
+    def _run_merge(self, job, recording, params):
+        """Concatenate source recordings' audio into this recording (#323).
+
+        The heavy ffmpeg concat runs here, off the request path, so hours-long
+        merges do not time out the HTTP request. On success the recording's
+        audio_path is set and a follow-up ``transcribe`` job is enqueued; on
+        failure the recording is flipped to FAILED with the error visible.
+        """
+        from src.services.recording_merge import run_merge_job, MergeError
+
+        try:
+            run_merge_job(recording, params)
+        except MergeError as e:
+            recording.status = 'FAILED'
+            recording.error_message = str(e)
+            recording.transcription = f"Processing failed: {e}"
+            db.session.commit()
+            raise
 
     def enqueue(
         self,

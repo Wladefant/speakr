@@ -15,6 +15,7 @@ export function useBulkOperations({
     availableFolders,
     showToast,
     setGlobalError,
+    exitSelectionMode,
     startReprocessingPoll
 }) {
     // Modal state
@@ -22,9 +23,16 @@ export function useBulkOperations({
     const showBulkTagModal = ref(false);
     const showBulkReprocessModal = ref(false);
     const showBulkFolderModal = ref(false);
+    const showBulkMergeModal = ref(false);
     const bulkTagAction = ref('add'); // 'add' or 'remove'
     const bulkTagSelectedId = ref('');
     const bulkReprocessType = ref('summary'); // 'transcription' or 'summary'
+
+    // Merge state
+    const mergeOrderedList = ref([]);   // ordered array of recording objects
+    const mergeTitle = ref('');
+    const mergeDeleteOriginals = ref(false);
+    const mergeInProgress = ref(false);
 
     // Get CSRF token
     const getCsrfToken = () => {
@@ -260,6 +268,85 @@ export function useBulkOperations({
     };
 
     // =========================================
+    // Merge Recordings (issue #323)
+    // =========================================
+
+    const openBulkMergeModal = () => {
+        // Seed the ordered list from the current selection. Order matters for a
+        // merge, so present the selection as an explicit, reorderable list.
+        mergeOrderedList.value = selectedRecordings.value.slice();
+        mergeTitle.value = '';
+        mergeDeleteOriginals.value = false;
+        showBulkMergeModal.value = true;
+    };
+
+    const closeBulkMergeModal = () => {
+        showBulkMergeModal.value = false;
+    };
+
+    const moveMergeItem = (index, direction) => {
+        const list = mergeOrderedList.value;
+        const target = index + direction;
+        if (target < 0 || target >= list.length) return;
+        const next = list.slice();
+        [next[index], next[target]] = [next[target], next[index]];
+        mergeOrderedList.value = next;
+    };
+
+    const executeBulkMerge = async () => {
+        const orderedIds = mergeOrderedList.value.map(r => r.id);
+        if (orderedIds.length < 2) return;
+
+        mergeInProgress.value = true;
+        bulkActionInProgress.value = true;
+
+        try {
+            const response = await fetch('/api/recordings/merge', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRFToken': getCsrfToken()
+                },
+                body: JSON.stringify({
+                    recording_ids: orderedIds,
+                    title: mergeTitle.value.trim() || undefined,
+                    delete_originals: mergeDeleteOriginals.value
+                })
+            });
+
+            const data = await response.json();
+
+            if (!response.ok) {
+                throw new Error(data.error || 'Failed to merge recordings');
+            }
+
+            // The audio concat runs on a worker; originals are deleted there
+            // only after it succeeds, so we do NOT remove them optimistically.
+            // They disappear on the next recordings refresh if delete was chosen.
+
+            // Surface the new merged recording immediately (in PROCESSING).
+            if (data.recording) {
+                recordings.value.unshift(data.recording);
+                if (startReprocessingPoll) {
+                    startReprocessingPoll(data.recording.id);
+                }
+            }
+
+            closeBulkMergeModal();
+            if (exitSelectionMode) exitSelectionMode();
+
+            const count = orderedIds.length;
+            showToast(`Merging ${count} recordings — the combined recording is processing`, 'fa-object-group', 4000, 'success');
+        } catch (error) {
+            console.error('Merge error:', error);
+            setGlobalError(`Failed to merge recordings: ${error.message}`);
+        } finally {
+            mergeInProgress.value = false;
+            bulkActionInProgress.value = false;
+        }
+    };
+
+    // =========================================
     // Bulk Toggle (Inbox/Highlight)
     // =========================================
 
@@ -446,9 +533,14 @@ export function useBulkOperations({
         showBulkTagModal,
         showBulkReprocessModal,
         showBulkFolderModal,
+        showBulkMergeModal,
         bulkTagAction,
         bulkTagSelectedId,
         bulkReprocessType,
+        mergeOrderedList,
+        mergeTitle,
+        mergeDeleteOriginals,
+        mergeInProgress,
 
         // Bulk Delete
         openBulkDeleteModal,
@@ -464,6 +556,12 @@ export function useBulkOperations({
         openBulkReprocessModal,
         closeBulkReprocessModal,
         executeBulkReprocess,
+
+        // Merge
+        openBulkMergeModal,
+        closeBulkMergeModal,
+        moveMergeItem,
+        executeBulkMerge,
 
         // Bulk Toggle
         bulkToggleInbox,

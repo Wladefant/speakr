@@ -53,6 +53,17 @@
                      data-download-dropdown
                      class="absolute right-0 top-full mt-1 surface-raised z-50 overflow-hidden whitespace-nowrap"
                      style="min-width: 220px;">
+                    <!-- Output format toggle (TXT / MD) — a persisted preference
+                         applied to whichever download action is chosen below. -->
+                    <div class="flex items-center justify-between gap-2 px-3 py-2 border-b border-[var(--border-primary)]">
+                        <span class="text-xs text-[var(--text-muted)]" v-text="t('transcriptTemplates.format')"></span>
+                        <div class="inline-flex rounded-md overflow-hidden border border-[var(--border-primary)]">
+                            <button @click.stop="transcriptDownloadFormat = 'txt'"
+                                    :class="['px-2.5 py-1 text-xs transition-colors', transcriptDownloadFormat === 'txt' ? 'bg-[var(--text-accent)] text-white' : 'hover:bg-[var(--bg-tertiary)]']">TXT</button>
+                            <button @click.stop="transcriptDownloadFormat = 'md'"
+                                    :class="['px-2.5 py-1 text-xs transition-colors border-l border-[var(--border-primary)]', transcriptDownloadFormat === 'md' ? 'bg-[var(--text-accent)] text-white' : 'hover:bg-[var(--bg-tertiary)]']">MD</button>
+                        </div>
+                    </div>
                     <button @click="downloadWithDefaultTemplate(); showDownloadMenu = false"
                             class="w-full text-left px-3 py-2 text-sm hover:bg-[var(--bg-tertiary)] transition-colors flex items-center gap-2">
                         <i class="fas fa-star text-[var(--text-accent)] text-[10px]"></i>

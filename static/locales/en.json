@@ -742,7 +742,13 @@
     "templateDescription": "Description",
     "templateName": "Template Name",
     "title": "Export Templates",
-    "viewGuide": "View Template Guide"
+    "viewGuide": "View Template Guide",
+    "bulkExportTitle": "Export existing recordings",
+    "bulkExportDescription": "Write all of your processed recordings to the export directory. Useful for recordings created before auto-export was enabled.",
+    "bulkExportButton": "Export all to disk",
+    "bulkExportRunning": "Exporting…",
+    "bulkExportResult": "Exported {{exported}} of {{total}} recordings.",
+    "bulkExportFailed": "Failed to export recordings."
   },
   "fileSize": {
     "bytes": "{{count}} B",
@@ -1628,7 +1634,8 @@
     "template": "Template",
     "templateName": "Template Name",
     "title": "Transcript Templates",
-    "viewGuide": "View Template Guide"
+    "viewGuide": "View Template Guide",
+    "format": "Format"
   },
   "initialPromptTemplates": {
     "tabTitle": "Transcription Templates",
@@ -1852,5 +1859,22 @@
     "noUsersFound": "No users found",
     "add": "Add",
     "notSharedYet": "Not shared with anyone yet"
+  },
+  "mergeRecordings": {
+    "title": "Merge Recordings",
+    "action": "Merge",
+    "subtitle": "Combine into one recording",
+    "orderHint": "Recordings will be joined in this order. Reorder them to match the sequence of the conversation.",
+    "untitled": "Untitled recording",
+    "moveUp": "Move up",
+    "moveDown": "Move down",
+    "titleLabel": "Title (optional)",
+    "titlePlaceholder": "Leave blank to use the first recording's title",
+    "deleteOriginals": "Delete original recordings",
+    "deleteOriginalsHint": "Remove the source recordings after the merged one is created. Off by default.",
+    "reprocessNote": "The combined audio will be transcribed and summarized again to produce one continuous transcript and summary.",
+    "merging": "Merging…",
+    "confirm": "Merge recordings",
+    "videoNote": "These recordings include video. Merging combines the audio only; the merged recording will not have video."
   }
 }

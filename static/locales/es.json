@@ -742,7 +742,13 @@
     "templateDescription": "Descripción",
     "templateName": "Nombre de la plantilla",
     "title": "Plantillas de exportación",
-    "viewGuide": "Ver guía de plantillas"
+    "viewGuide": "Ver guía de plantillas",
+    "bulkExportTitle": "Exportar grabaciones existentes",
+    "bulkExportDescription": "Escribe todas tus grabaciones procesadas en el directorio de exportación. Útil para grabaciones creadas antes de habilitar la exportación automática.",
+    "bulkExportButton": "Exportar todo al disco",
+    "bulkExportRunning": "Exportando…",
+    "bulkExportResult": "{{exported}} de {{total}} grabaciones exportadas.",
+    "bulkExportFailed": "No se pudieron exportar las grabaciones."
   },
   "fileSize": {
     "bytes": "{{count}} B",
@@ -1619,7 +1625,8 @@
     "template": "Plantilla",
     "templateName": "Nombre de Plantilla",
     "title": "Plantillas de Transcripción",
-    "viewGuide": "Ver Guía de Plantillas"
+    "viewGuide": "Ver Guía de Plantillas",
+    "format": "Formato"
   },
   "initialPromptTemplates": {
     "tabTitle": "Plantillas de transcripción",
@@ -1852,5 +1859,22 @@
     "noUsersFound": "No se encontraron usuarios",
     "add": "Añadir",
     "notSharedYet": "Aún no compartido con nadie"
+  },
+  "mergeRecordings": {
+    "title": "Combinar grabaciones",
+    "action": "Combinar",
+    "subtitle": "Unir en una sola grabación",
+    "orderHint": "Las grabaciones se unirán en este orden. Reordénalas para que coincidan con la secuencia de la conversación.",
+    "untitled": "Grabación sin título",
+    "moveUp": "Subir",
+    "moveDown": "Bajar",
+    "titleLabel": "Título (opcional)",
+    "titlePlaceholder": "Déjalo en blanco para usar el título de la primera grabación",
+    "deleteOriginals": "Eliminar las grabaciones originales",
+    "deleteOriginalsHint": "Elimina las grabaciones de origen después de crear la combinada. Desactivado de forma predeterminada.",
+    "reprocessNote": "El audio combinado se transcribirá y resumirá de nuevo para producir una transcripción y un resumen continuos.",
+    "merging": "Combinando…",
+    "confirm": "Combinar",
+    "videoNote": "Estas grabaciones incluyen vídeo. La combinación une solo el audio; la grabación combinada no tendrá vídeo."
   }
 }

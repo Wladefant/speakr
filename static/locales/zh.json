@@ -742,7 +742,13 @@
     "templateDescription": "描述",
     "templateName": "模板名称",
     "title": "导出模板",
-    "viewGuide": "查看模板指南"
+    "viewGuide": "查看模板指南",
+    "bulkExportTitle": "导出现有录音",
+    "bulkExportDescription": "将您所有已处理的录音写入导出目录。适用于在启用自动导出之前创建的录音。",
+    "bulkExportButton": "全部导出到磁盘",
+    "bulkExportRunning": "正在导出…",
+    "bulkExportResult": "已导出 {{total}} 条录音中的 {{exported}} 条。",
+    "bulkExportFailed": "导出录音失败。"
   },
   "fileSize": {
     "bytes": "{{count}} B",
@@ -1619,7 +1625,8 @@
     "template": "模板",
     "templateName": "模板名称",
     "title": "转录模板",
-    "viewGuide": "查看模板指南"
+    "viewGuide": "查看模板指南",
+    "format": "格式"
   },
   "initialPromptTemplates": {
     "tabTitle": "转录模板",
@@ -1852,5 +1859,22 @@
     "noUsersFound": "未找到用户",
     "add": "添加",
     "notSharedYet": "尚未与任何人分享"
+  },
+  "mergeRecordings": {
+    "title": "合并录音",
+    "action": "合并",
+    "subtitle": "合并为一条录音",
+    "orderHint": "录音将按此顺序拼接。请调整顺序以匹配对话的实际先后。",
+    "untitled": "未命名录音",
+    "moveUp": "上移",
+    "moveDown": "下移",
+    "titleLabel": "标题（可选）",
+    "titlePlaceholder": "留空则使用第一条录音的标题",
+    "deleteOriginals": "删除原始录音",
+    "deleteOriginalsHint": "创建合并录音后删除源录音。默认关闭。",
+    "reprocessNote": "合并后的音频将被重新转录和总结，以生成连续的转录文本和摘要。",
+    "merging": "正在合并…",
+    "confirm": "合并",
+    "videoNote": "这些录音包含视频。合并仅会合并音频；合并后的录音将不包含视频。"
   }
 }
