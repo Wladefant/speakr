@@ -531,35 +531,47 @@ def test_merge_endpoint_passes_notes_source_id():
         assert merged.notes == "beta"
 
 
-def test_merge_prompt_variables_follow_notes_source():
+def test_merge_prompt_variables_union_keeps_all_keys():
     from src.services.recording_merge import create_merge_recording
     with app.app_context():
         user = _mk_user()
-        a = _mk_recording(user, title="A", notes="a", prompt_variables={"agenda": "AAA"})
-        b = _mk_recording(user, title="B", notes="b", prompt_variables={"agenda": "BBB"})
+        a = _mk_recording(user, title="A", prompt_variables={"agenda": "AAA"})
+        b = _mk_recording(user, title="B", prompt_variables={"attendees": "BBB"})
         with _endpoint_mocks():
-            merged = create_merge_recording(user, [a.id, b.id], notes_source_id=b.id)
-        assert merged.notes == "b"
-        assert merged.prompt_variables == {"agenda": "BBB"}
+            merged = create_merge_recording(user, [a.id, b.id])
+        assert merged.prompt_variables == {"agenda": "AAA", "attendees": "BBB"}
 
 
-def test_merge_prompt_variables_default_first_source():
+def test_merge_prompt_variables_conflict_reference_wins():
     from src.services.recording_merge import create_merge_recording
     with app.app_context():
         user = _mk_user()
         a = _mk_recording(user, title="A", prompt_variables={"agenda": "AAA"})
         b = _mk_recording(user, title="B", prompt_variables={"agenda": "BBB"})
         with _endpoint_mocks():
-            merged = create_merge_recording(user, [a.id, b.id])
-        assert merged.prompt_variables == {"agenda": "AAA"}
+            merged = create_merge_recording(user, [a.id, b.id], notes_source_id=b.id)
+        assert merged.prompt_variables == {"agenda": "BBB"}
 
 
-def test_merge_prompt_variables_dropped_when_no_notes():
+def test_merge_prompt_variables_conflict_default_reference_is_first():
     from src.services.recording_merge import create_merge_recording
     with app.app_context():
         user = _mk_user()
         a = _mk_recording(user, title="A", prompt_variables={"agenda": "AAA"})
+        b = _mk_recording(user, title="B", prompt_variables={"agenda": "BBB"})
+        with _endpoint_mocks():
+            merged = create_merge_recording(user, [a.id, b.id])  # default reference = first
+        assert merged.prompt_variables == {"agenda": "AAA"}
+
+
+def test_merge_prompt_variables_kept_even_when_notes_dropped():
+    from src.services.recording_merge import create_merge_recording
+    with app.app_context():
+        user = _mk_user()
+        a = _mk_recording(user, title="A", notes="a", prompt_variables={"agenda": "AAA"})
         b = _mk_recording(user, title="B")
         with _endpoint_mocks():
+            # "keep no notes" still unions prompt variables (they ride with tags).
             merged = create_merge_recording(user, [a.id, b.id], notes_source_id=None)
-        assert merged.prompt_variables is None
+        assert merged.notes is None
+        assert merged.prompt_variables == {"agenda": "AAA"}

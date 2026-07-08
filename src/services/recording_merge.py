@@ -192,7 +192,19 @@ def create_merge_recording(user, recording_ids, title=None, delete_originals=Fal
         reference = next((r for r in recordings if r.id == notes_source_id), first)
 
     merged_notes = reference.notes if reference else None
-    merged_prompt_variables = (reference.prompt_variables or None) if reference else None
+
+    # Prompt variables travel with the unioned tags — their names usually come
+    # from tag prompts — so union them across ALL sources (kept regardless of the
+    # notes choice). On a key collision the reference source wins, e.g. two
+    # recordings on the same default prompt with the same variable set to
+    # different values keep the reference recording's value.
+    merged_prompt_variables = {}
+    for rec in recordings:
+        if rec.prompt_variables:
+            merged_prompt_variables.update(rec.prompt_variables)
+    if reference and reference.prompt_variables:
+        merged_prompt_variables.update(reference.prompt_variables)
+    merged_prompt_variables = merged_prompt_variables or None
 
     # Participants are additive across a merge — union them so none are lost.
     merged_participants = _union_participants(recordings)
