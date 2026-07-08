@@ -395,7 +395,19 @@ export function useBulkOperations({
     const addMergeCandidate = (recording) => {
         if (!recording) return;
         if (mergeOrderedList.value.some(r => r.id === recording.id)) return;
-        mergeOrderedList.value = [...mergeOrderedList.value, recording];
+        const list = mergeOrderedList.value.slice();
+        // In recording mode the just-recorded clip is a CONTINUATION of the
+        // existing recording(s) — the common case is an interrupted recording
+        // restarted — so newly added existing recordings go BEFORE the clip and
+        // the clip stays at the end by default (still reorderable). In bulk mode
+        // there is no clip; just append.
+        const selfIdx = list.findIndex(r => r.__self__);
+        if (mergeMode.value === 'recording' && selfIdx !== -1) {
+            list.splice(selfIdx, 0, recording);
+        } else {
+            list.push(recording);
+        }
+        mergeOrderedList.value = list;
         mergeAddSearch.value = '';
         mergeAddPickerOpen.value = false;
     };
