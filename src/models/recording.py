@@ -339,6 +339,10 @@ class Recording(db.Model):
             'id': self.id,
             'title': self.title,
             'participants': self.participants,
+            # Cheap boolean (full notes text is excluded from the list for
+            # lightness) — lets the merge modal offer this recording as a notes
+            # source without loading every recording's notes.
+            'has_notes': bool(self.notes and self.notes.strip()),
             'status': self.status,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'completed_at': self.completed_at.isoformat() if self.completed_at else None,

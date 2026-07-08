@@ -47,9 +47,10 @@ export function useBulkOperations({
     // '__self__' (the recorded clip), or null (keep no notes).
     const mergeNotesSourceId = ref(null);
     // Sources in the merge that actually have notes — drives the selector.
-    const mergeNotesCandidates = computed(() =>
-        mergeOrderedList.value.filter(r => r && r.notes && String(r.notes).trim())
-    );
+    // List dicts carry a cheap `has_notes` flag; detail dicts and the recorded
+    // clip carry full `notes` text. Accept either.
+    const _entryHasNotes = (r) => !!(r && (r.has_notes || (r.notes && String(r.notes).trim())));
+    const mergeNotesCandidates = computed(() => mergeOrderedList.value.filter(_entryHasNotes));
     // Keep the notes selection valid as the list changes: default to the first
     // source with notes; respect an explicit "keep none" ('none'); and if the
     // chosen source leaves the list, fall back to the first remaining one.

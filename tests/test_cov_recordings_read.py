@@ -315,6 +315,24 @@ def test_paginated_folder_filter(owner):
     assert no_folder not in ids
 
 
+def test_paginated_list_includes_has_notes_flag(owner):
+    # The merge notes picker relies on this cheap flag (full notes text is not
+    # shipped in the list).
+    with _db():
+        u = db.session.get(User, owner)
+        wn = make_recording(u, title="wn")
+        wn.notes = "some notes"
+        db.session.commit()
+        with_notes = wn.id
+        without = make_recording(u, title="wo").id
+    c = new_client()
+    login(c, owner)
+    resp = c.get("/api/recordings?per_page=100")
+    by_id = {r["id"]: r for r in resp.get_json()["recordings"]}
+    assert by_id[with_notes]["has_notes"] is True
+    assert by_id[without]["has_notes"] is False
+
+
 def test_paginated_status_filter(owner):
     # The merge picker uses ?status=COMPLETED to fetch only mergeable recordings.
     with _db():
