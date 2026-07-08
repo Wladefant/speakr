@@ -302,6 +302,17 @@ If your administrator has enabled **server-side recording sessions**, in-app rec
 
 This is an opt-in feature that is off by default. If you don't see it, ask your administrator to enable it. See [Recording Sessions](../admin-guide/recording-sessions.md) in the admin guide for setup details.
 
+## Merging Recordings
+
+When a call drops or a meeting freezes, you can end up with two separate recordings of what was really one session. Merging combines several recordings, in the order you choose, into a single new recording that is transcribed, diarized, and summarized from scratch — so you get one continuous transcript and summary instead of several partial ones. The audio is combined; if any source is a video, the merged recording keeps the audio only.
+
+There are two ways to start a merge:
+
+- **From the sidebar.** Use the "select multiple" button, tick two or more recordings, and choose **Merge**. A dialog opens where you can reorder the sources with the up and down arrows, add more recordings from a searchable list, set a title, and optionally delete the originals once the merged recording is created.
+- **From the recording view.** After you finish an in-app recording, the **Upload Recording & Notes** button has a small arrow on its right edge. Its menu offers **Merge with an existing recording**, which lets you append the recording you just made onto one or more existing recordings — the common case being an interrupted recording you had to restart. The new recording is added to the end by default, since it continues the earlier one.
+
+Because notes cannot be meaningfully combined, when more than one source has notes the dialog asks which recording's notes to keep (or to keep none). That same recording's prompt-template variables carry over as well, so the merged summary uses the intended context. **Participants and tags are combined from all sources**, and folder membership follows the first recording in the order.
+
 ## Best Practices for Quality Recordings
 
 ### Mobile Recording Considerations

@@ -9,7 +9,7 @@
   <a href="https://www.gnu.org/licenses/agpl-3.0"><img alt="AGPL v3" src="https://img.shields.io/badge/License-AGPL_v3-blue.svg"></a>
   <a href="https://github.com/murtaza-nasir/speakr/actions/workflows/docker-publish.yml"><img alt="Docker Build" src="https://github.com/murtaza-nasir/speakr/actions/workflows/docker-publish.yml/badge.svg"></a>
   <a href="https://hub.docker.com/r/learnedmachine/speakr"><img alt="Docker Pulls" src="https://img.shields.io/docker/pulls/learnedmachine/speakr"></a>
-  <a href="https://github.com/murtaza-nasir/speakr/releases/latest"><img alt="Latest Version" src="https://img.shields.io/badge/version-0.9.5--alpha-brightgreen.svg"></a>
+  <a href="https://github.com/murtaza-nasir/speakr/releases/latest"><img alt="Latest Version" src="https://img.shields.io/badge/version-0.9.6--alpha-brightgreen.svg"></a>
 </p>
 
 <p align="center">
@@ -201,9 +201,13 @@ Complete documentation is available at **[murtaza-nasir.github.io/speakr](https:
 - [Troubleshooting](https://murtaza-nasir.github.io/speakr/troubleshooting) - Common issues and solutions
 - [FAQ](https://murtaza-nasir.github.io/speakr/faq) - Frequently asked questions
 
-## Latest Release (v0.9.5-alpha)
+## Latest Release (v0.9.6-alpha)
 
-**Adds a cloud transcription provider, in-app video capture, and recording filters, with a round of security and reliability hardening.** AssemblyAI is now a built-in transcription connector that diarizes and handles multi-hour files in a single job. When video retention is enabled, the System Audio and Mic + System recording modes can also record the shared tab, window, or screen as video that plays back alongside the transcript. The sidebar gains filters for recordings that still need transcription, a summary, or speaker identification (contributed by @fxfitz). This release also fixes the speaker page's invalid dates and missing voice samples, stops meeting dates from drifting on each edit, restores length and seeking in the pre-upload recording review, and exempts long recording sessions from rate limiting. On the security side, authentication rate limits are now actually enforced, the bulk inbox/highlight toggle is access-checked, webhook delivery re-validates its target against DNS rebinding, and all FFmpeg work is bounded by a timeout. **Full release notes on the [GitHub release page](https://github.com/murtaza-nasir/speakr/releases/tag/v0.9.5-alpha).**
+**Adds recording merge, Markdown transcript export, and a one-click backfill export, plus a large internal consolidation of how every ingestion path resolves its transcription settings.** Several recordings can now be combined into one that is re-processed from scratch through the full pipeline (transcription, diarization, summary, and automatic speaker labelling) — useful when a dropped call or an interrupted recording leaves two partial transcripts. You can merge from the sidebar by selecting recordings, reordering them, and choosing which notes and prompt variables to keep (participants and tags are combined), or from the recording view, where a new split button lets you append a just-finished recording onto an existing one directly. The transcript download menu gains a TXT / MD toggle, and when automatic export is enabled, Settings gains an "Export all to disk" button that backfills every processed recording. Under the hood, uploads, reprocessing, merges, recording-session finalization, the share target, and the auto-process folder now resolve language, speaker hints, hotwords, prompt, and model through one shared precedence chain, so a recording created by any path transcribes identically to a standard upload. **Full release notes on the [GitHub release page](https://github.com/murtaza-nasir/speakr/releases/tag/v0.9.6-alpha).**
+
+### v0.9.5-alpha (previous release)
+
+**Adds a cloud transcription provider, in-app video capture, and recording filters, with a round of security and reliability hardening.** AssemblyAI is now a built-in transcription connector that diarizes and handles multi-hour files in a single job. When video retention is enabled, the System Audio and Mic + System recording modes can also record the shared tab, window, or screen as video that plays back alongside the transcript. The sidebar gains filters for recordings that still need transcription, a summary, or speaker identification (contributed by @fxfitz), alongside fixes for speaker-page dates and voice samples, drifting meeting dates, and pre-upload review seeking, plus enforced auth rate limits, an access check on bulk toggle, webhook delivery re-validation, and bounded FFmpeg timeouts. **Full release notes on the [GitHub release page](https://github.com/murtaza-nasir/speakr/releases/tag/v0.9.5-alpha).**
 
 ### v0.9.4-alpha (previous release)
 

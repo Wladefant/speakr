@@ -6,10 +6,10 @@ Speakr is a powerful self-hosted transcription platform that helps you capture, 
   <img src="assets/images/screenshots/main-view-video.png" alt="Main Interface" style="border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
 </div>
 
-!!! success "Latest Release: v0.9.5-alpha — AssemblyAI connector, video capture, and recording filters"
-    AssemblyAI is now a built-in transcription connector, the System Audio and Mic + System recording modes can optionally record the shared tab, window, or screen as video (when video retention is enabled), and the sidebar gains filters for recordings that still need transcription, a summary, or speaker identification. This release also fixes speaker-page dates and voice samples, stops meeting dates drifting on each edit, restores length and seeking in the pre-upload review, and adds a round of security hardening (enforced auth rate limits, an access check on bulk toggle, webhook delivery re-validation, and bounded FFmpeg timeouts).
+!!! success "Latest Release: v0.9.6-alpha — merge recordings, Markdown export, and backfill export"
+    Several recordings can now be combined into one that is re-processed from scratch through the full pipeline (transcription, diarization, summary, and automatic speaker labelling) — merge from the sidebar by selecting and reordering recordings, or from the recording view where a split button appends a just-finished recording onto an existing one. The merge dialog lets you choose which recording's notes and prompt variables to keep, while participants and tags are combined. The transcript download menu gains a TXT / MD toggle, and Settings gains an "Export all to disk" button (when automatic export is enabled) that backfills every processed recording. Internally, every ingestion path now resolves its transcription settings through one shared precedence chain, so any path transcribes identically to a standard upload.
 
-    See the [full release notes](https://github.com/murtaza-nasir/speakr/releases/tag/v0.9.5-alpha) for details. Backwards compatible; database migrations run automatically on startup.
+    See the [full release notes](https://github.com/murtaza-nasir/speakr/releases/tag/v0.9.6-alpha) for details. Backwards compatible; database migrations run automatically on startup.
 
 ## Quick Navigation
 
