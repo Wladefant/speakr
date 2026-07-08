@@ -416,6 +416,71 @@ def stitch_recording_session(session_id: str) -> Tuple[int, str, dict]:
     return recording.id, final_path, metadata
 
 
+def _try_kickoff_merge(recording, user_id, metadata) -> bool:
+    """If the finalize metadata carries a ``merge_intent``, create the merged
+    recording (this clip + the chosen existing recordings, in the chosen order)
+    and enqueue the merge job, skipping this clip's standalone transcription.
+
+    Returns True when a merge was enqueued, False to fall through to the normal
+    transcribe. Any failure returns False so the clip is transcribed normally
+    rather than left in limbo.
+    """
+    intent = (metadata or {}).get('merge_intent')
+    if not isinstance(intent, dict):
+        return False
+
+    order = intent.get('order')
+    if not isinstance(order, list) or '__self__' not in order:
+        return False
+
+    from flask import current_app
+    from src.database import db
+    from src.models import User
+    from src.services.recording_merge import create_merge_recording, MergeError
+
+    try:
+        # Substitute this clip's real id for the "__self__" placeholder, coercing
+        # the existing ids to ints and dropping anything unusable.
+        source_ids = []
+        for entry in order:
+            if entry == '__self__':
+                source_ids.append(recording.id)
+            else:
+                try:
+                    source_ids.append(int(entry))
+                except (TypeError, ValueError):
+                    continue
+
+        if len(source_ids) < 2 or recording.id not in source_ids:
+            return False
+
+        user = db.session.get(User, user_id)
+        if not user:
+            return False
+
+        # Trusted path: the clip's audio was just produced by the stitch, so it
+        # is final even though the recording is not COMPLETED (require_settled
+        # off). Ownership + audio-existence are still enforced.
+        create_merge_recording(
+            user,
+            source_ids,
+            title=(intent.get('title') or None),
+            delete_originals=bool(intent.get('delete_originals', False)),
+            require_settled=False,
+        )
+        return True
+    except MergeError as e:
+        current_app.logger.warning(
+            f"Merge-from-recording for {recording.id} failed ({e}); transcribing normally instead."
+        )
+        return False
+    except Exception as e:
+        current_app.logger.error(
+            f"Unexpected error routing recording {recording.id} into a merge: {e}; transcribing normally."
+        )
+        return False
+
+
 def kickoff_transcription_for_stitched(
     recording_id: int,
     user_id: int,
@@ -432,6 +497,15 @@ def kickoff_transcription_for_stitched(
     from src.models import Recording
 
     recording = db.session.get(Recording, recording_id)
+
+    # Merge-from-recording (issue #323): if the user chose to merge this clip
+    # into existing recording(s) BEFORE finishing, route the freshly-stitched
+    # audio straight into a merge instead of transcribing it on its own. The clip
+    # is therefore never transcribed standalone — only the combined recording is,
+    # once. Falls back to a normal transcribe on any problem so the clip is never
+    # left orphaned.
+    if _try_kickoff_merge(recording, user_id, metadata):
+        return
 
     overrides = {
         'min_speakers': metadata.get('min_speakers'),

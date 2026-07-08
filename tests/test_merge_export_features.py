@@ -383,3 +383,66 @@ def test_run_merge_job_empty_output_raises():
              patch("src.services.recording_merge.job_queue.enqueue", return_value=1):
             with pytest.raises(MergeError):
                 run_merge_job(merged, {"source_ids": [r1.id, r2.id]})
+
+
+# --------------------------------------------------------------------------- #
+# #323 — Merge-from-recording (stitch straight into a merge, no double transcribe)
+# --------------------------------------------------------------------------- #
+
+def test_create_merge_recording_require_settled_false_accepts_processing_source():
+    from src.services.recording_merge import create_merge_recording, MergeError
+    with app.app_context():
+        user = _mk_user()
+        done = _mk_recording(user, title="Existing", status="COMPLETED")
+        # The freshly-stitched clip is NOT completed yet, but its audio is ready.
+        clip = _mk_recording(user, title="Clip", status="PROCESSING")
+        # With the guard on, the clip is rejected...
+        with _endpoint_mocks():
+            import pytest
+            with pytest.raises(MergeError):
+                create_merge_recording(user, [done.id, clip.id])
+        # ...with require_settled off (trusted stitch path), it is accepted.
+        with _endpoint_mocks() as enqueue:
+            merged = create_merge_recording(user, [done.id, clip.id], require_settled=False)
+        assert merged.processing_source == "merge"
+        assert enqueue.call_args.kwargs["job_type"] == "merge"
+        assert enqueue.call_args.kwargs["params"]["source_ids"] == [done.id, clip.id]
+
+
+def test_try_kickoff_merge_substitutes_self_and_enqueues():
+    from src.services.recording_stitch import _try_kickoff_merge
+    with app.app_context():
+        user = _mk_user()
+        existing = _mk_recording(user, title="Existing", status="COMPLETED")
+        clip = _mk_recording(user, title="Clip", status="PROCESSING")  # just stitched
+        metadata = {"merge_intent": {"order": [existing.id, "__self__"], "delete_originals": True, "title": "Combined"}}
+        with _endpoint_mocks() as enqueue:
+            handled = _try_kickoff_merge(clip, user.id, metadata)
+        assert handled is True
+        # A merge job was enqueued with the clip's real id substituted for __self__
+        assert enqueue.call_args.kwargs["job_type"] == "merge"
+        assert enqueue.call_args.kwargs["params"]["source_ids"] == [existing.id, clip.id]
+        assert enqueue.call_args.kwargs["params"]["delete_originals"] is True
+
+
+def test_try_kickoff_merge_no_intent_falls_through():
+    from src.services.recording_stitch import _try_kickoff_merge
+    with app.app_context():
+        user = _mk_user()
+        clip = _mk_recording(user, title="Clip", status="PROCESSING")
+        assert _try_kickoff_merge(clip, user.id, {}) is False
+        # order without the __self__ placeholder is ignored (falls through)
+        assert _try_kickoff_merge(clip, user.id, {"merge_intent": {"order": [1, 2]}}) is False
+
+
+def test_try_kickoff_merge_other_users_source_falls_through():
+    from src.services.recording_stitch import _try_kickoff_merge
+    with app.app_context():
+        me = _mk_user()
+        other = _mk_user()
+        clip = _mk_recording(me, title="Clip", status="PROCESSING")
+        theirs = _mk_recording(other, title="Theirs", status="COMPLETED")
+        metadata = {"merge_intent": {"order": [theirs.id, "__self__"], "delete_originals": True}}
+        with _endpoint_mocks():
+            # create_merge_recording raises MergeError (not owned) -> falls through
+            assert _try_kickoff_merge(clip, me.id, metadata) is False

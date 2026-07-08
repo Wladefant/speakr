@@ -1886,6 +1886,7 @@
     "noClip": "Nenhum áudio gravado para mesclar.",
     "uploadedMergeManually": "Seu clipe foi enviado. Selecione-o e outra gravação da lista para mesclá-los.",
     "preparingClip": "Preparando seu clipe — as opções de mesclagem abrirão quando estiver pronto.",
-    "clipNotReady": "Não foi possível preparar o clipe para a mesclagem."
+    "clipNotReady": "Não foi possível preparar o clipe para a mesclagem.",
+    "thisRecording": "Esta gravação"
   }
 }

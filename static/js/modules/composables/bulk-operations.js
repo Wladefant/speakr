@@ -16,8 +16,11 @@ export function useBulkOperations({
     showToast,
     setGlobalError,
     exitSelectionMode,
-    startReprocessingPoll
+    startReprocessingPoll,
+    t,
+    finalizeRecordingMerge
 }) {
+    const _t = (k, fallback) => (typeof t === 'function' ? t(k) : (fallback || k));
     // Modal state
     const showBulkDeleteModal = ref(false);
     const showBulkTagModal = ref(false);
@@ -33,6 +36,11 @@ export function useBulkOperations({
     const mergeTitle = ref('');
     const mergeDeleteOriginals = ref(false);
     const mergeInProgress = ref(false);
+    // 'bulk' = merge existing recordings (POST /api/recordings/merge).
+    // 'recording' = merge a just-recorded clip into existing ones; the list
+    // holds a virtual { __self__: true } entry for the not-yet-uploaded clip and
+    // confirm finalizes the recording session with the merge intent instead.
+    const mergeMode = ref('bulk');
     // In-modal "add recording" picker (lets the user append existing recordings
     // to the merge from within the modal — used by the normal merge and by the
     // merge-from-recording flow that seeds the modal with a just-recorded clip).
@@ -291,9 +299,26 @@ export function useBulkOperations({
     const openBulkMergeModal = () => {
         // Seed the ordered list from the current selection. Order matters for a
         // merge, so present the selection as an explicit, reorderable list.
+        mergeMode.value = 'bulk';
         mergeOrderedList.value = selectedRecordings.value.slice();
         mergeTitle.value = '';
         mergeDeleteOriginals.value = false;
+        mergeAddPickerOpen.value = false;
+        mergeAddSearch.value = '';
+        showBulkMergeModal.value = true;
+    };
+
+    // Open the merge modal for a just-recorded clip that has NOT been uploaded
+    // yet. The list starts with a virtual placeholder for the clip; the user
+    // adds existing recordings to merge it into. Defaults to replacing the
+    // sources (the chosen behavior for this flow).
+    const openMergeForRecording = () => {
+        mergeMode.value = 'recording';
+        mergeOrderedList.value = [{ id: '__self__', __self__: true, title: _t('mergeRecordings.thisRecording', 'This recording') }];
+        mergeTitle.value = '';
+        mergeDeleteOriginals.value = true;
+        mergeAddPickerOpen.value = false;
+        mergeAddSearch.value = '';
         showBulkMergeModal.value = true;
     };
 
@@ -307,6 +332,7 @@ export function useBulkOperations({
     // Used by the "merge this recording with an existing one" flow (upload view)
     // — it seeds the just-recorded clip and defaults to replacing the sources.
     const openMergeWith = (seedRecordings, { deleteOriginals = false, title = '' } = {}) => {
+        mergeMode.value = 'bulk';
         mergeOrderedList.value = (seedRecordings || []).slice();
         mergeTitle.value = title || '';
         mergeDeleteOriginals.value = !!deleteOriginals;
@@ -324,6 +350,9 @@ export function useBulkOperations({
     };
 
     const removeMergeItem = (index) => {
+        // The virtual clip entry is the anchor of a recording-mode merge and
+        // cannot be removed.
+        if (mergeOrderedList.value[index] && mergeOrderedList.value[index].__self__) return;
         const next = mergeOrderedList.value.slice();
         next.splice(index, 1);
         mergeOrderedList.value = next;
@@ -339,6 +368,28 @@ export function useBulkOperations({
     };
 
     const executeBulkMerge = async () => {
+        if (mergeOrderedList.value.length < 2) return;
+
+        // Recording mode: hand off to the recorder, which finalizes the session
+        // carrying the ordered merge intent (with '__self__' marking the clip).
+        // The server routes the stitched clip straight into the merge — no
+        // standalone transcription of the clip.
+        if (mergeMode.value === 'recording') {
+            const orderedSpec = mergeOrderedList.value.map(r => (r.__self__ ? '__self__' : r.id));
+            const hasExisting = orderedSpec.some(x => x !== '__self__');
+            if (!hasExisting || typeof finalizeRecordingMerge !== 'function') return;
+            const title = mergeTitle.value.trim() || undefined;
+            const deleteOriginals = mergeDeleteOriginals.value;
+            closeBulkMergeModal();
+            try {
+                await finalizeRecordingMerge(orderedSpec, { deleteOriginals, title });
+            } catch (error) {
+                console.error('Recording merge finalize error:', error);
+                setGlobalError(`Failed to start merge: ${error.message}`);
+            }
+            return;
+        }
+
         const orderedIds = mergeOrderedList.value.map(r => r.id);
         if (orderedIds.length < 2) return;
 
@@ -605,6 +656,7 @@ export function useBulkOperations({
         mergeAddPickerOpen,
         mergeAddSearch,
         mergeCandidates,
+        mergeMode,
 
         // Bulk Delete
         openBulkDeleteModal,
@@ -623,6 +675,7 @@ export function useBulkOperations({
 
         // Merge
         openBulkMergeModal,
+        openMergeForRecording,
         closeBulkMergeModal,
         openMergeWith,
         addMergeCandidate,

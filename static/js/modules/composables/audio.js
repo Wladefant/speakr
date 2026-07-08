@@ -913,11 +913,15 @@ export function useAudio(state, utils) {
     };
 
     // Upload recorded audio
-    const uploadRecordedAudio = async () => {
+    const uploadRecordedAudio = async (opts = {}) => {
         if (!audioBlobURL.value) {
             setGlobalError("No recorded audio to upload.");
             return;
         }
+        // Optional merge intent: when present, the server routes the stitched
+        // clip straight into a merge (no standalone transcription). See
+        // finalizeRecordingMerge / mergeRecordedWithExisting.
+        const mergeIntent = opts.mergeIntent || null;
 
         // Get selected tags as objects and create a DEEP copy to prevent reactivity issues
         const selectedTagsTemp = selectedTagIds.value.map(tagId => {
@@ -950,6 +954,9 @@ export function useAudio(state, utils) {
                     min_speakers: asrMinSpeakers.value || null,
                     max_speakers: asrMaxSpeakers.value || null,
                 };
+                if (mergeIntent) {
+                    metadata.merge_intent = mergeIntent;
+                }
                 const result = await ServerSessions.finalizeSession(serverSessionId, metadata);
                 showToast?.((utils.t && utils.t('toasts.recordingFinalized')) || 'Recording uploaded for processing', 'fa-cloud-upload-alt');
 
@@ -1055,65 +1062,40 @@ export function useAudio(state, utils) {
         }
     };
 
-    // Poll a recording until its audio is settled and it is mergeable
-    // (COMPLETED), then return its full dict. Used by mergeRecordedWithExisting.
-    const _pollUntilMergeable = async (recordingId, { timeoutMs = 15 * 60 * 1000, intervalMs = 3000 } = {}) => {
-        const start = Date.now();
-        while (Date.now() - start < timeoutMs) {
-            try {
-                const resp = await fetch(`/recording/${recordingId}/status`);
-                if (resp.ok) {
-                    const s = await resp.json();
-                    if (s.status === 'COMPLETED' && s.audio_ready !== false) {
-                        const full = await fetch(`/api/recordings/${recordingId}`);
-                        return full.ok ? await full.json() : null;
-                    }
-                    if (s.status === 'FAILED') return null;
-                }
-            } catch (_) { /* transient; keep polling */ }
-            await new Promise(r => setTimeout(r, intervalMs));
-        }
-        return null;
-    };
-
-    // Split-button action: upload the just-recorded clip, then open the merge
-    // modal seeded with it so the user can combine it with existing
-    // recording(s). The merge service only accepts settled sources, so we upload
-    // first and wait for the clip to finish processing before opening the modal.
+    // Split-button action: open the merge modal in "recording" mode BEFORE
+    // finalizing, so the user picks which existing recording(s) to merge this
+    // clip into and in what order. On confirm the modal calls
+    // finalizeRecordingMerge, which finalizes the session carrying that intent —
+    // the server stitches the clip and routes it straight into the merge, so the
+    // clip is never transcribed on its own (only the combined recording is).
     const mergeRecordedWithExisting = async () => {
         const t = (k, p) => (utils.t ? utils.t(k, p) : k);
         if (!audioBlobURL.value) {
             setGlobalError(t('mergeRecordings.noClip') || 'No recorded audio to merge.');
             return;
         }
-
-        let result;
-        try {
-            result = await uploadRecordedAudio();
-        } catch (e) {
-            setGlobalError(`Upload failed: ${e.message}`);
-            return;
-        }
-
-        const newId = result && result.recording_id;
-        if (!newId) {
-            // Legacy single-shot path or a failure — the clip uploaded normally
-            // but we can't chain a merge automatically.
+        if (!serverSessionId) {
+            // Legacy single-shot recordings have no server session to attach the
+            // intent to. Tell the user to upload and merge from the list.
             showToast?.(t('mergeRecordings.uploadedMergeManually'), 'fa-info-circle', 6000);
             return;
         }
-
-        showToast?.(t('mergeRecordings.preparingClip'), 'fa-spinner');
-        const rec = await _pollUntilMergeable(newId);
-        if (!rec) {
-            setGlobalError(t('mergeRecordings.clipNotReady'));
-            return;
+        if (utils.openMergeForRecording) {
+            utils.openMergeForRecording();
         }
+    };
 
-        if (utils.openMergeWith) {
-            // Default to replacing the sources (the chosen behavior for this flow).
-            utils.openMergeWith([rec], { deleteOriginals: true });
-        }
+    // Called by the merge modal (recording mode) on confirm: finalize the
+    // recording session with the merge intent. `orderedSpec` is the ordered
+    // source list with the string '__self__' marking this clip's position.
+    const finalizeRecordingMerge = async (orderedSpec, { deleteOriginals = true, title = undefined } = {}) => {
+        return uploadRecordedAudio({
+            mergeIntent: {
+                order: orderedSpec,
+                delete_originals: !!deleteOriginals,
+                title: title || undefined,
+            },
+        });
     };
 
     // Upload recorded audio in incognito mode
@@ -1496,6 +1478,7 @@ export function useAudio(state, utils) {
         normalizeLiveMediaDuration,
         uploadRecordedAudio,
         mergeRecordedWithExisting,
+        finalizeRecordingMerge,
         uploadRecordedAudioIncognito,
         acceptRecordingDisclaimer,
         cancelRecordingDisclaimer,

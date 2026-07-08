@@ -93,8 +93,16 @@ def _concat_audio(input_paths: list, output_path: str) -> None:
     _run_ffmpeg_command(cmd, f"merge concat of {len(input_paths)} recordings")
 
 
-def _validate_sources(user, recording_ids, storage):
+def _validate_sources(user, recording_ids, storage, require_settled=True):
     """Validate the requested sources and return them in caller order.
+
+    ``require_settled`` gates the "must be a settled/COMPLETED recording" check.
+    User-initiated merges keep it on (a source mid-processing could still have
+    its audio_path mutated by video->audio extraction). Trusted internal callers
+    that just produced the audio themselves — the recording-session stitch that
+    routes straight into a merge — pass False, since the audio is final the
+    moment the stitch finishes even though the recording is not COMPLETED. The
+    ownership and audio-existence checks always apply.
 
     Raises MergeError on any problem. Returns the list of Recording rows.
     """
@@ -115,7 +123,7 @@ def _validate_sources(user, recording_ids, storage):
         rec = db.session.get(Recording, rid)
         if not rec or rec.user_id != user.id:
             raise MergeError("One or more recordings were not found.")
-        if rec.status not in _STABLE_STATUSES:
+        if require_settled and rec.status not in _STABLE_STATUSES:
             raise MergeError(
                 f"\"{rec.title or 'A recording'}\" is still processing. "
                 "Wait for it to finish before merging."
@@ -129,17 +137,19 @@ def _validate_sources(user, recording_ids, storage):
     return recordings
 
 
-def create_merge_recording(user, recording_ids, title=None, delete_originals=False):
+def create_merge_recording(user, recording_ids, title=None, delete_originals=False,
+                           require_settled=True):
     """Validate sources and create a placeholder recording queued for merging.
 
-    Runs in the request. Does NO ffmpeg — the heavy concat happens later in
-    ``run_merge_job`` on a worker. Returns the new (PROCESSING) Recording.
+    Runs in the request (or, with ``require_settled=False``, from the stitch
+    worker for the merge-from-recording flow). Does NO ffmpeg — the heavy concat
+    happens later in ``run_merge_job``. Returns the new (QUEUED) Recording.
 
     Raises:
         MergeError: on validation failure.
     """
     storage = get_storage_service()
-    recordings = _validate_sources(user, recording_ids, storage)
+    recordings = _validate_sources(user, recording_ids, storage, require_settled=require_settled)
     ordered_ids = [r.id for r in recordings]
 
     first = recordings[0]

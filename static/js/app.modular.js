@@ -2408,13 +2408,17 @@ document.addEventListener('DOMContentLoaded', async () => {
                 showToast,
                 setGlobalError,
                 exitSelectionMode: bulkSelectionComposable.exitSelectionMode,
-                startReprocessingPoll: reprocessComposable.startReprocessingPoll
+                startReprocessingPoll: reprocessComposable.startReprocessingPoll,
+                t,
+                finalizeRecordingMerge: audioComposable.finalizeRecordingMerge
             });
 
-            // Bridge merge-modal opener to the audio composable so the
+            // Bridge merge-modal openers to the audio composable so the
             // "merge this recording with an existing one" split-button action in
-            // the recording view can seed and open the merge modal after upload.
+            // the recording view can open the merge modal (recording mode) and,
+            // on confirm, finalize the session with the merge intent.
             utils.openMergeWith = bulkOperationsComposable.openMergeWith;
+            utils.openMergeForRecording = bulkOperationsComposable.openMergeForRecording;
 
             // =========================================================================
             // VIRTUAL SCROLL SETUP (for performance with long transcriptions)
