@@ -2867,6 +2867,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
             // Watch allJobs for completed/failed transitions - update local recordings state
             watch(allJobs, async (jobs) => {
+                let reconcileNeeded = false;
                 for (const job of jobs) {
                     // A 'stitch' job is an intermediate step for server-side
                     // recordings (#287): a 'transcribe' job always follows it.
@@ -2877,6 +2878,20 @@ document.addEventListener('DOMContentLoaded', async () => {
                     // "Processing". A FAILED stitch IS terminal (no transcribe
                     // follows), so only skip the completed case.
                     if (job.job_type === 'stitch' && job.job_status === 'completed') continue;
+                    // A 'merge' job's completion means the concat finished: the
+                    // merged recording now exists and (with delete_originals) the
+                    // source recordings are gone, but a transcribe still follows.
+                    // Reconcile the sidebar once so the merged recording appears
+                    // and deleted sources drop — WITHOUT marking the recording
+                    // done, so its transcribe completion still moves it to
+                    // COMPLETED below.
+                    if (job.job_type === 'merge' && job.job_status === 'completed') {
+                        if (!completedRecordingIds.has(`merge_${job.recording_id}`)) {
+                            completedRecordingIds.add(`merge_${job.recording_id}`);
+                            reconcileNeeded = true;
+                        }
+                        continue;
+                    }
                     if (job.job_status === 'completed' && !completedRecordingIds.has(job.recording_id)) {
                         completedRecordingIds.add(job.recording_id);
                         try {
@@ -2886,6 +2901,11 @@ document.addEventListener('DOMContentLoaded', async () => {
                                 const idx = recordings.value.findIndex(r => r.id === job.recording_id);
                                 if (idx !== -1) {
                                     recordings.value[idx] = data;
+                                } else {
+                                    // Completed recording we don't have locally —
+                                    // e.g. a merge result, an auto-processed file,
+                                    // or one created in another tab. Reconcile.
+                                    reconcileNeeded = true;
                                 }
                                 if (selectedRecording.value?.id === job.recording_id) {
                                     selectedRecording.value = data;
@@ -2924,6 +2944,23 @@ document.addEventListener('DOMContentLoaded', async () => {
                         } catch (err) {
                             console.error(`Error fetching failed recording ${job.recording_id}:`, err);
                         }
+                    }
+                }
+
+                // A merge created a new recording and/or deleted its sources that
+                // our local list doesn't reflect. Reload page 1 (respecting the
+                // current search) so the merged recording appears and the deleted
+                // sources — including the recorded clip — drop out, without a
+                // manual refresh. If the open recording was one of the deleted
+                // sources, clear the stale detail view.
+                if (reconcileNeeded) {
+                    try {
+                        await recordingsComposable.loadRecordings(1, false, searchQuery.value || '');
+                        if (selectedRecording.value && !recordings.value.some(r => r.id === selectedRecording.value.id)) {
+                            selectedRecording.value = null;
+                        }
+                    } catch (e) {
+                        console.error('Reconcile after merge failed:', e);
                     }
                 }
             }, { deep: true });
