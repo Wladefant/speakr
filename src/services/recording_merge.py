@@ -178,17 +178,21 @@ def create_merge_recording(user, recording_ids, title=None, delete_originals=Fal
 
     now = datetime.utcnow()
 
-    # Notes cannot be meaningfully concatenated, so keep exactly one source's:
+    # The "reference" source (chosen via notes_source_id) donates both its notes
+    # AND its per-recording prompt variables to the merged recording, so the same
+    # summarization context carries into the merged recording's pipeline:
     #   - notes_source_id unset  -> the first source (API back-compat default)
-    #   - notes_source_id is None -> keep no notes
-    #   - notes_source_id == <id> -> that source's notes (the user's pick)
+    #   - notes_source_id is None -> no reference (keep no notes / prompt vars)
+    #   - notes_source_id == <id> -> that source (its notes + prompt vars)
     if notes_source_id is _UNSET:
-        merged_notes = first.notes
+        reference = first
     elif notes_source_id is None:
-        merged_notes = None
+        reference = None
     else:
-        chosen = next((r for r in recordings if r.id == notes_source_id), None)
-        merged_notes = chosen.notes if chosen else first.notes
+        reference = next((r for r in recordings if r.id == notes_source_id), first)
+
+    merged_notes = reference.notes if reference else None
+    merged_prompt_variables = (reference.prompt_variables or None) if reference else None
 
     # Participants are additive across a merge — union them so none are lost.
     merged_participants = _union_participants(recordings)
@@ -211,6 +215,7 @@ def create_merge_recording(user, recording_ids, title=None, delete_originals=Fal
         mime_type='audio/mp4',
         notes=merged_notes,
         participants=merged_participants,
+        prompt_variables=merged_prompt_variables,
         folder_id=first.folder_id,
         processing_source='merge',
     )

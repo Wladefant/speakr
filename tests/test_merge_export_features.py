@@ -529,3 +529,37 @@ def test_merge_endpoint_passes_notes_source_id():
         assert resp.status_code == 200
         merged = db.session.get(Recording, resp.get_json()["recording_id"])
         assert merged.notes == "beta"
+
+
+def test_merge_prompt_variables_follow_notes_source():
+    from src.services.recording_merge import create_merge_recording
+    with app.app_context():
+        user = _mk_user()
+        a = _mk_recording(user, title="A", notes="a", prompt_variables={"agenda": "AAA"})
+        b = _mk_recording(user, title="B", notes="b", prompt_variables={"agenda": "BBB"})
+        with _endpoint_mocks():
+            merged = create_merge_recording(user, [a.id, b.id], notes_source_id=b.id)
+        assert merged.notes == "b"
+        assert merged.prompt_variables == {"agenda": "BBB"}
+
+
+def test_merge_prompt_variables_default_first_source():
+    from src.services.recording_merge import create_merge_recording
+    with app.app_context():
+        user = _mk_user()
+        a = _mk_recording(user, title="A", prompt_variables={"agenda": "AAA"})
+        b = _mk_recording(user, title="B", prompt_variables={"agenda": "BBB"})
+        with _endpoint_mocks():
+            merged = create_merge_recording(user, [a.id, b.id])
+        assert merged.prompt_variables == {"agenda": "AAA"}
+
+
+def test_merge_prompt_variables_dropped_when_no_notes():
+    from src.services.recording_merge import create_merge_recording
+    with app.app_context():
+        user = _mk_user()
+        a = _mk_recording(user, title="A", prompt_variables={"agenda": "AAA"})
+        b = _mk_recording(user, title="B")
+        with _endpoint_mocks():
+            merged = create_merge_recording(user, [a.id, b.id], notes_source_id=None)
+        assert merged.prompt_variables is None
