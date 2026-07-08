@@ -1887,6 +1887,7 @@
     "uploadedMergeManually": "Tu clip se ha subido. Selecciónalo junto con otra grabación de la lista para combinarlos.",
     "preparingClip": "Preparando tu clip: las opciones de combinación se abrirán cuando esté listo.",
     "clipNotReady": "No se pudo preparar el clip para la combinación.",
-    "thisRecording": "Esta grabación"
+    "thisRecording": "Esta grabación",
+    "searching": "Buscando…"
   }
 }

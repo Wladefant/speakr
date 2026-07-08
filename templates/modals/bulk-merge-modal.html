@@ -55,13 +55,17 @@
                 <div v-else class="rounded-md border border-[var(--border-primary)] overflow-hidden">
                     <input type="text" v-model="mergeAddSearch" :placeholder="t('mergeRecordings.searchRecordings')"
                            class="w-full px-3 py-2 text-sm bg-[var(--bg-input)] text-[var(--text-primary)] border-b border-[var(--border-primary)] focus:outline-none">
-                    <div class="max-h-40 overflow-y-auto">
+                    <div class="max-h-40 overflow-y-auto"
+                         @scroll="(e) => { if (e.target.scrollTop + e.target.clientHeight >= e.target.scrollHeight - 24) loadMoreMergeCandidates(); }">
                         <button v-for="cand in mergeCandidates" :key="cand.id" @click="addMergeCandidate(cand)"
                                 class="w-full text-left px-3 py-2 text-sm hover:bg-[var(--bg-tertiary)] transition-colors flex items-center gap-2">
                             <i class="fas fa-plus text-[10px] text-[var(--text-accent)]"></i>
                             <span class="truncate">${ cand.title || t('mergeRecordings.untitled') }</span>
                         </button>
-                        <div v-if="mergeCandidates.length === 0" class="px-3 py-3 t-meta text-center" v-text="t('mergeRecordings.noCandidates')"></div>
+                        <div v-if="mergePickerLoading" class="px-3 py-3 t-meta text-center">
+                            <i class="fas fa-spinner fa-spin mr-1"></i><span v-text="t('mergeRecordings.searching')"></span>
+                        </div>
+                        <div v-else-if="mergeCandidates.length === 0" class="px-3 py-3 t-meta text-center" v-text="t('mergeRecordings.noCandidates')"></div>
                     </div>
                 </div>
             </div>

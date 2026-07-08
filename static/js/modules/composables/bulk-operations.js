@@ -3,7 +3,7 @@
  * Handles bulk API operations for multiple recordings
  */
 
-const { ref, computed } = Vue;
+const { ref, computed, watch } = Vue;
 
 export function useBulkOperations({
     selectedRecordingIds,
@@ -18,7 +18,8 @@ export function useBulkOperations({
     exitSelectionMode,
     startReprocessingPoll,
     t,
-    finalizeRecordingMerge
+    finalizeRecordingMerge,
+    fetchRecordingsPage
 }) {
     const _t = (k, fallback) => (typeof t === 'function' ? t(k) : (fallback || k));
     // Modal state
@@ -46,17 +47,67 @@ export function useBulkOperations({
     // merge-from-recording flow that seeds the modal with a just-recorded clip).
     const mergeAddPickerOpen = ref(false);
     const mergeAddSearch = ref('');
-    // Only completed recordings with settled audio are mergeable, and not ones
-    // already in the list. Filtered by the search box.
+    // Server-side candidate search so the picker never downloads the whole list.
+    // Mirrors the sidebar's paginated /api/recordings search, filtered to
+    // mergeable (COMPLETED) recordings via the status param.
+    const mergePickerResults = ref([]);
+    const mergePickerLoading = ref(false);
+    const mergePickerPage = ref(1);
+    const mergePickerHasMore = ref(false);
+    const MERGE_PICKER_PER_PAGE = 20;
+
+    const loadMergeCandidates = async ({ append = false } = {}) => {
+        if (typeof fetchRecordingsPage !== 'function') return;
+        const page = append ? mergePickerPage.value + 1 : 1;
+        mergePickerLoading.value = true;
+        try {
+            const data = await fetchRecordingsPage({
+                page,
+                per_page: MERGE_PICKER_PER_PAGE,
+                q: mergeAddSearch.value.trim(),
+                status: 'COMPLETED',
+                // Deliberately ignores the sidebar's archived/starred/inbox/
+                // folder filters — the picker searches all completed recordings.
+            });
+            const list = Array.isArray(data.recordings) ? data.recordings : [];
+            mergePickerResults.value = append ? [...mergePickerResults.value, ...list] : list;
+            mergePickerPage.value = data.pagination ? data.pagination.page : page;
+            mergePickerHasMore.value = data.pagination ? !!data.pagination.has_next : false;
+        } catch (e) {
+            console.error('Merge candidate search failed:', e);
+            if (!append) mergePickerResults.value = [];
+            mergePickerHasMore.value = false;
+        } finally {
+            mergePickerLoading.value = false;
+        }
+    };
+
+    const loadMoreMergeCandidates = async () => {
+        if (mergePickerHasMore.value && !mergePickerLoading.value) {
+            await loadMergeCandidates({ append: true });
+        }
+    };
+
+    // Candidates = server results minus what's already in the merge list and
+    // anything without settled audio.
     const mergeCandidates = computed(() => {
         const inList = new Set(mergeOrderedList.value.map(r => r.id));
-        const q = mergeAddSearch.value.trim().toLowerCase();
-        return recordings.value.filter(r =>
-            !inList.has(r.id) &&
-            r.status === 'COMPLETED' &&
-            r.audio_ready !== false &&
-            (!q || (r.title || '').toLowerCase().includes(q))
+        return mergePickerResults.value.filter(r =>
+            !inList.has(r.id) && r.audio_ready !== false
         );
+    });
+
+    // Debounced re-search when the query changes (only while the picker is open).
+    let _mergeSearchTimer = null;
+    watch(mergeAddSearch, () => {
+        if (!mergeAddPickerOpen.value) return;
+        clearTimeout(_mergeSearchTimer);
+        _mergeSearchTimer = setTimeout(() => loadMergeCandidates({ append: false }), 250);
+    });
+
+    // Load the first page whenever the picker opens.
+    watch(mergeAddPickerOpen, (open) => {
+        if (open) loadMergeCandidates({ append: false });
     });
 
     // Get CSRF token
@@ -656,6 +707,9 @@ export function useBulkOperations({
         mergeAddPickerOpen,
         mergeAddSearch,
         mergeCandidates,
+        mergePickerLoading,
+        mergePickerHasMore,
+        loadMoreMergeCandidates,
         mergeMode,
 
         // Bulk Delete

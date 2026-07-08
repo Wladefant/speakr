@@ -1616,6 +1616,7 @@ def get_recordings_paginated():
         needs_speakers = request.args.get('needs_speakers', '').lower() == 'true'
         sort_by = request.args.get('sort_by', 'created_at')  # 'created_at' or 'meeting_date'
         folder_filter = request.args.get('folder', '').strip()  # folder_id or 'none' for no folder
+        status_filter = request.args.get('status', '').strip().upper()  # e.g. 'COMPLETED' (used by the merge picker)
 
         # Get all accessible recording IDs (own + shared)
         accessible_recording_ids = get_accessible_recording_ids(current_user.id)
@@ -1635,6 +1636,11 @@ def get_recordings_paginated():
 
         # Build base query to include accessible recordings
         stmt = select(Recording).where(Recording.id.in_(accessible_recording_ids))
+
+        # Apply status filter (AND with other filters). Used by the merge picker
+        # to request only mergeable (COMPLETED) recordings server-side.
+        if status_filter:
+            stmt = stmt.where(Recording.status == status_filter)
 
         # Apply archived filter (AND with other filters)
         if show_archived:

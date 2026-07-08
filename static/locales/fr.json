@@ -1887,6 +1887,7 @@
     "uploadedMergeManually": "Votre extrait a été téléversé. Sélectionnez-le ainsi qu'un autre enregistrement de la liste pour les fusionner.",
     "preparingClip": "Préparation de votre extrait — les options de fusion s'ouvriront dès qu'il sera prêt.",
     "clipNotReady": "Impossible de préparer l'extrait pour la fusion.",
-    "thisRecording": "Cet enregistrement"
+    "thisRecording": "Cet enregistrement",
+    "searching": "Recherche…"
   }
 }

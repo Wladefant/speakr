@@ -24,6 +24,21 @@ export function useRecordings(state, utils, reprocessComposable) {
     const { setGlobalError, showToast } = utils;
 
     // Load recordings from API
+    // Low-level, state-free fetch of one page from the paginated recordings
+    // endpoint. Reused by the sidebar list (loadRecordings) and by the merge
+    // picker's server-side search so neither downloads the whole list. Only
+    // non-empty params are sent. Returns { recordings, pagination }.
+    const fetchRecordingsPage = async (params = {}) => {
+        const qs = new URLSearchParams();
+        Object.entries(params).forEach(([k, v]) => {
+            if (v !== undefined && v !== null && v !== '') qs.set(k, String(v));
+        });
+        const response = await fetch(`/api/recordings?${qs.toString()}`);
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Failed to load recordings');
+        return data;
+    };
+
     const loadRecordings = async (page = 1, append = false, searchQueryParam = '') => {
         globalError.value = null;
         if (!append) {
@@ -33,53 +48,20 @@ export function useRecordings(state, utils, reprocessComposable) {
         }
 
         try {
-            const endpoint = '/api/recordings';
-
-            const params = new URLSearchParams({
-                page: page.toString(),
-                per_page: perPage.value.toString()
+            const data = await fetchRecordingsPage({
+                page,
+                per_page: perPage.value,
+                q: searchQueryParam.trim(),
+                sort_by: sortBy.value || '',
+                archived: showArchivedRecordings.value ? 'true' : '',
+                shared: showSharedWithMe.value ? 'true' : '',
+                starred: filterStarred.value ? 'true' : '',
+                inbox: filterInbox.value ? 'true' : '',
+                needs_transcription: filterNeedsTranscription.value ? 'true' : '',
+                needs_summary: filterNeedsSummary.value ? 'true' : '',
+                needs_speakers: filterNeedsSpeakers.value ? 'true' : '',
+                folder: (filterFolder && filterFolder.value) ? filterFolder.value : '',
             });
-
-            if (searchQueryParam.trim()) {
-                params.set('q', searchQueryParam.trim());
-            }
-
-            // Add sort parameter
-            if (sortBy.value) {
-                params.set('sort_by', sortBy.value);
-            }
-
-            // Add archived/shared/starred/inbox filters as query params (ANDed with other filters)
-            if (showArchivedRecordings.value) {
-                params.set('archived', 'true');
-            }
-            if (showSharedWithMe.value) {
-                params.set('shared', 'true');
-            }
-            if (filterStarred.value) {
-                params.set('starred', 'true');
-            }
-            if (filterInbox.value) {
-                params.set('inbox', 'true');
-            }
-            if (filterNeedsTranscription.value) {
-                params.set('needs_transcription', 'true');
-            }
-            if (filterNeedsSummary.value) {
-                params.set('needs_summary', 'true');
-            }
-            if (filterNeedsSpeakers.value) {
-                params.set('needs_speakers', 'true');
-            }
-
-            // Add folder filter
-            if (filterFolder && filterFolder.value) {
-                params.set('folder', filterFolder.value);
-            }
-
-            const response = await fetch(`${endpoint}?${params}`);
-            const data = await response.json();
-            if (!response.ok) throw new Error(data.error || 'Failed to load recordings');
 
             const recordingsList = data.recordings;
             const pagination = data.pagination;
@@ -516,6 +498,7 @@ export function useRecordings(state, utils, reprocessComposable) {
     };
 
     return {
+        fetchRecordingsPage,
         loadRecordings,
         loadMoreRecordings,
         performSearch,

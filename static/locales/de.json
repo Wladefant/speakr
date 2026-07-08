@@ -1887,6 +1887,7 @@
     "uploadedMergeManually": "Ihr Clip wurde hochgeladen. Wählen Sie ihn und eine weitere Aufnahme in der Liste aus, um sie zusammenzuführen.",
     "preparingClip": "Ihr Clip wird vorbereitet — die Optionen zum Zusammenführen öffnen sich, sobald er bereit ist.",
     "clipNotReady": "Der Clip konnte nicht zum Zusammenführen vorbereitet werden.",
-    "thisRecording": "Diese Aufnahme"
+    "thisRecording": "Diese Aufnahme",
+    "searching": "Suche…"
   }
 }

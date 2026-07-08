@@ -2410,7 +2410,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                 exitSelectionMode: bulkSelectionComposable.exitSelectionMode,
                 startReprocessingPoll: reprocessComposable.startReprocessingPoll,
                 t,
-                finalizeRecordingMerge: audioComposable.finalizeRecordingMerge
+                finalizeRecordingMerge: audioComposable.finalizeRecordingMerge,
+                fetchRecordingsPage: recordingsComposable.fetchRecordingsPage
             });
 
             // Bridge merge-modal openers to the audio composable so the

@@ -1887,6 +1887,7 @@
     "uploadedMergeManually": "Your clip was uploaded. Select it and another recording in the list to merge them.",
     "preparingClip": "Preparing your clip — the merge options will open when it's ready.",
     "clipNotReady": "The clip could not be prepared for merging.",
-    "thisRecording": "This recording"
+    "thisRecording": "This recording",
+    "searching": "Searching…"
   }
 }

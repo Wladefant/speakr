@@ -1887,6 +1887,7 @@
     "uploadedMergeManually": "您的片段已上传。请在列表中选择它和另一条录音以进行合并。",
     "preparingClip": "正在准备您的片段——准备就绪后将打开合并选项。",
     "clipNotReady": "无法准备该片段以进行合并。",
-    "thisRecording": "此录音"
+    "thisRecording": "此录音",
+    "searching": "搜索中…"
   }
 }

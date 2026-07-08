@@ -315,6 +315,21 @@ def test_paginated_folder_filter(owner):
     assert no_folder not in ids
 
 
+def test_paginated_status_filter(owner):
+    # The merge picker uses ?status=COMPLETED to fetch only mergeable recordings.
+    with _db():
+        u = db.session.get(User, owner)
+        done = make_recording(u, title="done", status="COMPLETED").id
+        proc = make_recording(u, title="processing", status="PROCESSING").id
+
+    c = new_client()
+    login(c, owner)
+    resp = c.get("/api/recordings?status=COMPLETED&per_page=100")
+    ids = {r["id"] for r in resp.get_json()["recordings"]}
+    assert done in ids
+    assert proc not in ids
+
+
 def test_paginated_folder_none_filter(owner):
     with _db():
         u = db.session.get(User, owner)
