@@ -456,10 +456,6 @@ export function useBulkOperations({
         const orderedIds = mergeOrderedList.value.map(r => r.id);
         if (orderedIds.length < 2) return;
 
-        // Capture the delete choice now — the modal resets it when reopened, and
-        // the removal runs seconds later once the merge audio is ready.
-        const shouldDeleteOriginals = mergeDeleteOriginals.value;
-
         mergeInProgress.value = true;
         bulkActionInProgress.value = true;
 
@@ -483,28 +479,15 @@ export function useBulkOperations({
                 throw new Error(data.error || 'Failed to merge recordings');
             }
 
-            // The audio concat runs on a worker; originals are deleted there
-            // only after it succeeds. We do NOT remove them optimistically —
-            // instead we wait for the poll to report the merged audio is ready
-            // (which happens right after the concat + original-deletion), then
-            // drop them from the list. If the merge fails, the poll never fires
-            // onAudioReady, so the originals correctly stay put.
+            // Show the merged recording immediately (in PROCESSING) for instant
+            // feedback. Everything after this — advancing it to COMPLETED and
+            // removing the deleted source recordings once the concat finishes —
+            // is handled by the single merge-aware reconcile in watch(allJobs),
+            // the same path the merge-from-recording flow relies on. This keeps
+            // one source of truth for "a merge landed" instead of duplicating the
+            // add/remove logic here.
             if (data.recording) {
-                const mergedId = data.recording.id;
                 recordings.value.unshift(data.recording);
-                if (startReprocessingPoll) {
-                    startReprocessingPoll(mergedId, {
-                        onAudioReady: () => {
-                            if (!shouldDeleteOriginals) return;
-                            const removed = new Set(orderedIds);
-                            recordings.value = recordings.value.filter(r => !removed.has(r.id));
-                            // If a now-deleted original was open, switch to the merged one.
-                            if (selectedRecording.value && removed.has(selectedRecording.value.id)) {
-                                selectedRecording.value = recordings.value.find(r => r.id === mergedId) || null;
-                            }
-                        }
-                    });
-                }
             }
 
             closeBulkMergeModal();
