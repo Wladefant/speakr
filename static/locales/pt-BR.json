@@ -1888,6 +1888,10 @@
     "preparingClip": "Preparando seu clipe — as opções de mesclagem abrirão quando estiver pronto.",
     "clipNotReady": "Não foi possível preparar o clipe para a mesclagem.",
     "thisRecording": "Esta gravação",
-    "searching": "Pesquisando…"
+    "searching": "Pesquisando…",
+    "notesLabel": "Manter notas de",
+    "notesNone": "Não manter notas",
+    "notesWarning": "Somente as notas de uma gravação podem ser mantidas. Os participantes e as tags de todas as gravações são combinados.",
+    "notesHint": "Os participantes e as tags de todas as gravações são combinados."
   }
 }

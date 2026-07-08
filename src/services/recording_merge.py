@@ -54,9 +54,30 @@ _MERGED_BITRATE = '192k'
 # video is extracted to audio, so PENDING/PROCESSING sources are rejected.
 _STABLE_STATUSES = {'COMPLETED', 'SUMMARIZING', 'FAILED'}
 
+# Distinguishes "caller did not choose a notes source" (default to the first
+# source, for API back-compat) from "explicitly keep no notes" (None).
+_UNSET = object()
+
 
 class MergeError(Exception):
     """Raised when a merge cannot be performed. The message is user-safe."""
+
+
+def _union_participants(recordings):
+    """Union the comma-separated participants of all sources, de-duplicated
+    case-insensitively and order-preserving. Participants are additive across a
+    merge, so none should be lost. Returns a comma-separated string or None."""
+    seen = set()
+    out = []
+    for rec in recordings:
+        if not rec.participants:
+            continue
+        for name in (p.strip() for p in rec.participants.split(',')):
+            key = name.lower()
+            if name and key not in seen:
+                seen.add(key)
+                out.append(name)
+    return ', '.join(out) if out else None
 
 
 def _build_concat_filter(num_inputs: int) -> str:
@@ -138,7 +159,7 @@ def _validate_sources(user, recording_ids, storage, require_settled=True):
 
 
 def create_merge_recording(user, recording_ids, title=None, delete_originals=False,
-                           require_settled=True):
+                           require_settled=True, notes_source_id=_UNSET):
     """Validate sources and create a placeholder recording queued for merging.
 
     Runs in the request (or, with ``require_settled=False``, from the stitch
@@ -157,8 +178,24 @@ def create_merge_recording(user, recording_ids, title=None, delete_originals=Fal
 
     now = datetime.utcnow()
 
-    # Inherit folder from the first source; leave meeting_date at the earliest
-    # source's date so the merged session sorts where the conversation began.
+    # Notes cannot be meaningfully concatenated, so keep exactly one source's:
+    #   - notes_source_id unset  -> the first source (API back-compat default)
+    #   - notes_source_id is None -> keep no notes
+    #   - notes_source_id == <id> -> that source's notes (the user's pick)
+    if notes_source_id is _UNSET:
+        merged_notes = first.notes
+    elif notes_source_id is None:
+        merged_notes = None
+    else:
+        chosen = next((r for r in recordings if r.id == notes_source_id), None)
+        merged_notes = chosen.notes if chosen else first.notes
+
+    # Participants are additive across a merge — union them so none are lost.
+    merged_participants = _union_participants(recordings)
+
+    # Folder: a recording lives in exactly one folder; keep the first source's.
+    # meeting_date: earliest source date so the merged session sorts where the
+    # conversation began.
     meeting_dates = [r.meeting_date for r in recordings if r.meeting_date]
     merged_meeting_date = min(meeting_dates) if meeting_dates else now
 
@@ -172,21 +209,31 @@ def create_merge_recording(user, recording_ids, title=None, delete_originals=Fal
         meeting_date=merged_meeting_date,
         user_id=user.id,
         mime_type='audio/mp4',
-        notes=first.notes,
+        notes=merged_notes,
+        participants=merged_participants,
         folder_id=first.folder_id,
         processing_source='merge',
     )
     db.session.add(recording)
     db.session.flush()  # assign recording.id
 
-    # Inherit the first source's tags (preserving order).
-    for order, tag in enumerate(first.tags, 1):
-        db.session.add(RecordingTag(
-            recording_id=recording.id,
-            tag_id=tag.id,
-            order=order,
-            added_at=datetime.utcnow(),
-        ))
+    # Tags are additive too: union across all sources so none are lost. The first
+    # source's tags come first (in order) so the transcription-param resolver
+    # still keys off the first source's primary tag; other sources' tags follow.
+    order = 1
+    seen_tag_ids = set()
+    for rec in recordings:
+        for tag in rec.tags:
+            if tag.id in seen_tag_ids:
+                continue
+            seen_tag_ids.add(tag.id)
+            db.session.add(RecordingTag(
+                recording_id=recording.id,
+                tag_id=tag.id,
+                order=order,
+                added_at=datetime.utcnow(),
+            ))
+            order += 1
 
     db.session.commit()
 

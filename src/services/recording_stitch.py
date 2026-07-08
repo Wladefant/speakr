@@ -436,7 +436,7 @@ def _try_kickoff_merge(recording, user_id, metadata) -> bool:
     from flask import current_app
     from src.database import db
     from src.models import User
-    from src.services.recording_merge import create_merge_recording, MergeError
+    from src.services.recording_merge import create_merge_recording, MergeError, _UNSET
 
     try:
         # Substitute this clip's real id for the "__self__" placeholder, coercing
@@ -458,6 +458,22 @@ def _try_kickoff_merge(recording, user_id, metadata) -> bool:
         if not user:
             return False
 
+        # Resolve which source's notes to keep. '__self__' -> the clip; an id ->
+        # that source; null -> none; absent -> first source (default).
+        if 'notes_source' in intent:
+            ns = intent.get('notes_source')
+            if ns == '__self__':
+                notes_source_id = recording.id
+            elif ns is None:
+                notes_source_id = None
+            else:
+                try:
+                    notes_source_id = int(ns)
+                except (TypeError, ValueError):
+                    notes_source_id = _UNSET
+        else:
+            notes_source_id = _UNSET
+
         # Trusted path: the clip's audio was just produced by the stitch, so it
         # is final even though the recording is not COMPLETED (require_settled
         # off). Ownership + audio-existence are still enforced.
@@ -467,6 +483,7 @@ def _try_kickoff_merge(recording, user_id, metadata) -> bool:
             title=(intent.get('title') or None),
             delete_originals=bool(intent.get('delete_originals', False)),
             require_settled=False,
+            notes_source_id=notes_source_id,
         )
         return True
     except MergeError as e:

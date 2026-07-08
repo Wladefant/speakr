@@ -1081,21 +1081,27 @@ export function useAudio(state, utils) {
             return;
         }
         if (utils.openMergeForRecording) {
-            utils.openMergeForRecording();
+            // Pass the clip's recording-view notes so it can be offered as a
+            // notes source in the merge modal.
+            utils.openMergeForRecording({ clipNotes: recordingNotes.value || '' });
         }
     };
 
     // Called by the merge modal (recording mode) on confirm: finalize the
     // recording session with the merge intent. `orderedSpec` is the ordered
     // source list with the string '__self__' marking this clip's position.
-    const finalizeRecordingMerge = async (orderedSpec, { deleteOriginals = true, title = undefined } = {}) => {
-        return uploadRecordedAudio({
-            mergeIntent: {
-                order: orderedSpec,
-                delete_originals: !!deleteOriginals,
-                title: title || undefined,
-            },
-        });
+    const finalizeRecordingMerge = async (orderedSpec, { deleteOriginals = true, title = undefined, notesSource = undefined } = {}) => {
+        const mergeIntent = {
+            order: orderedSpec,
+            delete_originals: !!deleteOriginals,
+            title: title || undefined,
+        };
+        // notesSource: '__self__' | <id> | null. Only include the key when the
+        // caller specified one, so its absence means "use the backend default".
+        if (notesSource !== undefined) {
+            mergeIntent.notes_source = notesSource;
+        }
+        return uploadRecordedAudio({ mergeIntent });
     };
 
     // Upload recorded audio in incognito mode

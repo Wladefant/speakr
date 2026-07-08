@@ -446,3 +446,86 @@ def test_try_kickoff_merge_other_users_source_falls_through():
         with _endpoint_mocks():
             # create_merge_recording raises MergeError (not owned) -> falls through
             assert _try_kickoff_merge(clip, me.id, metadata) is False
+
+
+# --------------------------------------------------------------------------- #
+# #323 — Merge metadata preservation (notes pick, participants/tags union)
+# --------------------------------------------------------------------------- #
+
+def test_merge_notes_default_is_first_source():
+    from src.services.recording_merge import create_merge_recording
+    with app.app_context():
+        user = _mk_user()
+        a = _mk_recording(user, title="A", notes="alpha notes")
+        b = _mk_recording(user, title="B", notes="beta notes")
+        with _endpoint_mocks():
+            merged = create_merge_recording(user, [a.id, b.id])
+        assert merged.notes == "alpha notes"
+
+
+def test_merge_notes_explicit_source():
+    from src.services.recording_merge import create_merge_recording
+    with app.app_context():
+        user = _mk_user()
+        a = _mk_recording(user, title="A", notes="alpha notes")
+        b = _mk_recording(user, title="B", notes="beta notes")
+        with _endpoint_mocks():
+            merged = create_merge_recording(user, [a.id, b.id], notes_source_id=b.id)
+        assert merged.notes == "beta notes"
+
+
+def test_merge_notes_none_keeps_no_notes():
+    from src.services.recording_merge import create_merge_recording
+    with app.app_context():
+        user = _mk_user()
+        a = _mk_recording(user, title="A", notes="alpha notes")
+        b = _mk_recording(user, title="B", notes="beta notes")
+        with _endpoint_mocks():
+            merged = create_merge_recording(user, [a.id, b.id], notes_source_id=None)
+        assert merged.notes is None
+
+
+def test_merge_participants_unioned_dedup_case_insensitive():
+    from src.services.recording_merge import create_merge_recording
+    with app.app_context():
+        user = _mk_user()
+        a = _mk_recording(user, title="A", participants="Alice, Bob")
+        b = _mk_recording(user, title="B", participants="bob, Carol")
+        with _endpoint_mocks():
+            merged = create_merge_recording(user, [a.id, b.id])
+        parts = [p.strip() for p in (merged.participants or "").split(",") if p.strip()]
+        assert parts == ["Alice", "Bob", "Carol"]
+
+
+def test_merge_tags_unioned_first_source_first():
+    from src.services.recording_merge import create_merge_recording
+    with app.app_context():
+        user = _mk_user()
+        t1 = Tag(name=f"t1_{uuid.uuid4().hex[:6]}", user_id=user.id)
+        t2 = Tag(name=f"t2_{uuid.uuid4().hex[:6]}", user_id=user.id)
+        db.session.add_all([t1, t2])
+        db.session.commit()
+        a = _mk_recording(user, title="A")
+        db.session.add(RecordingTag(recording_id=a.id, tag_id=t1.id, order=1))
+        b = _mk_recording(user, title="B")
+        db.session.add(RecordingTag(recording_id=b.id, tag_id=t2.id, order=1))
+        db.session.add(RecordingTag(recording_id=b.id, tag_id=t1.id, order=2))  # dup of a's tag
+        db.session.commit()
+        with _endpoint_mocks():
+            merged = create_merge_recording(user, [a.id, b.id])
+        assert [t.id for t in merged.tags] == [t1.id, t2.id]
+
+
+def test_merge_endpoint_passes_notes_source_id():
+    with app.app_context():
+        user = _mk_user()
+        a = _mk_recording(user, title="A", notes="alpha")
+        b = _mk_recording(user, title="B", notes="beta")
+        client = app.test_client()
+        _login(client, user)
+        with _endpoint_mocks():
+            resp = client.post("/api/recordings/merge",
+                               json={"recording_ids": [a.id, b.id], "notes_source_id": b.id})
+        assert resp.status_code == 200
+        merged = db.session.get(Recording, resp.get_json()["recording_id"])
+        assert merged.notes == "beta"

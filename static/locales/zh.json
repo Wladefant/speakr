@@ -1888,6 +1888,10 @@
     "preparingClip": "正在准备您的片段——准备就绪后将打开合并选项。",
     "clipNotReady": "无法准备该片段以进行合并。",
     "thisRecording": "此录音",
-    "searching": "搜索中…"
+    "searching": "搜索中…",
+    "notesLabel": "保留备注来自",
+    "notesNone": "不保留备注",
+    "notesWarning": "只能保留一条录音的备注。所有录音的参与者和标签将被合并。",
+    "notesHint": "所有录音的参与者和标签将被合并。"
   }
 }

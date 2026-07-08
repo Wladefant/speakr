@@ -42,6 +42,24 @@ export function useBulkOperations({
     // holds a virtual { __self__: true } entry for the not-yet-uploaded clip and
     // confirm finalizes the recording session with the merge intent instead.
     const mergeMode = ref('bulk');
+    // Which source's notes to keep on the merged recording. Notes cannot be
+    // concatenated, so only one source's are kept. Value is a recording id,
+    // '__self__' (the recorded clip), or null (keep no notes).
+    const mergeNotesSourceId = ref(null);
+    // Sources in the merge that actually have notes — drives the selector.
+    const mergeNotesCandidates = computed(() =>
+        mergeOrderedList.value.filter(r => r && r.notes && String(r.notes).trim())
+    );
+    // Keep the notes selection valid as the list changes: default to the first
+    // source with notes; respect an explicit "keep none" ('none'); and if the
+    // chosen source leaves the list, fall back to the first remaining one.
+    watch(mergeNotesCandidates, (cands) => {
+        const ids = cands.map(r => r.id);
+        if (mergeNotesSourceId.value === 'none') return;      // explicit opt-out
+        if (mergeNotesSourceId.value === null || !ids.includes(mergeNotesSourceId.value)) {
+            mergeNotesSourceId.value = ids.length ? ids[0] : null;
+        }
+    }, { deep: false });
     // In-modal "add recording" picker (lets the user append existing recordings
     // to the merge from within the modal — used by the normal merge and by the
     // merge-from-recording flow that seeds the modal with a just-recorded clip).
@@ -354,6 +372,7 @@ export function useBulkOperations({
         mergeOrderedList.value = selectedRecordings.value.slice();
         mergeTitle.value = '';
         mergeDeleteOriginals.value = false;
+        mergeNotesSourceId.value = null;
         mergeAddPickerOpen.value = false;
         mergeAddSearch.value = '';
         showBulkMergeModal.value = true;
@@ -362,12 +381,18 @@ export function useBulkOperations({
     // Open the merge modal for a just-recorded clip that has NOT been uploaded
     // yet. The list starts with a virtual placeholder for the clip; the user
     // adds existing recordings to merge it into. Defaults to replacing the
-    // sources (the chosen behavior for this flow).
-    const openMergeForRecording = () => {
+    // sources (the chosen behavior for this flow). ``clipNotes`` carries the
+    // notes typed in the recording view so the clip can be a notes source.
+    const openMergeForRecording = ({ clipNotes = '' } = {}) => {
         mergeMode.value = 'recording';
-        mergeOrderedList.value = [{ id: '__self__', __self__: true, title: _t('mergeRecordings.thisRecording', 'This recording') }];
+        mergeOrderedList.value = [{
+            id: '__self__', __self__: true,
+            title: _t('mergeRecordings.thisRecording', 'This recording'),
+            notes: clipNotes || '',
+        }];
         mergeTitle.value = '';
         mergeDeleteOriginals.value = true;
+        mergeNotesSourceId.value = null;
         mergeAddPickerOpen.value = false;
         mergeAddSearch.value = '';
         showBulkMergeModal.value = true;
@@ -387,6 +412,7 @@ export function useBulkOperations({
         mergeOrderedList.value = (seedRecordings || []).slice();
         mergeTitle.value = title || '';
         mergeDeleteOriginals.value = !!deleteOriginals;
+        mergeNotesSourceId.value = null;
         mergeAddPickerOpen.value = false;
         mergeAddSearch.value = '';
         showBulkMergeModal.value = true;
@@ -443,9 +469,11 @@ export function useBulkOperations({
             if (!hasExisting || typeof finalizeRecordingMerge !== 'function') return;
             const title = mergeTitle.value.trim() || undefined;
             const deleteOriginals = mergeDeleteOriginals.value;
+            // notes source: 'none' -> keep none (null); else the id or '__self__'.
+            const notesSource = mergeNotesSourceId.value === 'none' ? null : mergeNotesSourceId.value;
             closeBulkMergeModal();
             try {
-                await finalizeRecordingMerge(orderedSpec, { deleteOriginals, title });
+                await finalizeRecordingMerge(orderedSpec, { deleteOriginals, title, notesSource });
             } catch (error) {
                 console.error('Recording merge finalize error:', error);
                 setGlobalError(`Failed to start merge: ${error.message}`);
@@ -469,7 +497,9 @@ export function useBulkOperations({
                 body: JSON.stringify({
                     recording_ids: orderedIds,
                     title: mergeTitle.value.trim() || undefined,
-                    delete_originals: mergeDeleteOriginals.value
+                    delete_originals: mergeDeleteOriginals.value,
+                    // 'none' -> keep no notes (null); otherwise the chosen source id.
+                    notes_source_id: mergeNotesSourceId.value === 'none' ? null : mergeNotesSourceId.value
                 })
             });
 
@@ -706,6 +736,8 @@ export function useBulkOperations({
         mergePickerHasMore,
         loadMoreMergeCandidates,
         mergeMode,
+        mergeNotesSourceId,
+        mergeNotesCandidates,
 
         // Bulk Delete
         openBulkDeleteModal,

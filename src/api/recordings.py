@@ -773,7 +773,7 @@ def merge_recordings_endpoint():
     recording is created immediately in PROCESSING and queued for the normal
     transcription + summarization pipeline. See src/services/recording_merge.py.
     """
-    from src.services.recording_merge import create_merge_recording, MergeError
+    from src.services.recording_merge import create_merge_recording, MergeError, _UNSET
 
     data = request.get_json(silent=True) or {}
     raw_ids = data.get('recording_ids')
@@ -789,12 +789,29 @@ def merge_recordings_endpoint():
     title = data.get('title')
     delete_originals = bool(data.get('delete_originals', False))
 
+    # notes_source_id: which source's notes to keep on the merged recording.
+    #   key absent      -> default to the first source
+    #   null            -> keep no notes
+    #   <id>            -> that source's notes
+    if 'notes_source_id' in data:
+        raw_notes_src = data.get('notes_source_id')
+        if raw_notes_src is None:
+            notes_source_id = None
+        else:
+            try:
+                notes_source_id = int(raw_notes_src)
+            except (ValueError, TypeError):
+                notes_source_id = _UNSET
+    else:
+        notes_source_id = _UNSET
+
     try:
         recording = create_merge_recording(
             current_user,
             recording_ids,
             title=title,
             delete_originals=delete_originals,
+            notes_source_id=notes_source_id,
         )
     except MergeError as e:
         return jsonify({'error': str(e)}), 400

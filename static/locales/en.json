@@ -1888,6 +1888,10 @@
     "preparingClip": "Preparing your clip — the merge options will open when it's ready.",
     "clipNotReady": "The clip could not be prepared for merging.",
     "thisRecording": "This recording",
-    "searching": "Searching…"
+    "searching": "Searching…",
+    "notesLabel": "Keep notes from",
+    "notesNone": "Don't keep notes",
+    "notesWarning": "Only one recording's notes can be kept. Participants and tags from all recordings are combined.",
+    "notesHint": "Participants and tags from all recordings are combined."
   }
 }

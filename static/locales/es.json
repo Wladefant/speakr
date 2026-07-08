@@ -1888,6 +1888,10 @@
     "preparingClip": "Preparando tu clip: las opciones de combinación se abrirán cuando esté listo.",
     "clipNotReady": "No se pudo preparar el clip para la combinación.",
     "thisRecording": "Esta grabación",
-    "searching": "Buscando…"
+    "searching": "Buscando…",
+    "notesLabel": "Conservar notas de",
+    "notesNone": "No conservar notas",
+    "notesWarning": "Solo se pueden conservar las notas de una grabación. Los participantes y las etiquetas de todas las grabaciones se combinan.",
+    "notesHint": "Los participantes y las etiquetas de todas las grabaciones se combinan."
   }
 }

@@ -1888,6 +1888,10 @@
     "preparingClip": "Ihr Clip wird vorbereitet — die Optionen zum Zusammenführen öffnen sich, sobald er bereit ist.",
     "clipNotReady": "Der Clip konnte nicht zum Zusammenführen vorbereitet werden.",
     "thisRecording": "Diese Aufnahme",
-    "searching": "Suche…"
+    "searching": "Suche…",
+    "notesLabel": "Notizen übernehmen von",
+    "notesNone": "Keine Notizen übernehmen",
+    "notesWarning": "Es können nur die Notizen einer Aufnahme übernommen werden. Teilnehmer und Tags aller Aufnahmen werden zusammengeführt.",
+    "notesHint": "Teilnehmer und Tags aller Aufnahmen werden zusammengeführt."
   }
 }

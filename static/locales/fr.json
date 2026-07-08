@@ -1888,6 +1888,10 @@
     "preparingClip": "Préparation de votre extrait — les options de fusion s'ouvriront dès qu'il sera prêt.",
     "clipNotReady": "Impossible de préparer l'extrait pour la fusion.",
     "thisRecording": "Cet enregistrement",
-    "searching": "Recherche…"
+    "searching": "Recherche…",
+    "notesLabel": "Conserver les notes de",
+    "notesNone": "Ne pas conserver de notes",
+    "notesWarning": "Les notes d'un seul enregistrement peuvent être conservées. Les participants et les étiquettes de tous les enregistrements sont regroupés.",
+    "notesHint": "Les participants et les étiquettes de tous les enregistrements sont regroupés."
   }
 }
