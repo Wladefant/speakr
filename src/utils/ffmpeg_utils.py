@@ -385,6 +385,53 @@ def extract_audio_segment(
     _run_ffmpeg_command(cmd, f"Segment extraction from {os.path.basename(input_path)}")
 
 
+def remux_mp3_in_place(filepath: str) -> None:
+    """
+    Losslessly remux an MP3 file in place so ffmpeg writes a fresh
+    Xing/Info header (issue #325). No re-encoding: the audio stream is
+    stream-copied, so this is fast and bit-identical, and ID3 metadata
+    carries over. The original file is only replaced after the remux
+    succeeds and produced non-empty output.
+
+    Args:
+        filepath: Path to the MP3 file to repair
+
+    Raises:
+        FFmpegNotFoundError: If FFmpeg is not installed
+        FFmpegError: If the remux fails or produces empty output
+    """
+    # Temp file in the same directory so os.replace() stays atomic
+    # (same filesystem) and inherits the directory's permissions.
+    fd, temp_path = tempfile.mkstemp(
+        suffix='.mp3', dir=os.path.dirname(filepath) or None
+    )
+    os.close(fd)
+    try:
+        cmd = [
+            'ffmpeg',
+            '-y',
+            '-i', filepath,
+            '-map', '0:a:0',
+            '-c:a', 'copy',
+            '-map_metadata', '0',
+            '-f', 'mp3',
+            temp_path,
+        ]
+        _run_ffmpeg_command(cmd, f"Xing header remux of {os.path.basename(filepath)}")
+
+        if os.path.getsize(temp_path) == 0:
+            raise FFmpegError("MP3 remux produced empty output")
+
+        os.replace(temp_path, filepath)
+    finally:
+        # Only present if the remux failed before os.replace() consumed it
+        if os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+
 @contextmanager
 def temp_audio_conversion(input_path: str, target_format: str = 'mp3'):
     """

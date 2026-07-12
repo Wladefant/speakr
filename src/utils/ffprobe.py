@@ -65,6 +65,47 @@ def probe(filename: str, cmd: str = 'ffprobe', timeout: Optional[int] = None) ->
         raise FFProbeError(f'Failed to parse ffprobe output: {e}')
 
 
+def mp3_duration_is_estimated(filename: str, timeout: Optional[int] = None) -> bool:
+    """
+    Detect MP3 files whose duration ffmpeg has to estimate from bitrate,
+    i.e. files missing a Xing/Info/VBRI header. Chromium-based browsers
+    stutter when seeking/playing such files (issue #325).
+
+    Runs ffprobe at warning loglevel and checks stderr for the demuxer's
+    "Estimating duration from bitrate" warning — the same signal ffmpeg
+    itself uses, so it stays authoritative across container quirks.
+
+    Args:
+        filename: Path to the MP3 file to check
+        timeout: Optional timeout in seconds
+
+    Returns:
+        True if the duration is estimated (header missing), False otherwise.
+        Returns False on any probe failure — callers treat this as a
+        best-effort repair hint, never a hard gate.
+    """
+    if timeout is None:
+        try:
+            timeout = max(10, int(os.getenv('FFPROBE_TIMEOUT_SECONDS', '60')))
+        except (TypeError, ValueError):
+            timeout = 60
+
+    args = ['ffprobe', '-v', 'warning', '-show_format', '-of', 'json', filename]
+    try:
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if result.returncode != 0:
+            return False
+        return 'Estimating duration from bitrate' in (result.stderr or '')
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        logger.warning(f"Could not check MP3 duration header for {filename}: {e}")
+        return False
+
+
 def get_codec_info(filename: str, timeout: Optional[int] = None) -> Dict[str, Any]:
     """
     Get codec information for a media file.
