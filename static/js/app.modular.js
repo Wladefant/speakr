@@ -2121,7 +2121,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                                 speaker: segment.speaker,
                                 color: segment.color,
                                 speakerId: segment.speakerId,
-                                startTime: segment.startTime || segment.start_time,
+                                startTime: segment.startTime ?? segment.start_time,
                                 runOffset: idx,
                                 segments: []
                             });
@@ -2148,7 +2148,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                         }
                         bubbleRows[bubbleRows.length - 1].bubbles.push({
                             sentence: segment.sentence,
-                            startTime: segment.startTime || segment.start_time,
+                            startTime: segment.startTime ?? segment.start_time,
                             color: segment.color
                         });
                     });
