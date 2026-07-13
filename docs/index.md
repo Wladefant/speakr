@@ -6,10 +6,10 @@ Speakr is a powerful self-hosted transcription platform that helps you capture, 
   <img src="assets/images/screenshots/main-view-video.png" alt="Main Interface" style="border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
 </div>
 
-!!! success "Latest Release: v0.9.6-alpha — merge recordings, Markdown export, and backfill export"
-    Several recordings can now be combined into one that is re-processed from scratch through the full pipeline (transcription, diarization, summary, and automatic speaker labelling) — merge from the sidebar by selecting and reordering recordings, or from the recording view where a split button appends a just-finished recording onto an existing one. The merge dialog lets you choose which recording's notes and prompt variables to keep, while participants and tags are combined. The transcript download menu gains a TXT / MD toggle, and Settings gains an "Export all to disk" button (when automatic export is enabled) that backfills every processed recording. Internally, every ingestion path now resolves its transcription settings through one shared precedence chain, so any path transcribes identically to a standard upload.
+!!! success "Latest Release: v0.9.7-alpha — MP3 playback, transcript clicking, and retention fixes"
+    A bug fix release. MP3 uploads missing a Xing/VBR header, which cause stuttering playback in Chromium-based browsers, are now detected and repaired with a lossless in-place remux (#325). A transcript segment starting at exactly 0 seconds is clickable again and included in playback highlighting, in the main app and on the public share page (#326). The auto-deletion retention sweep now includes failed recordings, while recordings still queued or processing remain protected (#328).
 
-    See the [full release notes](https://github.com/murtaza-nasir/speakr/releases/tag/v0.9.6-alpha) for details. Backwards compatible; database migrations run automatically on startup.
+    See the [full release notes](https://github.com/murtaza-nasir/speakr/releases/tag/v0.9.7-alpha) for details. Backwards compatible; no database changes.
 
 ## Quick Navigation
 
@@ -127,6 +127,16 @@ Learn more about [audio synchronization features](user-guide/transcripts.md#audi
     Tags aren't just for organization - they transform content. Create a "Recipe" tag to convert cooking narration into formatted recipes. Use "Study Notes" tags to turn lecture recordings into organized outlines. Stack tags like "Client Meeting" + "Legal Review" for combined analysis. Learn more in the [Custom Prompts guide](admin-guide/prompts.md#creative-tag-prompt-use-cases).
 
 ## Latest Updates
+
+!!! info "Version 0.9.6-alpha - Merge recordings, Markdown export, and backfill export"
+    A feature release. Backwards compatible; database migrations run automatically on startup.
+
+    - **Merge recordings (#323)** - Combine several recordings into one that is re-processed from scratch through the full pipeline (transcription, diarization, summary, and automatic speaker labelling). Merge from the sidebar by selecting and reordering recordings, or from the recording view where a split button appends a just-finished recording onto an existing one. The dialog lets you choose which recording's notes and prompt variables to keep; participants and tags are combined.
+    - **Markdown transcript export (#322)** - The transcript download menu gains a TXT / MD toggle, and the choice is remembered.
+    - **Backfill export (#321)** - When automatic export is enabled, Settings gains an "Export all to disk" button that writes every already-processed recording to the export directory in one step.
+    - **Unified transcription settings** - Every ingestion path (uploads, reprocessing, merges, recording sessions, the share target, and the auto-process folder) now resolves language, speaker hints, hotwords, prompt, and model through one shared precedence chain, so any path transcribes identically to a standard upload.
+
+    See the [full release notes](https://github.com/murtaza-nasir/speakr/releases/tag/v0.9.6-alpha).
 
 !!! info "Version 0.9.5-alpha - AssemblyAI connector, video capture, and recording filters"
     A feature and hardening release. Backwards compatible; database migrations run automatically on startup.
