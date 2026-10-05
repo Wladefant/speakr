@@ -16,7 +16,6 @@ from sqlalchemy import select
 from sqlalchemy.orm import joinedload
 import threading
 from dotenv import load_dotenv # Import load_dotenv
-import httpx 
 import re
 import subprocess
 import mimetypes
