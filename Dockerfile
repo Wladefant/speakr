@@ -44,10 +44,10 @@ RUN pip install --no-cache-dir requests && \
 ###############################################################################
 FROM python:3.11-slim AS ffmpeg-stage
 
-ARG BTBN_TAG=autobuild-2026-07-12-13-16
-ARG FFMPEG_VER=n8.1.2-22-g94138f6973
-ARG FFMPEG_SHA256_amd64=516b60bad3df2dedea23594c60e7afaecf3e6a440ca9091ef95ee1f62deba71e
-ARG FFMPEG_SHA256_arm64=0a34477fb47a9c108b869fccc9919e00d0c7ebf886e8d45301c74d2d46640d64
+ARG BTBN_TAG=autobuild-2026-10-05-13-07
+ARG FFMPEG_VER=n8.1.3-14-g330caae0c1
+ARG FFMPEG_SHA256_amd64=05f5ae3451a12cebe3b8b6b3c28477b6e53b405cb919f5b29655543efffffb2b
+ARG FFMPEG_SHA256_arm64=1a51e3c83d7f5d4edd3af7b11e25afc5beb3ffa9dfff45e84313a6e2cac7ec8f
 
 RUN apt-get update && apt-get install -y --no-install-recommends wget xz-utils \
     && rm -rf /var/lib/apt/lists/* \
@@ -57,14 +57,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends wget xz-utils \
          *) echo "Unsupported architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
        esac \
     && ASSET="ffmpeg-${FFMPEG_VER}-${BTBN_ARCH}-gpl-8.1.tar.xz" \
-    && wget -q "https://github.com/BtbN/FFmpeg-Builds/releases/download/${BTBN_TAG}/${ASSET}" -O /tmp/ff.tar.xz \
-    && echo "${SHA256}  /tmp/ff.tar.xz" | sha256sum -c - \
-    && mkdir -p /tmp/ffmpeg-dir \
-    && tar xf /tmp/ff.tar.xz -C /tmp/ffmpeg-dir --strip-components=1 \
-    && mv /tmp/ffmpeg-dir/bin/ffmpeg /usr/local/bin/ffmpeg \
-    && mv /tmp/ffmpeg-dir/bin/ffprobe /usr/local/bin/ffprobe \
-    && chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe \
-    && rm -rf /tmp/ff.tar.xz /tmp/ffmpeg-dir
+    && if wget -q "https://github.com/BtbN/FFmpeg-Builds/releases/download/${BTBN_TAG}/${ASSET}" -O /tmp/ff.tar.xz && echo "${SHA256}  /tmp/ff.tar.xz" | sha256sum -c -; then \
+         mkdir -p /tmp/ffmpeg-dir \
+         && tar xf /tmp/ff.tar.xz -C /tmp/ffmpeg-dir --strip-components=1 \
+         && mv /tmp/ffmpeg-dir/bin/ffmpeg /usr/local/bin/ffmpeg \
+         && mv /tmp/ffmpeg-dir/bin/ffprobe /usr/local/bin/ffprobe \
+         && chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe \
+         && rm -rf /tmp/ff.tar.xz /tmp/ffmpeg-dir; \
+       else \
+         echo "BtbN download failed or expired, falling back to apt ffmpeg" >&2 \
+         && apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+         && rm -rf /var/lib/apt/lists/* \
+         && cp /usr/bin/ffmpeg /usr/local/bin/ffmpeg \
+         && cp /usr/bin/ffprobe /usr/local/bin/ffprobe; \
+       fi
 
 ###############################################################################
 # Stage 3: Runtime — lean final image with only what's needed
