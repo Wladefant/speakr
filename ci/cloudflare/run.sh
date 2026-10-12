@@ -15,27 +15,22 @@ case "$node_major" in
   *) echo "Workers Builds requires Node.js 20; found ${node_major}" >&2; exit 1 ;;
 esac
 
-if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
-  if command -v apt-get >/dev/null 2>&1; then
-    if [ "$(id -u)" -eq 0 ]; then
-      apt-get update
-      apt-get install -y ffmpeg
-    else
-      sudo apt-get update
-      sudo apt-get install -y ffmpeg
-    fi
-  else
-    echo "ffmpeg and ffprobe are required by the Python test suite" >&2
-    exit 1
-  fi
-fi
-
 python3 -m pip install -r requirements.txt pytest pytest-cov
 npm install --no-audit --no-fund
 
-# This module targets PostgreSQL, which Workers Builds does not provide as a
-# service. The SQLite-only schema tests in that module are not a substitute.
+# Workers Builds has no privileged package manager. Install pinned static
+# binaries as temporary test dependencies instead of using apt or sudo.
+npm install --no-save --no-package-lock ffmpeg-static@5.2.0 ffprobe-static@3.1.0
+ffmpeg_bin="$(node -p "require('ffmpeg-static')")"
+ffprobe_bin="$(node -p "require('ffprobe-static').path")"
+export PATH="$(dirname "$ffmpeg_bin"):$(dirname "$ffprobe_bin"):$PATH"
+command -v ffmpeg >/dev/null
+command -v ffprobe >/dev/null
+
+# No PostgreSQL service is available in Workers Builds. Do not count or run
+# the PostgreSQL migration integration module here.
 python3 -m pytest tests/ -q \
   --ignore=tests/test_postgres_migrations.py \
   --cov=src --cov-report=term-missing --cov-fail-under=54
 npm test
+
