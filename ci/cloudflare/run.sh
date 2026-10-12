@@ -35,22 +35,28 @@ export PATH="$(dirname "$ffmpeg_bin"):$(dirname "$ffprobe_bin"):$PATH"
 command -v ffmpeg >/dev/null
 command -v ffprobe >/dev/null
 
-# Use the PostgreSQL 16 service from the existing GitHub test job. Workers
-# Builds provides Docker; this container is isolated and removed on exit.
-pg_container="speakr-ci-postgres-${WORKERS_CI_BUILD_UUID:?Missing Workers CI build UUID}"
+# Install the prebuilt PostgreSQL 16 server in user space; Workers Docker
+# cannot create containers in its cgroup namespace.
+pg_root=".ci-postgres-${WORKERS_CI_BUILD_UUID:?Missing Workers CI build UUID}"
+mkdir -p "$pg_root"
+curl --fail --location --silent --show-error https://micro.mamba.pm/api/micromamba/linux-64/latest \
+  | tar -xj -C "$pg_root" --strip-components=1 bin/micromamba
+export MAMBA_ROOT_PREFIX="$PWD/$pg_root/mamba-root"
+"$pg_root/micromamba" create --yes --prefix "$PWD/$pg_root/env" \
+  --channel conda-forge "postgresql=16"
+pg_bin="$pg_root/env/bin"
+pg_data="$pg_root/data"
+mkdir -p "$pg_data"
 stop_postgres() {
-  docker stop "$pg_container" >/dev/null 2>&1 || true
+  "$pg_bin/pg_ctl" -D "$pg_data" -m immediate stop >/dev/null 2>&1 || true
 }
 trap stop_postgres EXIT
-docker run --detach --rm --name "$pg_container" \
-  --cgroupns=host \
-  --publish 127.0.0.1:5432:5432 \
-  --env POSTGRES_USER=speakr \
-  --env POSTGRES_PASSWORD=speakr \
-  --env POSTGRES_DB=speakr_test \
-  postgres:16
+"$pg_bin/initdb" -D "$pg_data" -U speakr --auth-local=trust --auth-host=trust
+"$pg_bin/pg_ctl" -D "$pg_data" -l "$pg_root/postgres.log" \
+  -o "-h 127.0.0.1 -p 5432" -w start
+"$pg_bin/createdb" -h 127.0.0.1 -p 5432 -U speakr speakr_test
 for attempt in $(seq 1 60); do
-  if docker exec "$pg_container" pg_isready -U speakr -d speakr_test >/dev/null 2>&1; then
+  if "$pg_bin/pg_isready" -h 127.0.0.1 -p 5432 -U speakr -d speakr_test >/dev/null 2>&1; then
     break
   fi
   if [ "$attempt" -eq 60 ]; then
