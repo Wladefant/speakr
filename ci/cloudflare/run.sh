@@ -15,22 +15,21 @@ case "$node_major" in
   *) echo "Workers Builds requires Node.js 20; found ${node_major}" >&2; exit 1 ;;
 esac
 
-python3 -m pip install -r requirements.txt pytest pytest-cov
+python_bin=python3
+if ! python3 -c 'import sqlite3' >/dev/null 2>&1; then
+  # The Workers Build Python image omits _sqlite3. Use python-build-standalone,
+  # which includes the standard library extension used by these tests on CI.
+  python3 -m pip install uv==0.8.22
+  uv python install 3.11
+  uv venv --python 3.11 .venv
+  python_bin=.venv/bin/python
+fi
+uv pip install --python "$python_bin" -r requirements.txt pytest pytest-cov
 npm install --no-audit --no-fund
 
 # Workers Builds has no privileged package manager. Install pinned static
 # binaries as temporary test dependencies instead of using apt or sudo.
-npm install --no-save --no-package-lock ffmpeg-static@5.2.0 ffprobe-static@3.1.0
-ffmpeg_bin="$(node -p "require('ffmpeg-static')")"
-ffprobe_bin="$(node -p "require('ffprobe-static').path")"
-export PATH="$(dirname "$ffmpeg_bin"):$(dirname "$ffprobe_bin"):$PATH"
-command -v ffmpeg >/dev/null
-command -v ffprobe >/dev/null
-
-# No PostgreSQL service is available in Workers Builds. Do not count or run
-# the PostgreSQL migration integration module here.
-python3 -m pytest tests/ -q \
-  --ignore=tests/test_postgres_migrations.py \
-  --cov=src --cov-report=term-missing --cov-fail-under=54
+pytest_args=(tests/ -q --ignore=tests/test_postgres_migrations.py --cov=src --cov-report=term-missing --cov-fail-under=54)
+"$python_bin" -m pytest "${pytest_args[@]}"
 npm test
 
