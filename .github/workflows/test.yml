@@ -1,17 +1,12 @@
 name: Tests
 
-# Runs the full automated suite on every push and pull request. The existing
-# docker-publish.yml only ran two migration tests on release, so nothing
-# guarded day-to-day changes; this workflow gives the ~378 Python tests + the
-# Vitest JS tests real per-commit regression protection.
-#
-# Syntax is standard GitHub Actions and also runs on Forgejo Actions
-# (Forgejo reads .github/workflows by default). The Python suite isolates
-# itself to a throwaway SQLite DB via conftest.py, so it needs no app config.
+# Workers Builds runs the full suite on pushes and pull requests. Keep this
+# workflow_dispatch entry as an on-demand GitHub Actions fallback.
+# docker-publish.yml independently gates image releases with its own test job.
+# The Python suite uses PostgreSQL 16 for migration coverage and SQLite for the
+# other tests.
 
 on:
-  push:
-  pull_request:
   workflow_dispatch:
 
 jobs:
@@ -54,7 +49,7 @@ jobs:
           # The app tests run against an isolated SQLite DB (see conftest.py).
           # test_postgres_migrations.py reads TEST_DATABASE_URI separately so it
           # exercises real PostgreSQL compatibility against the service above.
-          TEST_DATABASE_URI: postgresql://speakr:speakr@localhost:5432/speakr_test
+          TEST_DATABASE_URI: postgresql+psycopg2://speakr:speakr@localhost:5432/speakr_test
         run: pytest tests/ -q --cov=src --cov-report=term-missing --cov-fail-under=54
 
   js-tests:
