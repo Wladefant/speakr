@@ -43,6 +43,7 @@ stop_postgres() {
 }
 trap stop_postgres EXIT
 docker run --detach --rm --name "$pg_container" \
+  --cgroupns=host \
   --publish 127.0.0.1:5432:5432 \
   --env POSTGRES_USER=speakr \
   --env POSTGRES_PASSWORD=speakr \
