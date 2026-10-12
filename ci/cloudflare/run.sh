@@ -65,7 +65,8 @@ for attempt in $(seq 1 60); do
   fi
   sleep 1
 done
-export TEST_DATABASE_URI=postgresql://speakr:speakr@127.0.0.1:5432/speakr_test
+# SQLAlchemy 2.1 maps a bare postgresql:// URL to psycopg 3; this repo installs psycopg2.
+export TEST_DATABASE_URI=postgresql+psycopg2://speakr:speakr@127.0.0.1:5432/speakr_test
 pytest_args=(tests/ -q --cov=src --cov-report=term-missing --cov-fail-under=54)
 "$python_bin" -m pytest "${pytest_args[@]}"
 npm test
