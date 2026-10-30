@@ -7,34 +7,15 @@ import * as FailedUploads from '../db/failed-uploads.js';
 import * as IncognitoStorage from '../db/incognito-storage.js';
 import * as RecordingDB from '../db/recording-persistence.js';
 import { getUploadCsrfToken, isCsrfRejection } from '../csrf.js';
+import { shouldSliceUpload, uploadFileInSlices } from '../db/sliced-file-upload.js';
 import { computeUploadTimeout } from '../utils/upload-timeout.js';
-
-// Parse error message and return friendly error info
-function getFriendlyError(errorMessage, t) {
-    const _t = t || ((key) => key);
-    if (!errorMessage) return { title: _t('errors.processingError'), message: _t('errors.processingErrorMessage') };
-    const lowerText = errorMessage.toLowerCase();
-    const patterns = [
-        // Reverse-proxy 413 (nginx / NPM default). Must match BEFORE the
-        // generic 413 pattern below; the proxy rejects the request body before
-        // Speakr sees it, so enabling chunking on the Speakr side will not help.
-        { patterns: ['request entity too large', 'request body is too large', '413 request entity too large'], title: _t('errors.uploadBlockedByProxyTitle'), guidance: _t('errors.uploadBlockedByProxyGuidance') },
-        { patterns: ['maximum content size limit', 'file too large', 'payload too large', 'exceeded', 'content too large'], title: _t('errors.fileTooLargeTitle'), guidance: _t('errors.enableChunkingGuidance') },
-        { patterns: ['timed out', 'timeout', 'deadline exceeded'], title: _t('errors.processingTimeout'), guidance: _t('errors.splitAudioGuidance') },
-        { patterns: ['401', 'unauthorized', 'invalid api key', 'authentication failed', 'incorrect api key'], title: _t('errors.authenticationError'), guidance: _t('errors.checkApiKeyGuidance') },
-        { patterns: ['rate limit', 'too many requests', '429', 'quota exceeded'], title: _t('errors.rateLimitExceeded'), guidance: _t('errors.waitAndRetryGuidance') },
-        { patterns: ['connection refused', 'connection reset', 'could not connect', 'network unreachable'], title: _t('errors.connectionError'), guidance: _t('errors.checkNetworkGuidance') },
-        { patterns: ['503', '502', '500', 'service unavailable', 'server error', 'internal server error'], title: _t('errors.serviceUnavailable'), guidance: _t('errors.tryAgainLaterGuidance') },
-        { patterns: ['invalid file format', 'unsupported format', 'could not decode', 'corrupt'], title: _t('errors.invalidAudioFormat'), guidance: _t('errors.convertFormatGuidance') },
-        { patterns: ['audio extraction failed', 'ffmpeg failed', 'no audio stream'], title: _t('errors.audioExtractionFailed'), guidance: _t('errors.convertStandardGuidance') },
-    ];
-    for (const pattern of patterns) {
-        for (const p of pattern.patterns) {
-            if (lowerText.includes(p)) return { title: pattern.title, guidance: pattern.guidance };
-        }
-    }
-    return { title: _t('errors.processingError'), guidance: _t('errors.processingErrorFallbackGuidance') };
-}
+import { recorderInUse } from '../utils/recorder-state.js';
+import { getFriendlyError } from '../utils/upload-errors.js';
+import {
+    sortQueuedForJoin, moveQueuedItem, placeQueuedItem, totalJoinDuration,
+    newJoinGroupId, MAX_JOIN_FILES,
+} from '../utils/upload-join.js';
+import { UPLOAD_ACCEPT, isAcceptedUploadFile, isVideoFileName } from '../utils/upload-file-type.js';
 
 export function useUpload(state, utils) {
     const {
@@ -54,12 +35,85 @@ export function useUpload(state, utils) {
         // View state
         currentView, showUploadModal,
         // Upload disclaimer state
-        uploadDisclaimer, showUploadDisclaimerModal
+        uploadDisclaimer, showUploadDisclaimerModal,
+        isRecording
     } = state;
 
     const { computed, nextTick, ref, markRaw } = Vue;
 
     const { setGlobalError, showToast, formatFileSize, onChatComplete, t } = utils;
+
+    // An upload error shows its message in the interface language; matchText keeps
+    // the English wording that getFriendlyError's text patterns recognise.
+    const uploadError = (message, matchText) => {
+        const err = new Error(message);
+        err.matchText = matchText;
+        return err;
+    };
+
+    // --- Join several files into one recording ------------------------------
+    // Offered once two or more files are queued. The queue order is the join
+    // order; turning the switch on sorts the files by modified time and name.
+    const joinMode = ref(false);
+    const joinTitle = ref('');
+    const joinDragClientId = ref(null);
+    const joinQueuedItems = computed(() => uploadQueue.value.filter(item => item.status === 'queued'));
+    const joinAvailable = computed(() =>
+        joinQueuedItems.value.length >= 2
+        && joinQueuedItems.value.length <= MAX_JOIN_FILES
+        && !(incognitoMode && incognitoMode.value));
+    const joinActive = computed(() => joinMode.value && joinAvailable.value);
+    const joinTotalDuration = computed(() => totalJoinDuration(joinQueuedItems.value));
+    const joinHasVideo = computed(() => joinQueuedItems.value.some(item => isVideoFileName(item.file?.name)));
+
+    const setJoinMode = (on) => {
+        joinMode.value = !!on;
+        if (on) uploadQueue.value = sortQueuedForJoin(uploadQueue.value);
+    };
+    const moveJoinItem = (clientId, delta) => {
+        uploadQueue.value = moveQueuedItem(uploadQueue.value, clientId, delta);
+    };
+    const handleJoinDragStart = (clientId, event) => {
+        joinDragClientId.value = clientId;
+        if (event?.dataTransfer) {
+            event.dataTransfer.effectAllowed = 'move';
+            event.dataTransfer.setData('text/plain', clientId);
+        }
+    };
+    const handleJoinDrop = (targetIndex) => {
+        if (joinDragClientId.value) {
+            uploadQueue.value = placeQueuedItem(uploadQueue.value, joinDragClientId.value, targetIndex);
+        }
+        joinDragClientId.value = null;
+    };
+    const handleJoinDragEnd = () => { joinDragClientId.value = null; };
+
+    // One part failed: stop the others and discard what the server holds, so
+    // the user retries the whole join with the files they still have.
+    const failJoinGroup = async (failedItem, message) => {
+        const group = failedItem.join.group;
+        for (const item of uploadQueue.value) {
+            if (item === failedItem || !item.join || item.join.group !== group) continue;
+            if (['ready', 'uploading', 'pending', 'completed'].includes(item.status)) {
+                item.joinCancelled = true;
+                item.status = 'failed';
+                item.error = message;
+                item.progress = 0;
+                if (item._xhr) {
+                    try { item._xhr.abort(); } catch (_) { /* already finished */ }
+                }
+            }
+        }
+        try {
+            const token = await getUploadCsrfToken();
+            await fetch(`/upload/join/${encodeURIComponent(group)}`, {
+                method: 'DELETE',
+                headers: token ? { 'X-CSRFToken': token } : {},
+            });
+        } catch (e) {
+            console.warn('[Upload] Could not discard the uploaded parts of a failed join:', e);
+        }
+    };
 
     // Probe a File for its audio/video duration without uploading it.
     // Uses a hidden <audio> or <video> element with preload="metadata"
@@ -253,23 +307,8 @@ export function useUpload(state, utils) {
                 max_speakers: asrMaxSpeakers.value
             };
 
-            // Check if it's an audio file or video container with audio
-            const isAudioFile = fileObject && (
-                fileObject.type.startsWith('audio/') ||
-                fileObject.type === 'video/mp4' ||
-                fileObject.type === 'video/quicktime' ||
-                fileObject.type === 'video/x-msvideo' ||
-                fileObject.type === 'video/webm' ||
-                fileObject.name.toLowerCase().endsWith('.amr') ||
-                fileObject.name.toLowerCase().endsWith('.3gp') ||
-                fileObject.name.toLowerCase().endsWith('.3gpp') ||
-                fileObject.name.toLowerCase().endsWith('.mp4') ||
-                fileObject.name.toLowerCase().endsWith('.mov') ||
-                fileObject.name.toLowerCase().endsWith('.avi') ||
-                fileObject.name.toLowerCase().endsWith('.mkv') ||
-                fileObject.name.toLowerCase().endsWith('.webm') ||
-                fileObject.name.toLowerCase().endsWith('.weba')
-            );
+            // Audio, or a video container with audio; the picker offers the same (#510)
+            const isAudioFile = isAcceptedUploadFile(fileObject);
 
             if (isAudioFile) {
                 // Per-file effective size limit. Audio files always use
@@ -287,7 +326,7 @@ export function useUpload(state, utils) {
                 //   3. The toggle component only renders once a video
                 //      is already in the queue, so blocking video files
                 //      at precheck creates a chicken-and-egg loop.
-                const isVideoExt = /\.(mp4|mov|mkv|avi|webm|m4v|wmv|flv|ts|mts)$/i.test(fileObject.name);
+                const isVideoExt = isVideoFileName(fileObject.name);
                 const effectiveLimitMB = isVideoExt
                     ? (maxAudioOnlyVideoSizeMB && maxAudioOnlyVideoSizeMB.value) || maxFileSizeMB.value
                     : maxFileSizeMB.value;
@@ -366,9 +405,25 @@ export function useUpload(state, utils) {
     };
 
     // Start processing all queued files
+    // "Upload" closes the modal after queuing; "Upload & Add More" keeps it
+    // open. The flag survives the disclaimer round-trip (startUpload returns
+    // early, acceptUploadDisclaimer re-invokes it) and is reset when the
+    // disclaimer is cancelled (cancelPendingUploadClose).
+    let closeModalAfterUpload = false;
+
+    const startUploadAndClose = () => {
+        closeModalAfterUpload = true;
+        startUpload();
+    };
+
+    const cancelPendingUploadClose = () => {
+        closeModalAfterUpload = false;
+    };
+
     const startUpload = () => {
         const pendingFiles = uploadQueue.value.filter(item => item.status === 'queued');
         if (pendingFiles.length === 0) {
+            closeModalAfterUpload = false;
             return;
         }
         // Show upload disclaimer if configured
@@ -376,6 +431,20 @@ export function useUpload(state, utils) {
             showUploadDisclaimerModal.value = true;
             return;
         }
+        // Joining: every queued file becomes one part of the same group, in
+        // queue order.
+        if (joinActive.value) {
+            const items = joinQueuedItems.value;
+            const group = newJoinGroupId();
+            const title = joinTitle.value.trim();
+            items.forEach((item, index) => {
+                item.join = { group, index, count: items.length, title };
+                item.displayName = `${item.file.name} · ${index + 1}/${items.length}`;
+            });
+        }
+        joinMode.value = false;
+        joinTitle.value = '';
+
         // Update all queued files with current tags and ASR options
         // AND change their status to 'ready' so they move to upload progress immediately
         for (const item of uploadQueue.value) {
@@ -401,6 +470,10 @@ export function useUpload(state, utils) {
         progressPopupMinimized.value = false;
         progressPopupClosed.value = false;
         startProcessingQueue();
+        if (closeModalAfterUpload) {
+            closeModalAfterUpload = false;
+            if (showUploadModal) showUploadModal.value = false;
+        }
     };
 
     // --- Parallel Upload System ---
@@ -447,25 +520,56 @@ export function useUpload(state, utils) {
      * Upload a single file to the server.
      * Acquires a concurrency slot, uploads, then releases.
      * Status updates are per-item (no global processingProgress).
+     *
+     * Files past the slice threshold go up through the sliced-upload
+     * transport instead of one multipart POST, so a reverse proxy whose
+     * body limit is below the file size cannot reject them. Both
+     * transports send the same form and return the same response, so
+     * everything below the transport call is shared.
      */
     const uploadSingleFile = async (fileItem) => {
         await acquireUploadSlot();
+        if (fileItem.joinCancelled) {
+            releaseUploadSlot();
+            return;
+        }
 
         fileItem.status = 'uploading';
         fileItem.progress = 5;
+        const sliced = shouldSliceUpload(fileItem.file);
 
         try {
             const formData = new FormData();
-            formData.append('file', fileItem.file);
+            if (!sliced) formData.append('file', fileItem.file);
+            // A recording made here was checked against the storage quota
+            // when it started, so the server keeps it whatever its size (#413).
+            if (fileItem.fromInProgressRecording) formData.append('from_recorder', 'true');
 
             // Send file's lastModified timestamp for meeting_date
             if (fileItem.file.lastModified) {
                 const lastModified = fileItem.file.lastModified;
                 formData.append('file_last_modified', lastModified.toString());
+                // Client timezone offset so filename-parsed wall-clock dates
+                // can be converted to UTC server-side (#342)
+                formData.append('client_tz_offset', new Date().getTimezoneOffset().toString());
             }
+
+            // The browser's IANA zone, so the title of this recording already
+            // uses the uploader's local time (#412).
+            try {
+                const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+                if (zone) formData.append('client_timezone', zone);
+            } catch (e) { /* older browser: the account or admin default applies */ }
 
             if (fileItem.notes) {
                 formData.append('notes', fileItem.notes);
+            }
+
+            if (fileItem.join) {
+                formData.append('join_group', fileItem.join.group);
+                formData.append('join_index', String(fileItem.join.index));
+                formData.append('join_count', String(fileItem.join.count));
+                if (fileItem.join.title) formData.append('title', fileItem.join.title);
             }
 
             // Add tags if selected
@@ -560,12 +664,16 @@ export function useUpload(state, utils) {
             const sendUpload = (csrfToken) => new Promise((resolve, reject) => {
                 const xhr = new XMLHttpRequest();
 
+                fileItem.serverProcessing = false;
                 xhr.upload.onprogress = (e) => {
                     if (e.lengthComputable) {
                         // Map upload progress to 5-90% range
                         fileItem.progress = Math.round(5 + (e.loaded / e.total) * 85);
                     }
                 };
+                // Every byte is sent; the server now checks and converts the
+                // file before answering, which can take minutes.
+                xhr.upload.onload = () => { fileItem.serverProcessing = true; };
 
                 xhr.onload = () => {
                     const contentType = xhr.getResponseHeader('content-type') || '';
@@ -578,8 +686,8 @@ export function useUpload(state, utils) {
                         }
                         const titleMatch = xhr.responseText.match(/<title>([^<]+)<\/title>/i);
                         const h1Match = xhr.responseText.match(/<h1>([^<]+)<\/h1>/i);
-                        reject(new Error(titleMatch?.[1] || h1Match?.[1] ||
-                            `Server error (${xhr.status}): Response was not JSON`));
+                        reject(uploadError(titleMatch?.[1] || h1Match?.[1] ||
+                            t('errors.serverError', { status: xhr.status }), `Server error (${xhr.status}): Response was not JSON`));
                         return;
                     }
 
@@ -587,27 +695,44 @@ export function useUpload(state, utils) {
                     try {
                         parsed = JSON.parse(xhr.responseText);
                     } catch {
-                        reject(new Error(`Invalid JSON response (${xhr.status})`));
+                        reject(uploadError(t('errors.responseUnreadable'), `Invalid JSON response (${xhr.status})`));
                         return;
                     }
 
-                    if (xhr.status === 202 && parsed.id) {
+                    if (xhr.status === 202 && (parsed.id || parsed.join_pending)) {
                         resolve(parsed);
                     } else if (!String(xhr.status).startsWith('2')) {
-                        let errorMsg = parsed.error || `Upload failed with status ${xhr.status}`;
-                        if (xhr.status === 413) errorMsg = parsed.error || `File too large. Max: ${parsed.max_size_mb?.toFixed(0) || maxFileSizeMB.value} MB.`;
-                        const err = new Error(errorMsg);
+                        let errorMsg = parsed.error || t('errors.uploadFailedWithStatus', { status: xhr.status });
+                        // English twin for getFriendlyError's text patterns.
+                        let matchText = parsed.error || `Upload failed with status ${xhr.status}`;
+                        if (xhr.status === 413) {
+                            const maxMb = parsed.max_size_mb?.toFixed(0) || maxFileSizeMB.value;
+                            errorMsg = parsed.error || t('errors.fileTooLargeMaxSize', { size: maxMb });
+                            matchText = parsed.error || `File too large. Max: ${maxMb} MB.`;
+                        }
+                        if (parsed.code === 'storage_quota_exceeded' && t) {
+                            const quotaMsg = t('storageQuota.uploadRefused', {
+                                used: formatFileSize(parsed.used_bytes), quota: formatFileSize(parsed.quota_bytes),
+                                file: formatFileSize(parsed.file_bytes),
+                            });
+                            if (quotaMsg && quotaMsg !== 'storageQuota.uploadRefused') errorMsg = quotaMsg;
+                        }
+                        // A file the server could not read (#482): the item says so in the UI language.
+                        if (parsed.code === 'audio_decode_failed' && t) errorMsg = t('errors.audioDecodeFailedGuidance');
+                        if (parsed.code === 'empty_file' && t) errorMsg = t('errors.emptyFileGuidance');
+                        const err = uploadError(errorMsg, matchText);
+                        err.code = parsed.code;
                         if (isCsrfRejection(xhr.status, parsed.error || '')) {
                             err.isCsrfRejection = true;
                         }
                         reject(err);
                     } else {
-                        reject(new Error('Unexpected success response from server after upload.'));
+                        reject(uploadError(t('errors.unexpectedResponse'), 'Unexpected success response from server after upload.'));
                     }
                 };
 
-                xhr.onerror = () => reject(new Error('Network error during upload'));
-                xhr.ontimeout = () => reject(new Error('Upload timed out'));
+                xhr.onerror = () => reject(uploadError(t('errors.networkErrorDuringUpload'), 'Network error during upload'));
+                xhr.ontimeout = () => reject(uploadError(t('errors.uploadTimedOut'), 'Upload timed out'));
 
                 // Without an explicit timeout, a stalled connection (no FIN/RST,
                 // just no progress) hangs forever and ontimeout never fires — so
@@ -627,18 +752,52 @@ export function useUpload(state, utils) {
                 xhr.send(formData);
             });
 
-            // Refresh the token right before sending, and retry exactly once
-            // with another fresh token if the server still rejects it —
-            // mirroring what the fetch interceptor in csrf-refresh.js does
-            // for non-XHR requests.
             let data;
-            try {
-                data = await sendUpload(await getUploadCsrfToken());
-            } catch (uploadError) {
-                if (!uploadError.isCsrfRejection) throw uploadError;
-                console.warn(`[Upload] CSRF rejection for ${fileItem.file.name}; refreshing token and retrying once.`);
-                fileItem.progress = 5;
-                data = await sendUpload(await getUploadCsrfToken());
+            if (sliced) {
+                data = await uploadFileInSlices(fileItem.file, formData, {
+                    onProgress: (fraction) => {
+                        fileItem.progress = Math.round(5 + fraction * 85);
+                        fileItem.serverProcessing = fraction >= 1;
+                    },
+                    onXhr: (xhr) => { fileItem._xhr = xhr; },
+                });
+            } else {
+                // Refresh the token right before sending, and retry exactly once
+                // with another fresh token if the server still rejects it —
+                // mirroring what the fetch interceptor in csrf-refresh.js does
+                // for non-XHR requests.
+                try {
+                    data = await sendUpload(await getUploadCsrfToken());
+                } catch (uploadError) {
+                    if (!uploadError.isCsrfRejection) throw uploadError;
+                    console.warn(`[Upload] CSRF rejection for ${fileItem.file.name}; refreshing token and retrying once.`);
+                    fileItem.progress = 5;
+                    data = await sendUpload(await getUploadCsrfToken());
+                }
+            }
+
+            // One part of a join is stored; the part that completes the group
+            // gets the recording back.
+            if (data.join_pending) {
+                // Stays active until the rest of its join arrives.
+                fileItem.status = 'pending';
+                fileItem.progress = 100;
+                fileItem.serverProcessing = false;
+                fileItem.joinWaiting = { received: data.received, total: data.total };
+                return;
+            }
+            if (fileItem.join) {
+                // From here one entry stands for the joined recording.
+                const group = fileItem.join.group;
+                uploadQueue.value = uploadQueue.value.filter(item =>
+                    item === fileItem || !(item.join && item.join.group === group));
+                fileItem.displayName = data.title || fileItem.displayName;
+                if (recordings.value.some(r => r.id === data.id)) {
+                    fileItem.status = 'pending';
+                    fileItem.recordingId = data.id;
+                    fileItem.progress = 100;
+                    return;
+                }
             }
 
             // Upload succeeded - recording is now on the server
@@ -658,9 +817,13 @@ export function useUpload(state, utils) {
             // #287(b)): the audio is on the server. Only do this for queue
             // items that came from an in-app recording, to avoid touching the
             // session for file-drag-drop uploads that never wrote one.
+            //
+            // Only the session this recording was saved under is cleared: the
+            // upload can finish after the user has started the next recording,
+            // whose crash-recovery copy must survive (#407).
             if (fileItem.fromInProgressRecording) {
                 try {
-                    await RecordingDB.clearRecordingSession();
+                    await RecordingDB.clearRecordingSessionIfStartedAt(fileItem.recordingSessionStartTime);
                 } catch (dbError) {
                     console.warn('[Upload] Failed to clear recording session after successful upload:', dbError);
                 }
@@ -696,7 +859,11 @@ export function useUpload(state, utils) {
             // audio.js's recording-stop path) so bulk drag-drop
             // uploads of many files still leave the user wherever
             // they were.
-            if (fileItem.fromInProgressRecording) {
+            //
+            // Not while the next recording is under way (#407): the upload can
+            // finish minutes after the user started recording again, and
+            // switching views then took them off the recorder.
+            if (fileItem.fromInProgressRecording && !recorderInUse(isRecording, currentView)) {
                 selectedRecording.value = data;
                 currentView.value = 'detail';
                 if (showUploadModal) showUploadModal.value = false;
@@ -706,9 +873,9 @@ export function useUpload(state, utils) {
             if (data.duplicate_warning) {
                 const warning = data.duplicate_warning;
                 const existingDate = warning.existing_created_at
-                    ? utils.parseServerInstant(warning.existing_created_at).toLocaleDateString()
+                    ? utils.parseServerInstant(warning.existing_created_at).toLocaleDateString(window.i18n?.getIntlLocale?.())
                     : '';
-                const existingName = warning.existing_title || 'Unknown';
+                const existingName = warning.existing_title || t('sharing.unknown');
                 showToast(
                     `⚠️ ${existingName} (${existingDate})`,
                     'fa-copy'
@@ -717,28 +884,46 @@ export function useUpload(state, utils) {
             }
 
         } catch (error) {
+            if (fileItem.joinCancelled) {
+                // Stopped because another part of its join failed.
+                fileItem.status = 'failed';
+                return;
+            }
             console.error(`Upload Error for ${fileItem.file.name} (Client ID: ${fileItem.clientId}):`, error);
             fileItem.status = 'failed';
             fileItem.error = error.message;
             fileItem.progress = 0;
+            if (fileItem.join) {
+                const message = t('upload.joinFailed', { name: fileItem.file.name });
+                await failJoinGroup(fileItem, message);
+                setGlobalError(`${message} ${error.message}`);
+                return;
+            }
 
             // Show friendly error message
-            const friendlyErr = getFriendlyError(error.message, t);
+            const friendlyErr = getFriendlyError(error.matchText || error.message, t, error.code);
             setGlobalError(`${friendlyErr.title}: ${friendlyErr.guidance}`);
 
             // If this failure is itself a resurfaced retry, just bump the retry
             // count on the EXISTING IndexedDB record — don't store a duplicate or
             // re-download. resurfaceFailedUploads() will pick it up again on the
-            // next online/load (until it hits the retry cap).
+            // next online/load. Once the retry cap is reached, hand the audio
+            // back as a browser download instead of leaving the record trapped
+            // in IndexedDB (capped records are never resurfaced again).
             if (fileItem._failedUploadId) {
+                const newRetryCount = (fileItem._retryCount || 0) + 1;
                 try {
                     await FailedUploads.updateRetryCount(
-                        fileItem._failedUploadId, (fileItem._retryCount || 0) + 1, error.message);
+                        fileItem._failedUploadId, newRetryCount, error.message);
                 } catch (e) {
                     console.warn('[Upload] Could not bump retry count:', e);
                 }
-            } else {
-                // Defense-in-depth recovery (issue #297, #287, #313):
+                if (newRetryCount >= MAX_AUTO_RETRIES) {
+                    await handOffExhaustedUpload(fileItem._failedUploadId, fileItem.file);
+                }
+            } else if (fileItem.fromInProgressRecording) {
+                // Defense-in-depth recovery (issue #297, #287, #313) for in-app
+                // recordings, whose ONLY copy lives in browser memory:
                 //   1. Persist the file to IndexedDB so it can be auto-retried
                 //      in-app on the next online/page-load (resurfaceFailedUploads).
                 //   2. If IndexedDB persistence fails (quota exceeded, private
@@ -796,6 +981,13 @@ export function useUpload(state, utils) {
                     }
                 }
             }
+            // else: the file came from the user's filesystem (picker or
+            // drag-drop), so the original still exists on disk and nothing is
+            // lost by the failure. Persisting a copy to IndexedDB — or worse,
+            // re-downloading a multi-GB file into Downloads — would only
+            // duplicate it. The queue item stays 'failed' with the error
+            // surfaced above; the user can re-add the file once the cause
+            // (e.g. a proxy size limit) is addressed.
         } finally {
             fileItem._xhr = null;
             releaseUploadSlot();
@@ -971,13 +1163,16 @@ export function useUpload(state, utils) {
             if (!contentType.includes('application/json')) {
                 const text = await response.text();
                 const titleMatch = text.match(/<title>([^<]+)<\/title>/i);
-                throw new Error(titleMatch?.[1] || `Server error (${response.status})`);
+                throw uploadError(titleMatch?.[1] || t('errors.serverErrorStatus', { status: response.status }), titleMatch?.[1] || `Server error (${response.status})`);
             }
 
             const data = await response.json();
 
             if (!response.ok || data.error) {
-                throw new Error(data.error || `Processing failed with status ${response.status}`);
+                const err = uploadError(data.error || t('errors.processingFailedWithStatus', { status: response.status }), data.error || `Processing failed with status ${response.status}`);
+                err.code = data.code;
+                err.errorType = data.error_type;
+                throw err;
             }
 
             processingProgress.value = 80;
@@ -1011,9 +1206,13 @@ export function useUpload(state, utils) {
             processingProgress.value = 100;
             processingMessage.value = t('incognito.recordingReady');
 
-            // Auto-select the incognito recording and switch to detail view
-            selectedRecording.value = incognitoData;
-            currentView.value = 'detail';
+            // Auto-select the incognito recording and switch to detail view,
+            // unless the next recording is already under way (#407); it stays
+            // available from the incognito entry in the sidebar.
+            if (!recorderInUse(isRecording, currentView)) {
+                selectedRecording.value = incognitoData;
+                currentView.value = 'detail';
+            }
             // Dismiss the upload modal if it was still open behind the
             // success transition.
             if (showUploadModal) showUploadModal.value = false;
@@ -1025,7 +1224,7 @@ export function useUpload(state, utils) {
 
         } catch (error) {
             console.error('[Incognito] Processing failed:', error);
-            const friendlyErr = getFriendlyError(error.message, t);
+            const friendlyErr = getFriendlyError(error.matchText || error.message, t, error.code, error.errorType);
             setGlobalError(`${friendlyErr.title}: ${friendlyErr.guidance}`);
             fileItem.status = 'failed';
             fileItem.error = error.message;
@@ -1088,6 +1287,29 @@ export function useUpload(state, utils) {
     const MAX_AUTO_RETRIES = 3;
     let _isResurfacing = false;
 
+    // When auto-retry gives up on a persisted recording, hand the audio back
+    // to the user as a browser download and drop the IndexedDB record —
+    // otherwise capped records sit invisibly in IndexedDB forever (the
+    // resurfacing loop skips them) and the recording is effectively lost.
+    // Keeps the record when the download could not be triggered so a later
+    // pass can try again.
+    const handOffExhaustedUpload = async (failedUploadId, file) => {
+        const downloaded = FailedUploads.triggerLocalDownload(
+            file, file?.name || `speakr-recording-${Date.now()}.webm`);
+        if (!downloaded) return false;
+        try {
+            await FailedUploads.deleteFailedUpload(failedUploadId);
+        } catch (e) {
+            console.warn('[Upload] Could not delete exhausted upload record:', e);
+        }
+        showToast?.(
+            (t && t('toasts.uploadRetriesExhaustedDownloaded'))
+                || 'Automatic upload retries exhausted. The audio was saved to your Downloads folder.',
+            'fa-file-download'
+        );
+        return true;
+    };
+
     // Auto-retry path for #313: read the failed uploads persisted in IndexedDB,
     // rebuild a File for each, and resubmit them through the normal upload queue
     // (correct CSRF, visible in the Processing Queue, works in every browser —
@@ -1103,7 +1325,16 @@ export function useUpload(state, utils) {
             let queued = 0;
             for (const rec of failed) {
                 if (!rec || !rec.fileData) continue;
-                if ((rec.retryCount || 0) >= MAX_AUTO_RETRIES) continue;
+                if ((rec.retryCount || 0) >= MAX_AUTO_RETRIES) {
+                    // Records that hit the cap before this hand-off existed (or
+                    // whose earlier hand-off download failed): give the audio
+                    // back now instead of skipping it forever.
+                    const file = new File([rec.fileData],
+                        rec.fileName || `speakr-recording-${Date.now()}.webm`,
+                        { type: rec.mimeType || 'audio/webm' });
+                    await handOffExhaustedUpload(rec.id, file);
+                    continue;
+                }
 
                 // Skip if this upload is already represented in the queue and
                 // actively in flight; otherwise drop a stale failed item so we
@@ -1149,6 +1380,20 @@ export function useUpload(state, utils) {
     };
 
     return {
+        uploadAccept: UPLOAD_ACCEPT,
+        // Join several files into one recording
+        joinMode,
+        joinTitle,
+        joinAvailable,
+        joinActive,
+        joinTotalDuration,
+        joinHasVideo,
+        joinDragClientId,
+        setJoinMode,
+        moveJoinItem,
+        handleJoinDragStart,
+        handleJoinDrop,
+        handleJoinDragEnd,
         resurfaceFailedUploads,
         handleDragOver,
         handleDragLeave,
@@ -1159,6 +1404,8 @@ export function useUpload(state, utils) {
         cancelWaitingFile,
         clearCompletedUploads,
         startUpload,
+        startUploadAndClose,
+        cancelPendingUploadClose,
         startProcessingQueue,
         resetCurrentFileProcessingState,
         startStatusPolling,

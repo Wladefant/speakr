@@ -1,0 +1,17 @@
+# Advisories for locked packages that do not apply to Speakr, read by
+# scripts/audit-dependencies.sh. One per line:
+#   <advisory id>  <review date YYYY-MM-DD>  <reason>
+# Past its review date an exception no longer applies.
+
+# transformers and sentence-transformers (embeddings image only): code
+# execution or file writes when loading or saving an untrusted model. Speakr
+# loads one model, named by the administrator in EMBEDDING_MODEL, without
+# trust_remote_code, and never trains, saves or loads custom generation code.
+# The fixes are in transformers 5, a major upgrade.
+PYSEC-2025-217       2027-01-31  transformers X-CLIP conversion is not used
+PYSEC-2026-2288      2027-01-31  transformers Trainer is not used
+PYSEC-2026-2289      2027-01-31  only the administrator's embedding model is loaded
+PYSEC-2026-2290      2027-01-31  only the administrator's embedding model is loaded
+PYSEC-2026-3929      2027-01-31  tokenizers are never saved
+PYSEC-2026-4174      2027-01-31  load_custom_generate is not used
+PYSEC-2026-4164      2027-01-31  only the administrator's embedding model is loaded

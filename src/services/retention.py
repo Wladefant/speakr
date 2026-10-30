@@ -9,6 +9,7 @@ from flask import current_app
 from src.database import db
 from src.models import Recording, RecordingTag, Tag
 from src.services.storage import get_storage_service
+from src.utils.localization import api_error
 
 ENABLE_AUTO_DELETION = os.environ.get('ENABLE_AUTO_DELETION', 'false').lower() == 'true'
 GLOBAL_RETENTION_DAYS = int(os.environ.get('GLOBAL_RETENTION_DAYS', '0'))
@@ -88,7 +89,7 @@ def process_auto_deletion():
         Dictionary with deletion statistics
     """
     if not ENABLE_AUTO_DELETION:
-        return {'error': 'Auto-deletion is not enabled'}
+        return api_error('auto_deletion_disabled')
 
     # Check if any retention policy exists (global or tag-level)
     has_global_retention = GLOBAL_RETENTION_DAYS > 0
@@ -154,20 +155,9 @@ def process_auto_deletion():
                 # Determine deletion mode
                 if DELETION_MODE == 'audio_only':
                     # Delete only the audio file, keep transcription
-                    storage = get_storage_service()
-                    if recording.audio_path and storage.exists(recording.audio_path):
-                        current_app.logger.info(f"Recording {recording.id} is past retention ({retention_days} days), deleting audio")
-                        storage.delete(recording.audio_path, missing_ok=True)
-                        current_app.logger.info(f"Auto-deleted audio file: {recording.audio_path}")
-                        recording.audio_deleted_at = datetime.utcnow()
-                        db.session.commit()
+                    current_app.logger.info(f"Recording {recording.id} is past retention ({retention_days} days), removing audio")
+                    if remove_recording_audio(recording):
                         stats['deleted_audio_only'] += 1
-                    else:
-                        # Audio already deleted or doesn't exist - just mark timestamp
-                        if not recording.audio_deleted_at:
-                            recording.audio_deleted_at = datetime.utcnow()
-                            db.session.commit()
-                            current_app.logger.debug(f"Recording {recording.id} audio file not found, marked as deleted")
 
                 else:  # full_recording mode
                     # Check if this is completing a previous audio_only deletion
@@ -176,19 +166,12 @@ def process_auto_deletion():
                     else:
                         current_app.logger.info(f"Recording {recording.id} is past retention ({retention_days} days), deleting fully")
 
-                    # Delete audio file if it exists
-                    if recording.audio_path:
-                        get_storage_service().delete(recording.audio_path, missing_ok=True)
-
-                    # Delete associated processing jobs (required due to NOT NULL constraint)
-                    from src.models.processing_job import ProcessingJob
-                    ProcessingJob.query.filter_by(recording_id=recording.id).delete()
-
-                    # Delete the database record (cascades to chunks, shares, etc.)
-                    db.session.delete(recording)
-                    db.session.commit()
+                    from src.services.recording_deletion import delete_recording_completely
+                    deleted_id = recording.id
+                    delete_recording_completely(recording, storage=get_storage_service(), strict_media=True,
+                                                reason='retention')
                     stats['deleted_full'] += 1
-                    current_app.logger.info(f"Auto-deleted full recording ID: {recording.id}")
+                    current_app.logger.info(f"Auto-deleted full recording ID: {deleted_id}")
 
             except Exception as e:
                 stats['errors'] += 1
@@ -221,3 +204,23 @@ def process_auto_deletion():
 # Use environment variables from .env
 
 
+def remove_recording_audio(recording):
+    """Delete a recording's media file and keep everything else.
+
+    The transcript, summary, notes, tags and shares stay; the recording shows
+    as "Audio removed" and can no longer be played or reprocessed. Used by
+    audio-only retention and by the manual "Delete audio" action.
+
+    Returns True when a stored file was deleted, False when there was none
+    (the recording is marked either way). Commits.
+    """
+    storage = get_storage_service()
+    deleted = False
+    if recording.audio_path and storage.exists(recording.audio_path):
+        storage.delete(recording.audio_path, missing_ok=True)
+        current_app.logger.info(f"Removed audio file for recording {recording.id}: {recording.audio_path}")
+        deleted = True
+    if not recording.audio_deleted_at:
+        recording.audio_deleted_at = datetime.utcnow()
+    db.session.commit()
+    return deleted

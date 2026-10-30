@@ -161,7 +161,7 @@ ASR_BASE_URL=http://whisperx-asr-api:9000
 ASR_RETURN_SPEAKER_EMBEDDINGS=true
 ```
 
-> **Important:** The `ASR_RETURN_SPEAKER_EMBEDDINGS=true` setting is required to enable voice profile features. This setting is only supported by WhisperX and should not be enabled when using the basic OpenAI Whisper ASR Webservice.
+> **Important:** The `ASR_RETURN_SPEAKER_EMBEDDINGS=true` setting is required to enable voice profile features. This setting is supported by WhisperX and by OpenASR servers from openasr#379 onward, and should not be enabled when using the basic OpenAI Whisper ASR Webservice.
 
 Restart Speakr:
 
@@ -224,7 +224,11 @@ COMPUTE_TYPE=int8
 
 ### Model Selection
 
-Models are selected per-recording in Speakr. Available options:
+Speakr sends a model with each request when one is configured: the model chosen at upload, a tag's or folder's default transcription model, or the default transcription model set by an administrator. When none of these is set, the request names no model and the service uses its own default.
+
+On whisperx-asr-service, that default is `PRELOAD_MODEL`, the model it also loads at startup. If `PRELOAD_MODEL` is empty, including when the service's `.env` omits it under Docker Compose, requests that name no model fail with `Invalid model size ''` on service versions before 0.4.2. Either set `PRELOAD_MODEL` (for example `large-v3`) in the service's `.env`, or choose a default transcription model in Speakr's admin settings. From 0.4.2 the service also accepts `DEFAULT_MODEL`, which sets the default without preloading anything, for a GPU shared with other applications.
+
+Available options:
 
 | Model | Quality | Speed | VRAM Required |
 |-------|---------|-------|---------------|
@@ -357,6 +361,8 @@ curl http://ASR_BASE_URL/health
 - Regenerate HF token
 - Accept model agreements again
 - Check logs for specific errors
+
+If diarization breaks specifically after enabling `HF_HUB_OFFLINE=1`, the container is missing `HF_HOME=/.cache` and the diarization model was never stored in the cache volume. See [Diarization Fails After Enabling Offline Mode](../troubleshooting.md#diarization-fails-after-enabling-offline-mode-whisperx-asr-service).
 
 ## Upgrading
 

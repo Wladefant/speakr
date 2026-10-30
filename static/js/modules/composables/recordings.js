@@ -4,17 +4,21 @@
  */
 
 import * as IncognitoStorage from '../db/incognito-storage.js';
+import { matchTagsByLabelName } from '../utils/label-links.js';
+
+// Guarded: the module can run before i18n.js has loaded.
+const t = (key, params) => (window.i18n ? window.i18n.t(key, params) : key);
 
 export function useRecordings(state, utils, reprocessComposable) {
     const {
         recordings, selectedRecording, isLoadingRecordings, isLoadingMore,
         currentPage, perPage, totalRecordings, totalPages, hasNextPage, hasPrevPage,
-        showSharedWithMe, showArchivedRecordings, searchQuery, searchDebounceTimer,
+        showSharedWithMe, filterAudioRemoved, showArchivedRecordings, searchQuery, searchDebounceTimer,
         filterTags, filterSpeakers, filterDatePreset, filterDateRange, filterTextQuery,
         filterStarred, filterInbox, filterNeedsTranscription, filterNeedsSummary, filterNeedsSpeakers,
         filterFolder, sortBy,
         availableTags, availableSpeakers, availableFolders, selectedTagIds, uploadLanguage, uploadMinSpeakers, uploadMaxSpeakers, uploadHotwords, uploadInitialPrompt,
-        useAsrEndpoint, connectorSupportsDiarization, globalError, uploadQueue, isProcessingActive, currentView, showUploadModal, uploadDeepLinkPending,
+        useAsrEndpoint, connectorSupportsDiarization, globalError, uploadQueue, isProcessingActive, currentView, showUploadModal, uploadDeepLinkPending, labelDeepLinkPending,
         isMobileScreen, isSidebarCollapsed, isRecording, audioBlobURL,
         speakerColorMap,
         // Incognito mode
@@ -33,9 +37,15 @@ export function useRecordings(state, utils, reprocessComposable) {
         Object.entries(params).forEach(([k, v]) => {
             if (v !== undefined && v !== null && v !== '') qs.set(k, String(v));
         });
+        // Date searches ("date:today", date_from/date_to) use this browser's
+        // calendar days (#412).
+        try {
+            const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+            if (zone) qs.set('tz', zone);
+        } catch (e) { /* the account timezone applies */ }
         const response = await fetch(`/api/recordings?${qs.toString()}`);
         const data = await response.json();
-        if (!response.ok) throw new Error(data.error || 'Failed to load recordings');
+        if (!response.ok) throw new Error(data.error || t('errors.loadRecordingsFailed'));
         return data;
     };
 
@@ -54,6 +64,7 @@ export function useRecordings(state, utils, reprocessComposable) {
                 q: searchQueryParam.trim(),
                 sort_by: sortBy.value || '',
                 archived: showArchivedRecordings.value ? 'true' : '',
+                audio_removed: filterAudioRemoved.value ? 'true' : '',
                 shared: showSharedWithMe.value ? 'true' : '',
                 starred: filterStarred.value ? 'true' : '',
                 inbox: filterInbox.value ? 'true' : '',
@@ -68,7 +79,7 @@ export function useRecordings(state, utils, reprocessComposable) {
 
             if (!Array.isArray(recordingsList)) {
                 console.error('Unexpected response format:', data);
-                throw new Error('Invalid response format from server');
+                throw new Error(t('errors.responseNotJson'));
             }
 
             if (pagination) {
@@ -89,11 +100,20 @@ export function useRecordings(state, utils, reprocessComposable) {
                 recordings.value = [...recordings.value, ...recordingsList];
             } else {
                 recordings.value = recordingsList;
-                const lastRecordingId = localStorage.getItem('lastSelectedRecordingId');
-                if (lastRecordingId && recordingsList.length > 0) {
-                    const recordingToSelect = recordingsList.find(r => r.id == lastRecordingId);
-                    if (recordingToSelect) {
-                        selectRecording(recordingToSelect);
+                // Arriving via /label/<name> means the user asked for the
+                // list of that label, not for a recording. Auto-selecting the
+                // last viewed one here would open the detail view and rewrite
+                // the address bar to /recordings/<id>, losing the label link.
+                // Consume the one-shot flag so later loads behave normally.
+                if (labelDeepLinkPending && labelDeepLinkPending.value) {
+                    labelDeepLinkPending.value = false;
+                } else {
+                    const lastRecordingId = localStorage.getItem('lastSelectedRecordingId');
+                    if (lastRecordingId && recordingsList.length > 0) {
+                        const recordingToSelect = recordingsList.find(r => r.id == lastRecordingId);
+                        if (recordingToSelect) {
+                            selectRecording(recordingToSelect);
+                        }
                     }
                 }
             }
@@ -105,7 +125,7 @@ export function useRecordings(state, utils, reprocessComposable) {
 
         } catch (error) {
             console.error('Load Recordings Error:', error);
-            setGlobalError(`Failed to load recordings: ${error.message}`);
+            setGlobalError(t('errors.loadRecordingsFailedDetail', { error: error.message }));
             if (!append) {
                 recordings.value = [];
             }
@@ -178,7 +198,7 @@ export function useRecordings(state, utils, reprocessComposable) {
 
     const selectRecording = async (recording) => {
         if (hasUnsavedRecording()) {
-            if (!confirm('You have an unsaved recording. Are you sure you want to leave?')) {
+            if (!confirm(t('confirms.discardUnsavedRecording'))) {
                 return;
             }
             // User chose to leave → actually discard the unsaved/recovered
@@ -194,22 +214,12 @@ export function useRecordings(state, utils, reprocessComposable) {
         if (incognitoRecording && incognitoRecording.value &&
             selectedRecording.value?.id === 'incognito' &&
             recording?.id !== 'incognito') {
-            if (!confirm('Switching to another recording will discard your incognito recording. Continue?')) {
+            if (!confirm(t('incognito.switchDiscardConfirm'))) {
                 return;
             }
             // Clear incognito recording immediately - this is the "incognito" promise
             IncognitoStorage.clearIncognitoRecording();
             incognitoRecording.value = null;
-        }
-
-        // Also clear any orphaned incognito data when selecting a non-incognito recording
-        // This handles edge cases like page refresh where the above check doesn't trigger
-        if (recording?.id !== 'incognito' && IncognitoStorage.hasIncognitoRecording()) {
-            console.log('[Incognito] Clearing orphaned incognito data');
-            IncognitoStorage.clearIncognitoRecording();
-            if (incognitoRecording) {
-                incognitoRecording.value = null;
-            }
         }
 
         // Reset modal audio state when switching recordings
@@ -321,7 +331,7 @@ export function useRecordings(state, utils, reprocessComposable) {
             });
 
             const data = await response.json();
-            if (!response.ok) throw new Error(data.error || 'Failed to toggle inbox status');
+            if (!response.ok) throw new Error(data.error || t('errors.updateInboxStatusFailed'));
 
             // Update the recording in the UI
             recording.is_inbox = data.is_inbox;
@@ -332,10 +342,10 @@ export function useRecordings(state, utils, reprocessComposable) {
                 recordings.value[index].is_inbox = data.is_inbox;
             }
 
-            showToast(`Recording ${data.is_inbox ? 'moved to inbox' : 'marked as read'}`);
+            showToast(t(data.is_inbox ? 'messages.recordingMovedToInbox' : 'messages.recordingMarkedAsRead'));
         } catch (error) {
             console.error('Toggle Inbox Error:', error);
-            setGlobalError(`Failed to toggle inbox status: ${error.message}`);
+            setGlobalError(t('errors.updateInboxStatusFailedDetail', { error: error.message }));
         }
     };
 
@@ -349,7 +359,7 @@ export function useRecordings(state, utils, reprocessComposable) {
             });
 
             const data = await response.json();
-            if (!response.ok) throw new Error(data.error || 'Failed to toggle highlighted status');
+            if (!response.ok) throw new Error(data.error || t('errors.updateHighlightStatusFailed'));
 
             // Update the recording in the UI
             recording.is_highlighted = data.is_highlighted;
@@ -360,10 +370,45 @@ export function useRecordings(state, utils, reprocessComposable) {
                 recordings.value[index].is_highlighted = data.is_highlighted;
             }
 
-            showToast(`Recording ${data.is_highlighted ? 'highlighted' : 'unhighlighted'}`);
+            showToast(t(data.is_highlighted ? 'messages.recordingHighlighted' : 'messages.recordingUnhighlighted'));
         } catch (error) {
             console.error('Toggle Highlight Error:', error);
-            setGlobalError(`Failed to toggle highlighted status: ${error.message}`);
+            setGlobalError(t('errors.updateHighlightStatusFailedDetail', { error: error.message }));
+        }
+    };
+
+    // Archive (#394): personal, like inbox and star. An archived recording
+    // leaves the main list (search still finds it), and an unarchived one
+    // leaves the archive view; the open recording stays open either way.
+    const toggleArchive = async (recording) => {
+        if (!recording || !recording.id) return;
+        const t = (key) => (window.i18n ? window.i18n.t(key) : key);
+        try {
+            const response = await fetch(`/recording/${recording.id}/toggle_archive`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' }
+            });
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || t('errors.archiveStatusFailed'));
+
+            recording.is_archived = data.is_archived;
+            if (selectedRecording.value && selectedRecording.value.id === recording.id) {
+                selectedRecording.value.is_archived = data.is_archived;
+            }
+            const leavesView = !searchQuery.value && (data.is_archived !== showArchivedRecordings.value);
+            const index = recordings.value.findIndex(r => r.id === recording.id);
+            if (index !== -1) {
+                if (leavesView) {
+                    recordings.value.splice(index, 1);
+                    totalRecordings.value = Math.max(0, (totalRecordings.value || 1) - 1);
+                } else {
+                    recordings.value[index].is_archived = data.is_archived;
+                }
+            }
+            showToast(t(data.is_archived ? 'archive.archivedToast' : 'archive.unarchivedToast'), 'fa-box-archive');
+        } catch (error) {
+            console.error('Toggle Archive Error:', error);
+            setGlobalError(error.message);
         }
     };
 
@@ -381,6 +426,19 @@ export function useRecordings(state, utils, reprocessComposable) {
     const filterByTag = (tag) => {
         filterTags.value = [tag.id];
         applyAdvancedFilters();
+    };
+
+    // Filter by a label given only its name, used by the /label/<name> deep
+    // link. Every accessible tag with that name is included, so the result is
+    // their union (see utils/label-links.js on why one name can be several
+    // tags). Returns false when the viewer has no such label, so the caller
+    // can say so instead of silently showing them everything.
+    const filterByLabelName = (name) => {
+        const matches = matchTagsByLabelName(name, availableTags.value);
+        if (matches.length === 0) return false;
+        filterTags.value = matches.map(tag => tag.id);
+        applyAdvancedFilters();
+        return true;
     };
 
     const buildSearchQuery = () => {
@@ -431,6 +489,7 @@ export function useRecordings(state, utils, reprocessComposable) {
         filterTextQuery.value = '';
         filterStarred.value = false;
         filterInbox.value = false;
+        filterAudioRemoved.value = false;
         filterNeedsTranscription.value = false;
         filterNeedsSummary.value = false;
         filterNeedsSpeakers.value = false;
@@ -511,9 +570,11 @@ export function useRecordings(state, utils, reprocessComposable) {
         hasUnsavedRecording,
         toggleInbox,
         toggleHighlight,
+        toggleArchive,
         getRecordingTags,
         getAvailableTagsForRecording,
         filterByTag,
+        filterByLabelName,
         buildSearchQuery,
         applyAdvancedFilters,
         clearAllFilters,

@@ -34,6 +34,16 @@ Changes save immediately when you click the Save Changes button. There's no draf
 
 The timestamp shows when the prompt was last modified, helpful for tracking changes over time. If multiple admins manage your instance, this helps coordinate who changed what and when.
 
+## Default Title Prompt
+
+The **Default Title Prompt** card sets the instructions for AI-generated recording titles across the deployment. It applies when no tag, folder or user title prompt is set, and leaving it blank falls back to the built-in default (at most eight words, no filler phrases such as "Discussion about", only the main topic). The transcript, the user's output language and the rule that the model replies with the title alone are added in code, after the transcript, so editing the instructions does not affect prefix caching.
+
+Title prompts use the same precedence as summary prompts: tag, then folder, then the user's own title prompt, then this default, then the built-in default. Group administrators can set a title prompt on group tags and folders as well.
+
+## Generation Temperature
+
+In the Default Prompts tab, you can also set the sampling temperature for four kinds of requests to the language model: summaries, titles, chat and event extraction. A value saved here applies to every user. Without a saved value, the built-in default is used: 0.5 for summaries, 0.7 for titles, 0.7 for chat and 0.2 for event extraction. Below each field, the value in use is displayed, with a note when it is the default. To restore the default, use the reset button beside the field, or clear the field and save. Values must lie between 0 and 2. Output is more consistent at lower values, for example 0 for repeatable summaries with a local model. A change takes effect with the next request, without a restart. The temperatures for Inquire and speaker identification are fixed and cannot be changed here, and no temperature is sent to models that do not accept one, such as GPT-5.
+
 ## Understanding the LLM Prompt Structure
 
 The expandable "View Full LLM Prompt Structure" section reveals how your prompt fits into the complete instruction sent to the AI. This technical view shows the system prompt, your custom prompt, and the transcript integration.

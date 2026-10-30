@@ -8,9 +8,12 @@ When speakers are merged:
 - Voice embeddings are combined using weighted average
 - All snippets are transferred to the target speaker
 - Usage statistics are combined
+- Every recording that shows a source speaker's name shows the target's name
 - Source speakers are deleted
 - Confidence score is recalculated
 """
+
+import json
 
 import numpy as np
 from src.database import db
@@ -61,8 +64,10 @@ def merge_speakers(target_id, source_ids, user_id):
     if target_id in source_ids:
         raise ValueError("Cannot merge a speaker with itself")
 
-    # Combine embeddings
-    _combine_embeddings(target, sources)
+    # Move the voice samples. The target's variants are rebuilt from the
+    # combined samples below, so the merge keeps every voice condition the
+    # people had instead of averaging them into one vector.
+    _merge_voice_samples(target, sources)
 
     # Transfer snippets
     for source in sources:
@@ -92,8 +97,20 @@ def merge_speakers(target_id, source_ids, user_id):
                 # If sorting fails, just concatenate and truncate
                 target.embeddings_history = (target_history + source_history)[-10:]
 
-    # Recalculate confidence score
-    target.confidence_score = calculate_confidence(target)
+    # Summary columns (average, count, history, confidence) from the samples
+    from src.services.voice_profiles import refresh_speaker_summary
+    db.session.flush()
+    refresh_speaker_summary(target)
+
+    # Recordings keep speaker names, not speaker ids: without this the
+    # recordings of a merged speaker kept showing the old name.
+    renamed = {}
+    for source in sources:
+        _, changed = rename_speaker_in_recordings(user_id, source.name, target.name,
+                                                  speaker_id=source.id, new_speaker_id=target.id)
+        for rid, fields in changed.items():
+            renamed.setdefault(rid, set()).update(fields)
+    target.recordings_updated = len(renamed)   # for the route's answer, not a column
 
     # Delete source speakers
     for source in sources:
@@ -102,7 +119,117 @@ def merge_speakers(target_id, source_ids, user_id):
     # Commit all changes
     db.session.commit()
 
+    refresh_renamed_recordings(renamed)
     return target
+
+
+def _same_name(a, b):
+    return isinstance(a, str) and a.strip().lower() == b.strip().lower()
+
+
+def rename_speaker_in_recordings(user_id, old_name, new_name, speaker_id=None, new_speaker_id=None):
+    """Show new_name wherever the user's recordings show old_name.
+
+    Covers the transcript segments, the participants list, the diarization
+    label map and the Inquire chunks' speaker column. A segment linked to
+    speaker_id follows the link (and is linked to new_speaker_id); a segment
+    without a link matches by name, ignoring case and surrounding spaces, as
+    saved speakers do. Does not commit.
+    Returns (chunks_updated, {recording id: set of the fields changed}).
+    """
+    from src.models import Recording, TranscriptChunk
+
+    old_key = old_name.strip().lower()
+    chunks_updated = 0
+    for chunk in TranscriptChunk.query.filter(
+            TranscriptChunk.user_id == user_id,
+            db.func.lower(db.func.trim(TranscriptChunk.speaker_name)) == old_key).all():
+        chunk.speaker_name = new_name
+        chunks_updated += 1
+
+    changed = {}
+    for recording in Recording.query.filter_by(user_id=user_id).all():
+        fields = set()
+
+        if recording.participants:
+            names = [p.strip() for p in recording.participants.split(',') if p.strip()]
+            if any(_same_name(p, old_name) for p in names):
+                merged = []
+                for p in names:
+                    p = new_name if _same_name(p, old_name) else p
+                    if not any(_same_name(p, m) for m in merged):
+                        merged.append(p)
+                recording.participants = ', '.join(merged)
+                fields.add('participants')
+
+        if recording.transcription:
+            try:
+                segments = json.loads(recording.transcription)
+            except (json.JSONDecodeError, TypeError):
+                segments = None
+            if isinstance(segments, list):
+                hit = False
+                for segment in segments:
+                    if not isinstance(segment, dict):
+                        continue
+                    linked = segment.get('speaker_id')
+                    if (speaker_id is not None and linked == speaker_id) or \
+                            (linked is None and _same_name(segment.get('speaker'), old_name)):
+                        if segment.get('speaker') != new_name:
+                            segment['speaker'] = new_name
+                            hit = True
+                        if new_speaker_id is not None and linked != new_speaker_id:
+                            segment['speaker_id'] = new_speaker_id
+                            hit = True
+                if hit:
+                    recording.transcription = json.dumps(segments)
+                    fields.add('transcription')
+
+        # The label map records which name each diarization label shows;
+        # without this the next save would think the voice was removed.
+        label_map = recording.speaker_label_map
+        if isinstance(label_map, dict) and any(_same_name(n, old_name) for n in label_map.values()):
+            recording.speaker_label_map = {
+                label: (new_name if _same_name(n, old_name) else n) for label, n in label_map.items()}
+            fields.add('speaker_label_map')
+
+        if fields:
+            changed.setdefault(recording.id, set()).update(fields)
+    return chunks_updated, changed
+
+
+def refresh_renamed_recordings(changed):
+    """After names change in committed recordings: rebuild their Inquire
+    chunks (the chunk text holds the names), rewrite their auto-exports and
+    recording.updated goes out from the change listener on commit.
+    changed: {recording id: fields}."""
+    if not changed:
+        return
+    from flask import current_app
+    from src.api import recordings as recordings_api
+    from src.file_exporter import ENABLE_AUTO_EXPORT, export_recording
+    for rid in sorted(changed):
+        recordings_api.reindex_recording_chunks_async(rid)
+        if ENABLE_AUTO_EXPORT:
+            try:
+                export_recording(rid)
+            except Exception as e:
+                current_app.logger.warning(f"Export after speaker rename failed for {rid}: {e}")
+
+
+def _merge_voice_samples(target, sources):
+    """Give the target every voice sample of the sources.
+
+    Profiles from before samples existed are written out as samples first,
+    so nothing they learned is lost.
+    """
+    from src.models import SpeakerVoiceSample
+    from src.services.voice_profiles import _materialize_legacy
+    for speaker in [target] + list(sources):
+        _materialize_legacy(speaker)
+    for source in sources:
+        SpeakerVoiceSample.query.filter_by(speaker_id=source.id).update({'speaker_id': target.id})
+    db.session.flush()
 
 
 def _combine_embeddings(target, sources):
@@ -207,13 +334,14 @@ def can_merge_speakers(speaker_ids, user_id):
         user_id: ID of the user
 
     Returns:
-        tuple: (bool, str) - (can_merge, error_message)
+        tuple: (bool, str) - (can_merge, error code): the code is a
+        server.apiError key (#477), '' when the merge can go ahead
     """
     if len(speaker_ids) < 2:
-        return False, "Need at least 2 speakers to merge"
+        return False, 'merge_needs_two_speakers'
 
     if len(speaker_ids) != len(set(speaker_ids)):
-        return False, "Duplicate speaker IDs provided"
+        return False, 'duplicate_speaker_ids'
 
     speakers = Speaker.query.filter(
         Speaker.id.in_(speaker_ids),
@@ -221,6 +349,6 @@ def can_merge_speakers(speaker_ids, user_id):
     ).all()
 
     if len(speakers) != len(speaker_ids):
-        return False, "Some speakers don't exist or don't belong to user"
+        return False, 'speakers_not_found_or_not_owned'
 
     return True, ""

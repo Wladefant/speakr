@@ -22,6 +22,7 @@ import sys
 import uuid
 import contextlib
 from unittest import mock
+from flask import redirect
 
 import pytest
 
@@ -176,10 +177,21 @@ def test_login_when_already_authenticated_redirects(cleanup_users):
 def test_logout_clears_session(cleanup_users):
     user = _mk_user(cleanup_users)
     with _client_logged_in_as(user) as client:
-        resp = client.get('/logout')
+        # Logout is POST-only (CSRF-protected) so a cross-site GET can't force it.
+        resp = client.post('/logout')
         assert resp.status_code == 302
         with client.session_transaction() as s:
             assert '_user_id' not in s
+
+
+def test_logout_rejects_get(cleanup_users):
+    # A cross-site <img src="/logout"> style GET must not log the user out.
+    user = _mk_user(cleanup_users)
+    with _client_logged_in_as(user) as client:
+        resp = client.get('/logout')
+        assert resp.status_code == 405
+        with client.session_transaction() as s:
+            assert s.get('_user_id') == str(user.id)  # still logged in
 
 
 def test_login_blocked_when_email_unverified(cleanup_users):
@@ -312,6 +324,67 @@ def test_account_preferences_invalid_audio_position_falls_back(cleanup_users):
         })
     refreshed = db.session.get(User, uid)
     assert refreshed.audio_player_position == 'bottom'
+
+
+def test_account_preferences_persist_default_recording_sort(cleanup_users):
+    user = _mk_user(cleanup_users)
+    uid = user.id
+    assert user.default_recording_sort is None  # existing accounts keep the date-added default
+    with _client_logged_in_as(user) as client:
+        client.post('/account', data={
+            'preferences_form': '1',
+            'ui_language': 'en',
+            'default_recording_sort': 'meeting_date',
+        })
+    assert db.session.get(User, uid).default_recording_sort == 'meeting_date'
+
+
+def test_account_preferences_unknown_default_recording_sort_resets_it(cleanup_users):
+    user = _mk_user(cleanup_users)
+    uid = user.id
+    user.default_recording_sort = 'meeting_date'
+    db.session.commit()
+    with _client_logged_in_as(user) as client:
+        client.post('/account', data={
+            'preferences_form': '1',
+            'ui_language': 'en',
+            'default_recording_sort': 'title',
+        })
+    assert db.session.get(User, uid).default_recording_sort is None
+
+
+def test_account_preferences_without_the_field_keep_default_recording_sort(cleanup_users):
+    # Other tabs submit the same form without this field and must not clear it.
+    user = _mk_user(cleanup_users)
+    uid = user.id
+    user.default_recording_sort = 'meeting_date'
+    db.session.commit()
+    with _client_logged_in_as(user) as client:
+        client.post('/account', data={'preferences_form': '1', 'ui_language': 'en'})
+    assert db.session.get(User, uid).default_recording_sort == 'meeting_date'
+
+
+def test_default_recording_sort_reaches_the_page_and_the_account_form(cleanup_users):
+    import re
+    user = _mk_user(cleanup_users)
+    user.default_recording_sort = 'meeting_date'
+    db.session.commit()
+    with _client_logged_in_as(user) as client:
+        index = client.get('/').get_data(as_text=True)
+        account = client.get('/account').get_data(as_text=True)
+    assert 'data-default-recording-sort="meeting_date"' in index
+    assert re.search(r'value="meeting_date"\s+checked', account)
+    assert not re.search(r'value="created_at"\s+checked', account)
+
+
+def test_default_recording_sort_defaults_to_date_added_for_existing_accounts(cleanup_users):
+    import re
+    user = _mk_user(cleanup_users)
+    with _client_logged_in_as(user) as client:
+        index = client.get('/').get_data(as_text=True)
+        account = client.get('/account').get_data(as_text=True)
+    assert 'data-default-recording-sort="created_at"' in index
+    assert re.search(r'value="created_at"\s+checked', account)
 
 
 def test_account_prompts_branch_persists_summary_prompt(cleanup_users):
@@ -472,6 +545,36 @@ def test_register_blocked_by_disallowed_domain(cleanup_users):
     assert User.query.filter_by(email=email).first() is None
 
 
+# The login page and the /register route must agree on every value (#479):
+# only 'true' in any case opens registration, unset defaults to open, and any
+# other value ('false', 'yes', '1', '') closes it.
+_REGISTRATION_VALUES = [
+    ('true', True), ('True', True), ('TRUE', True), (None, True),
+    ('false', False), ('False', False), ('FALSE', False),
+    ('yes', False), ('1', False), ('', False),
+]
+
+
+@pytest.mark.parametrize('value,enabled', _REGISTRATION_VALUES)
+def test_registration_enabled_helper(value, enabled):
+    with _envset(ALLOW_REGISTRATION=value):
+        assert auth_mod.registration_enabled() is enabled
+
+
+@pytest.mark.parametrize('value,enabled', _REGISTRATION_VALUES)
+def test_login_register_link_matches_register_route(value, enabled):
+    with _envset(ALLOW_REGISTRATION=value):
+        client = app.test_client()
+        page = client.get('/login')
+        assert page.status_code == 200
+        link_shown = b'Register here' in page.data
+        assert link_shown is enabled
+        assert (b'href="/register"' in page.data) is enabled
+        # The link is shown exactly when the route it points to accepts.
+        route = client.get('/register')
+        assert (route.status_code == 200) is enabled
+
+
 def test_is_registration_domain_allowed_helper(app_ctx):
     with _envset(REGISTRATION_ALLOWED_DOMAINS='example.com'):
         assert auth_mod.is_registration_domain_allowed('a@example.com') is True
@@ -588,7 +691,7 @@ def test_sso_login_does_not_store_unsafe_next(cleanup_users):
     # persisted to session['sso_next'] (it would be honoured after the
     # IdP round-trip). Both an absolute and a scheme-relative target.
     oauth = mock.MagicMock()
-    oauth.sso.authorize_redirect.return_value = 'redirecting'  # valid view return
+    oauth.sso.authorize_redirect.return_value = redirect("https://idp.example/authorize")
     with _sso_on(), mock.patch.object(auth_mod, 'get_sso_client', return_value=oauth):
         for evil in ('http://evil.com', '//evil.com'):
             client = app.test_client()
@@ -602,7 +705,7 @@ def test_sso_login_does_not_store_unsafe_next(cleanup_users):
 def test_sso_login_stores_safe_next(cleanup_users):
     # The safe-path companion: a local relative target IS stored.
     oauth = mock.MagicMock()
-    oauth.sso.authorize_redirect.return_value = 'redirecting'
+    oauth.sso.authorize_redirect.return_value = redirect("https://idp.example/authorize")
     with _sso_on(), mock.patch.object(auth_mod, 'get_sso_client', return_value=oauth):
         client = app.test_client()
         resp = client.get('/auth/sso/login', query_string={'next': '/recordings'})
@@ -730,7 +833,7 @@ def test_sso_login_uses_cached_client_without_reinit():
     # short-circuit and init_sso_client must NOT be called. The `or`->`and`
     # mutation would call init_sso_client (and use ITS return value instead).
     oauth = mock.MagicMock()
-    oauth.sso.authorize_redirect.return_value = 'redirecting'
+    oauth.sso.authorize_redirect.return_value = redirect("https://idp.example/authorize")
     with _sso_enabled_with_config(), \
             mock.patch.object(auth_mod, 'get_sso_client', return_value=oauth), \
             mock.patch.object(auth_mod, 'init_sso_client') as init_mock:
@@ -746,7 +849,7 @@ def test_sso_login_inits_client_when_none_cached():
     # client is used. Under `or`->`and`, `None and init_sso_client(...)`
     # short-circuits, init is never called, and the route bails to /login.
     oauth = mock.MagicMock()
-    oauth.sso.authorize_redirect.return_value = 'redirecting'
+    oauth.sso.authorize_redirect.return_value = redirect("https://idp.example/authorize")
     with _sso_enabled_with_config(), \
             mock.patch.object(auth_mod, 'get_sso_client', return_value=None), \
             mock.patch.object(auth_mod, 'init_sso_client', return_value=oauth) as init_mock:

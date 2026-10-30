@@ -1,10 +1,8 @@
 name: Deploy Documentation
 
 on:
-  release:
-    types: [published]
   push:
-    tags: [ 'v*.*.*' ]
+    branches: [ master, main ]
     paths:
       - 'docs/**'
       - '.github/workflows/docs.yml'
@@ -24,10 +22,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
-        
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # git-revision-date-localized needs full history for page dates;
+          # since plugin 1.6 a shallow clone is a warning, which --strict
+          # turns into a failed build.
+          fetch-depth: 0
+
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.11'
           
@@ -40,17 +43,16 @@ jobs:
         env:
           CI: true  # This enables git-revision-date plugin in CI
         run: |
-          cd docs
           # Update site_url for GitHub Pages if needed
           if [ "${{ github.repository }}" != "murtaza-nasir/speakr" ]; then
             sed -i "s|site_url:.*|site_url: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}|" mkdocs.yml
           fi
-          mkdocs build --strict --site-dir _site
+          mkdocs build --strict
           
       - name: Upload artifact
-        uses: actions/upload-pages-artifact@v5
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
-          path: ./docs/_site
+          path: ./site
 
   deploy:
     environment:
@@ -61,4 +63,4 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v5
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

@@ -20,15 +20,27 @@ A per-recording Stats tab shows total length, speaker count, conversation turns,
 
 An opt-in mode (`ENABLE_SERVER_RECORDING_CHUNKS`) streams in-app recording chunks to the server as you record instead of buffering them in browser memory, raising the practical recording ceiling to hours-long sessions and letting you resume a recording after a page reload. See the [Recording guide](user-guide/recording.md#server-side-recording-sessions-long-recordings) and [admin setup](admin-guide/recording-sessions.md).
 
+### Joining Files at Upload
+
+When a recorder or phone splits a meeting into several files, the upload dialog can join them into one recording: choose **One recording** above the file list, check the order (by modified time and name, adjustable by dragging or with the arrows), and upload. Speakr joins the audio once every file has arrived and transcribes it a single time. See [Joining Several Files into One Recording](user-guide/recording.md#joining-several-files-into-one-recording).
+
+### Sliced File Uploads
+
+Uploads of files larger than 16 MB are sent as fixed-size slices through the same session endpoints and reassembled server-side, so a reverse proxy with a request-body limit below the file size (Cloudflare caps bodies at 100 MB on most plans) no longer blocks large uploads. This needs no configuration; see [Recording Sessions](admin-guide/recording-sessions.md#sliced-uploads-of-files-on-disk).
+
 ## Core Transcription Features
 
 ### Multi-Engine Support
 
-Speakr supports multiple transcription engines to match your needs and budget. Use [OpenAI's Whisper API](getting-started.md#option-a-openai-whisper-configuration) for quick, cloud-based transcription with excellent accuracy. Deploy the [recommended ASR container](getting-started.md#option-b-custom-asr-endpoint-configuration) for advanced features like speaker diarization and local processing. Use [Mistral Voxtral](getting-started/installation.md#for-mistral-voxtral-cloud-based-diarization) for cloud-based diarization via the Mistral API, or run [VibeVoice ASR](getting-started/installation.md#for-vibevoice-asr-self-hosted-via-vllm) on your own hardware for fully self-hosted transcription with diarization. For long, multi-speaker meetings, [AssemblyAI](getting-started/installation.md#for-assemblyai-cloud-based-diarization) offers cloud diarization and handles multi-hour files in a single job. See the [installation guide](getting-started/installation.md) for detailed setup instructions. The system automatically handles different audio formats, converting them as needed for optimal transcription quality.
+Speakr supports multiple transcription engines to match your needs and budget. Use [OpenAI's Whisper API](getting-started.md#option-a-openai-whisper-configuration) for quick, cloud-based transcription with excellent accuracy. Deploy the [recommended ASR container](getting-started.md#option-b-custom-asr-endpoint-configuration) for advanced features like speaker diarization and local processing. Use [Mistral Voxtral](getting-started/installation.md#for-mistral-voxtral-cloud-based-diarization) for cloud-based diarization via the Mistral API, or run [VibeVoice ASR](getting-started/installation.md#for-vibevoice-asr-self-hosted-via-vllm) on your own hardware for fully self-hosted transcription with diarization. For long, multi-speaker meetings, [AssemblyAI](getting-started/installation.md#for-assemblyai-cloud-based-diarization) offers cloud diarization and handles multi-hour files in a single job. For Chinese and English meetings, [Tencent Cloud ASR](advanced/tencent-asr.md) provides recording-file recognition with speaker labels and hotwords. See the [installation guide](getting-started/installation.md) for detailed setup instructions. The system automatically handles different audio formats, converting them as needed for optimal transcription quality.
 
 ### Speaker Diarization
 
 When using the [ASR endpoint](getting-started.md#option-b-custom-asr-endpoint-configuration), Speakr automatically identifies different speakers in your recordings. If you encounter issues, check the [troubleshooting guide](troubleshooting.md#speaker-identification-not-working). Each speaker gets a unique label that you can later customize with actual names. The system remembers these speaker profiles, building a library that improves identification accuracy over time. Manage your speaker library in [account settings](user-guide/settings.md). This feature transforms multi-person meetings from walls of text into organized conversations.
+
+You can guide diarization with a speaker count. The upload, recording, and reprocess dialogs offer a Range / Exact toggle (remembered per user): Range sends a minimum and maximum, while Exact sends one number, and providers that only accept an exact count (such as OpenASR) show the single field automatically. Tag and folder defaults work with either form.
+
+**Self-Hosted Diarization with OpenASR**: OpenASR runs locally with an OpenAI-compatible API, diarizes with an exact speaker count, and, on servers from openasr#379 onward, returns speaker embeddings when `ASR_RETURN_SPEAKER_EMBEDDINGS=true`, so voice profiles work with it the same way they do with WhisperX.
 
 **Cloud Diarization with OpenAI**: When using OpenAI's `gpt-4o-transcribe-diarize` model, speaker diarization is also available with speakers labeled as A, B, C, etc. For longer files (over ~23 minutes) that require chunking, the system maintains speaker identity across chunks using audio reference samples. This technique supports **up to 4 speakers** - recordings with more speakers may have inconsistent labels across different sections of the transcript.
 
@@ -69,6 +81,8 @@ Transform static transcripts into dynamic conversations with the integrated chat
 
 Search across all your recordings using natural language questions instead of keywords through [Inquire Mode](user-guide/inquire-mode.md). The [vector store](admin-guide/vector-store.md) must be configured for this feature to work. The semantic search understands meaning and context, finding relevant content even when exact words don't match. Ask questions like "When did we discuss the budget increase?" and get results from any recording that covered that topic, regardless of the specific terminology used.
 
+An optional [agentic mode](user-guide/inquire-mode.md#agentic-inquire-beta) (opt-in beta, `ENABLE_INQUIRE_AGENT=true`) replaces the single retrieval pass with an AI agent that searches, lists, and reads your recordings iteratively until it can answer. The interface shows each step live with a stop button, keeps a collapsible activity record on every answer, and cites sources as numbered markers with timestamps; clicking a citation opens the recording and starts playback at the cited moment. Per-user privacy settings control what the agent may read: transcripts are always available, while summaries and private notes are individual opt-ins enforced by removing the corresponding capability from the agent entirely.
+
 ## Organization and Management
 
 ### Folders
@@ -92,7 +106,7 @@ See the [Folders Guide](user-guide/folders.md) for detailed usage instructions.
 
 ### Bulk Operations
 
-Select multiple recordings in the sidebar to perform batch operations efficiently. Enter multi-select mode by clicking the checkbox icon or using keyboard shortcuts, then select individual recordings or use Ctrl/Cmd+A to select all visible recordings.
+Select multiple recordings in the sidebar to perform batch operations efficiently. Enter multi-select mode by clicking the checkbox icon or using keyboard shortcuts, then select individual recordings or use Ctrl/Cmd+A to select all visible recordings. With Ctrl-click (Cmd-click on macOS), a recording is added to or removed from the selection, and with Shift-click, every recording between the last one clicked and the current one is selected. Either way, multi-select mode is turned on, and the open recording is the starting point for Shift-click.
 
 **Available bulk actions:**
 
@@ -107,6 +121,8 @@ The floating action bar appears when recordings are selected, showing the count 
 
 Organize recordings with a flexible [tagging system](user-guide/settings.md#tag-management-tab) that goes beyond simple labels. Tags can include [custom AI prompts](admin-guide/prompts.md) for specialized processing. Each tag can carry [custom AI prompts](admin-guide/prompts.md) and transcription settings, enabling automatic specialized processing based on content type, automatically applying specialized processing to tagged recordings. Tags use colors for visual organization and stack intelligently when multiple tags apply to the same recording.
 
+Every label is also a link. Clicking a tag filters the list to it and puts `/label/<name>` in the address bar, so a group of recordings can be bookmarked or shared the same way `/recordings/<id>` links a single one. The name is matched exactly but case-insensitively (`/label/Q3%20Planning` and `/label/q3%20planning` reach the same label), and it resolves against the tags the person opening it can see - so a link stays private, showing each viewer only their own recordings under that name, and covering both their personal tag and a group tag if they happen to share it.
+
 ### Retention Policies and Auto-Deletion
 
 Implement intelligent data lifecycle management with flexible retention policies. Set a global retention period for automatic cleanup of old recordings, with the choice to delete just audio files (preserving valuable transcriptions) or complete recordings. Tags can override global retention with custom retention periods - keep legal records for 7 years, marketing content for 6 months, and general meetings for 90 days, all through tag-level configuration. Protected tags prevent specific recordings from ever being auto-deleted, perfect for compliance requirements and permanent archives. Group tags can enforce group-wide retention policies. The system provides preview functionality to see exactly what will be deleted before any changes occur, and administrators can control whether users can delete their own recordings or if deletion requires admin approval.
@@ -117,9 +133,25 @@ Implement intelligent data lifecycle management with flexible retention policies
 
 Build and maintain a library of speaker profiles that persist across recordings. [Identify speakers](user-guide/transcripts.md#speaker-identification) after each transcription to build your library. Once identified, speakers are remembered and suggested in future recordings. The system tracks usage statistics, showing how often each speaker appears and when they were last identified. Bulk management tools help maintain a clean, organized speaker library.
 
-**Voice Profile Recognition**: The system builds voice recognition profiles from speaker identifications across multiple recordings. These profiles use 256-dimensional voice embeddings to suggest speaker matches when processing new recordings, making speaker identification faster and more consistent. The voice matching system calculates similarity scores to help identify speakers across recordings, even when audio quality varies. Voice profiles are automatically updated as more recordings are processed, improving recognition accuracy over time.
+**Renaming and merging**: Each named speaker in a transcript is linked to the saved speaker. Renaming a speaker in **Account, Speakers Management** shows the new name in every recording that speaker appears in, and merging speakers shows the kept speaker in every recording of the merged ones: transcript, participants and Inquire search. Summaries keep the names they were written with until they are regenerated. Recordings transcribed before v0.10.11-alpha are linked once at upgrade, through voice samples where they exist and otherwise by name.
 
-**Auto Speaker Labeling**: Enable automatic speaker identification in your [account settings](user-guide/settings.md#processing-preferences). When enabled, new recordings are automatically analyzed against your speaker profiles, and matching speakers are labeled without manual intervention. Configure the confidence threshold to balance between more matches (low threshold) and higher accuracy (high threshold). This feature requires WhisperX ASR with speaker embeddings enabled.
+**Voice Profile Recognition**: A person's voice profile is built from samples: each time you name someone in a recording, Speakr keeps that recording's voice embedding for them (up to 20 per person, oldest dropped first). Embeddings of any size work; WhisperX returns 256 dimensions. Samples that closely resemble each other form a voice variant, so the same person on a phone and in a meeting room can have two, and a new recording is compared with every variant, the closest one counting. The variants are always rebuilt from the samples, which makes corrections complete: renaming a speaker moves their sample to the right person, and removing a sample in **Account, Speakers Management, Voice profile** undoes its effect entirely.
+
+Several safeguards keep profiles clean. A speaker with less than 15 seconds of speech in a recording (`VOICE_PROFILE_MIN_SPEECH_SECONDS`) neither trains a profile nor gets auto-labelled, since such a short stretch gives a noisy embedding. A sample that is unlike everything a well-established profile already holds is kept out and logged as a likely wrong name. Samples from auto-labelling count half as much as names a person confirmed, and confirming the name in the speaker dialog upgrades them. Profiles built before this design are kept and read as one sample, weighted by how many recordings built them.
+
+Match thresholds calibrate themselves: once a voice space holds enough samples, Speakr compares each sample with the same person's other samples and with other people's, and places the threshold between the two distributions. Suggestions and the low / medium / high auto-labelling settings are derived from it; until then the fixed defaults apply. The admin **Voice embedding compatibility** card shows the threshold in use.
+
+**In-App Notifications**: The user menu carries an unread badge and a panel listing anything that needs attention, such as a change in the transcription backend's voice embedding model. Notices that describe a condition rather than an event clear themselves when the condition ends, so restoring a backend removes the warning without anyone dismissing it. Notification text is localized like the rest of the interface.
+
+**Email Notifications**: Each user can opt in to an email when one of their recordings finishes transcribing, or fails, from their [account preferences](user-guide/settings.md#notifications). It uses the same SMTP configuration as email verification and password resets, and is off by default. Set `APP_BASE_URL` so the message can link back to the recording. See [Email Setup](admin-guide/email-setup.md#processing-notifications).
+
+**Embedding Model Changes**: Voice profiles are only comparable with embeddings from the model that produced them. If the transcription backend starts returning embeddings from a different model, whether because the endpoint was repointed or because the service upgraded itself, existing profiles stop matching anything. On its own this failure is silent: matching simply returns nothing.
+
+Speakr detects it by sending a short fixed clip to the backend and comparing the embedding it gets back against the one recorded when voice matching first worked. Each model it recognises this way gets its own **voice space**, and embeddings are only compared within one space: profiles are kept separately per model, so switching from WhisperX to OpenASR and back leaves each backend's profiles intact, and a new model starts learning its own profiles as you name speakers. Profiles stored before voice spaces existed belong to the space of the model the reference was taken from. With the check disabled, nothing is assigned a space and matching works as before. The check runs at startup, which is when an embedding model realistically changes, and on demand from the **Voice embedding compatibility** card on the Admin page, which also shows the current verdict, the embedding size and when it was last checked. When it detects a change, Speakr writes a banner into the startup log and raises a notification for every administrator, keeping the original reference so that restoring the previous backend clears both by itself. If the change was intended, use **Re-baseline** on that card to accept the new model and clear the warning; the previous model's profiles stay in their own space and match again if that backend is restored. A backend that is simply unreachable is reported as a failed check rather than a changed model.
+
+Set `DISABLE_VOICE_EMBEDDING_CHECK=true` to turn the check off. The clip costs one short transcription each time it runs.
+
+**Auto Speaker Labeling**: Enable automatic speaker identification in your [account settings](user-guide/settings.md#processing-preferences). When enabled, new recordings are automatically analyzed against your speaker profiles, and matching speakers are labeled without manual intervention. Each person is given to at most one speaker in a recording, and a speaker whose two best candidates are nearly tied is left for you. Configure the confidence threshold to balance between more matches (low threshold) and higher accuracy (high threshold). This feature requires WhisperX ASR with speaker embeddings enabled.
 
 **Speaker Profile Preservation**: By default, speaker profiles and voice embeddings are preserved even when all associated recordings are deleted. Set `DELETE_ORPHANED_SPEAKERS=true` to automatically clean up speakers with no remaining recordings.
 
@@ -216,11 +248,11 @@ Store recording audio files in S3-compatible object storage (AWS S3, MinIO, or a
 
 ### Black Hole Processing
 
-Set up a watched directory where dropped audio files are automatically processed. Configure this in [system settings](admin-guide/system-settings.md) for automated workflows. Perfect for automation workflows or batch processing, the black hole directory monitors for new files and queues them for transcription without manual intervention.
+Set up a watched directory where dropped audio files are automatically processed. Configure this in [system settings](admin-guide/system-settings.md) for automated workflows. Perfect for automation workflows or batch processing, the black hole directory monitors for new files and queues them for transcription without manual intervention. In `user_directories` mode, each user gets their own subfolder, which may be named after the user id (`user123` or `123`) or the username itself (matching the naming of the per-user export folders), a clean fit for multi-tenant setups where other systems drop files per user.
 
 ### Automated Export
 
-Automatically export completed transcriptions and summaries to markdown files after processing. Configure the export directory to point to your Obsidian vault, Logseq directory, or any other note-taking system for seamless integration. Choose what to export (transcription, summary, or both) and let Speakr maintain synchronized copies of your recordings in your preferred format. Custom export templates allow you to format the output to match your note-taking workflow. Exports are organized in per-user subdirectories for multi-user instances.
+Automatically export completed transcriptions and summaries to markdown files after processing. Configure the export directory to point to your Obsidian vault, Logseq directory, or any other note-taking system for seamless integration. Choose what to export (transcription, summary, or both) and let Speakr maintain synchronized copies of your recordings in your preferred format. Custom export templates allow you to format the output to match your note-taking workflow. When a recording's tag and its folder both have an export template, the tag's template is used; otherwise the folder's, and then your default. Dates in exported files and file names are written in your timezone. Exports are organized in per-user subdirectories for multi-user instances.
 
 ### Custom Vocabulary & Transcription Hints
 
@@ -229,7 +261,7 @@ Improve transcription accuracy for domain-specific content with two complementar
 - **Hotwords** - Provide comma-separated terms (brand names, acronyms, technical jargon) that the transcription engine should prioritize. This biases the model toward correctly recognizing words it might otherwise misspell.
 - **Initial Prompt** - Give the transcription engine context about the recording content, helping it make better overall word choices when audio is ambiguous.
 
-Set these at any level - [per-user defaults](user-guide/settings.md#transcription-hints), [per-tag](user-guide/settings.md#transcription-hints-hotwords--initial-prompt), [per-folder](user-guide/folders.md), or per-upload in the Advanced ASR Options. Values cascade with upload form taking highest priority, then tags, folders, and finally user defaults. See the [FAQ](faq.md#certain-specialized-words-dont-get-transcribed-properly-how-do-i-fix-this) for practical usage tips.
+Set these at any level - [per-user defaults](user-guide/settings.md#transcription-hints), [per-tag](user-guide/settings.md#transcription-hints-hotwords--initial-prompt), [per-folder](user-guide/folders.md), or per-recording in the Advanced ASR Options of both the upload dialog and the in-app recorder (including a saved-template picker in each). Values cascade with the upload or recording form taking highest priority, then tags, folders, and finally user defaults. See the [FAQ](faq.md#certain-specialized-words-dont-get-transcribed-properly-how-do-i-fix-this) for practical usage tips.
 
 ### Custom ASR Configuration
 
@@ -296,7 +328,7 @@ Monitor and control LLM API consumption with per-user token tracking and budget 
 
 **Per-User Budgets**: Set monthly token limits for individual users to control costs. Users see their remaining budget in the interface and receive warnings at 80% consumption. Once a budget is exhausted, AI operations are blocked until the next month.
 
-**Admin Dashboard**: View detailed token statistics including daily trends, monthly totals, and per-user breakdowns. Cost tracking is available when using OpenRouter or other providers that return cost information. See the [admin guide](admin-guide/statistics.md#token-usage-statistics) for details.
+**Admin Dashboard**: System Statistics shows tokens per day by task, cost per month and per model, and each user's usage against the budget. Cost tracking is available when using OpenRouter or other providers that return cost information. See the [admin guide](admin-guide/statistics.md#usage-and-cost) for details.
 
 ### Transcription Usage Tracking & Budgets
 
@@ -306,7 +338,7 @@ Monitor and control speech-to-text API consumption separately from LLM tokens. T
 
 **Cost Estimation**: The system calculates estimated transcription costs based on the connector used - $0.006/minute for OpenAI Whisper, $0.003-$0.006/minute for OpenAI Transcribe models, and $0 for self-hosted ASR endpoints. This helps organizations forecast costs and identify heavy users.
 
-**Admin Dashboard**: View transcription statistics including today's usage, monthly totals, estimated costs, and per-user breakdowns with budget status indicators. See the [admin guide](admin-guide/statistics.md#transcription-usage-statistics) for details.
+**Admin Dashboard**: System Statistics shows minutes transcribed per day, estimated costs, and each user's minutes against the budget. See the [admin guide](admin-guide/statistics.md#usage-and-cost) for details.
 
 ### Flexible Configuration
 

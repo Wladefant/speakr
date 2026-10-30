@@ -13,6 +13,9 @@ const _asrEditorScrollMemory = new Map();
 // double-click-on-simple-view-segment path. null means "restore last scroll".
 let _asrEditorPendingScrollIndex = null;
 
+// Guarded: the module can run before i18n.js has loaded.
+const t = (key, params) => (window.i18n ? window.i18n.t(key, params) : key);
+
 export function useTranscription(state, utils) {
     const {
         showTextEditorModal, showAsrEditorModal, selectedRecording,
@@ -129,7 +132,7 @@ export function useTranscription(state, utils) {
             });
         } catch (e) {
             console.error("Could not parse transcription as JSON for ASR editor:", e);
-            setGlobalError("This transcription is not in the correct format for the ASR editor.");
+            setGlobalError(t('errors.asrEditorWrongFormat'));
         }
     };
 
@@ -287,12 +290,20 @@ export function useTranscription(state, utils) {
         }
     };
 
-    // O(1) dropdown management using single ref instead of O(n) forEach
-    const openSpeakerSuggestions = (index) => {
-        if (editingSegments.value[index]) {
+    // O(1) dropdown management using single ref instead of O(n) forEach.
+    // Opening the list (focus, chevron) shows every speaker; the list is
+    // filtered only while the name is being typed. Filtering by the name
+    // already in the field left only that speaker to choose (#425).
+    const openSpeakerSuggestions = (index, { filter = false } = {}) => {
+        const segment = editingSegments.value[index];
+        if (segment) {
             // Simply set the open index - O(1) instead of O(n) forEach
             openAsrDropdownIndex.value = index;
-            filterSpeakerSuggestions(index);
+            if (filter) {
+                filterSpeakerSuggestions(index);
+            } else {
+                segment.filteredSpeakers = [...availableSpeakers.value];
+            }
             updateDropdownPosition(index);
         }
     };
@@ -387,7 +398,10 @@ export function useTranscription(state, utils) {
         });
     };
 
-    const selectSpeaker = (index, speaker) => {
+    // Not selectSpeaker: the Identify Speakers dialog exports that name, and
+    // as the later composable in the app it replaced this one, so choosing a
+    // name in the editor did nothing (#425).
+    const selectSegmentSpeaker = (index, speaker) => {
         if (editingSegments.value[index]) {
             editingSegments.value[index].speaker = speaker;
             closeSpeakerSuggestions(index);
@@ -399,7 +413,7 @@ export function useTranscription(state, utils) {
         const newStart = lastSegment ? lastSegment.end_time : 0;
 
         editingSegments.value.push({
-            speaker: availableSpeakers.value[0] || 'Speaker 1',
+            speaker: availableSpeakers.value[0] || t('transcription.speaker', { number: 1 }),
             start_time: newStart,
             end_time: newStart + 5,
             sentence: '',
@@ -475,7 +489,7 @@ export function useTranscription(state, utils) {
             });
 
             const data = await response.json();
-            if (!response.ok) throw new Error(data.error || 'Failed to update transcription');
+            if (!response.ok) throw new Error(data.error || t('errors.updateTranscriptionFailed'));
 
             // Update recording
             selectedRecording.value.transcription = content;
@@ -485,9 +499,9 @@ export function useTranscription(state, utils) {
                 recordings.value[index].transcription = content;
             }
 
-            showToast('Transcription updated successfully!', 'fa-check-circle');
+            showToast(t('messages.transcriptionUpdated'), 'fa-check-circle');
         } catch (error) {
-            setGlobalError(`Failed to save transcription: ${error.message}`);
+            setGlobalError(t('errors.saveTranscriptionFailedDetail', { error: error.message }));
         }
     };
 
@@ -518,7 +532,7 @@ export function useTranscription(state, utils) {
             });
 
             const data = await response.json();
-            if (!response.ok) throw new Error(data.error || 'Failed to update summary');
+            if (!response.ok) throw new Error(data.error || t('errors.updateSummaryFailed'));
 
             // Update recording
             selectedRecording.value.summary = summary;
@@ -528,9 +542,9 @@ export function useTranscription(state, utils) {
                 recordings.value[index].summary = summary;
             }
 
-            showToast('Summary saved!', 'fa-check-circle');
+            showToast(t('messages.summarySaved'), 'fa-check-circle');
         } catch (error) {
-            setGlobalError(`Failed to save summary: ${error.message}`);
+            setGlobalError(t('errors.saveSummaryFailedDetail', { error: error.message }));
         }
     };
 
@@ -555,7 +569,7 @@ export function useTranscription(state, utils) {
             } catch (e) {
                 console.error('[Incognito] Failed to save notes to sessionStorage:', e);
             }
-            showToast('Notes saved (in browser only)', 'fa-check-circle');
+            showToast(t('messages.notesSavedBrowserOnly'), 'fa-check-circle');
             return;
         }
 
@@ -571,7 +585,7 @@ export function useTranscription(state, utils) {
             });
 
             const data = await response.json();
-            if (!response.ok) throw new Error(data.error || 'Failed to update notes');
+            if (!response.ok) throw new Error(data.error || t('errors.updateNotesFailed'));
 
             // Update recording
             selectedRecording.value.notes = notes;
@@ -581,9 +595,9 @@ export function useTranscription(state, utils) {
                 recordings.value[index].notes = notes;
             }
 
-            showToast('Notes saved!', 'fa-check-circle');
+            showToast(t('messages.notesUpdated'), 'fa-check-circle');
         } catch (error) {
-            setGlobalError(`Failed to save notes: ${error.message}`);
+            setGlobalError(t('errors.saveNotesFailedDetail', { error: error.message }));
         }
     };
 
@@ -609,7 +623,7 @@ export function useTranscription(state, utils) {
         isDropdownOpen,
         getDropdownPosition,
         updateDropdownPosition,
-        selectSpeaker,
+        selectSegmentSpeaker,
         addSegment,
         removeSegment,
         addSegmentBelow,

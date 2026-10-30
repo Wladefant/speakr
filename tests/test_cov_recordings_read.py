@@ -110,7 +110,9 @@ class FakeStorage:
 
 @contextmanager
 def use_storage(storage):
-    with patch.object(rec_module, "get_storage_service", return_value=storage):
+    # Reprocessing checks storage in src/services/reprocessing.py (#412).
+    with patch.object(rec_module, "get_storage_service", return_value=storage), \
+         patch("src.services.storage.get_storage_service", return_value=storage):
         yield storage
 
 
@@ -142,7 +144,7 @@ _PREFIX = "covrecread"
 
 
 def make_user():
-    suffix = uuid.uuid4().hex[:10]
+    suffix = uuid.uuid4().hex[:9]
     user = User(
         username=f"{_PREFIX}_{suffix}",
         email=f"{_PREFIX}_{suffix}@test.local",
@@ -333,6 +335,54 @@ def test_paginated_list_includes_has_notes_flag(owner):
     assert by_id[without]["has_notes"] is False
 
 
+
+_NOTES_CASES = [
+    ("some notes", True), (" \r\n\v\f x\t", True),
+    (None, False), ("", False), ("   ", False), ("\n\t", False), (" \r\n\v\f\t", False),
+]
+
+
+def test_list_has_notes_leaves_notes_unloaded(owner):
+    """#508: the list computes has_notes in SQL and does not load the notes text."""
+    from sqlalchemy import inspect as sa_inspect, select
+    from src.services.recording_list import list_load_options
+    with _db():
+        u = db.session.get(User, owner)
+        ids = {}
+        for notes, expected in _NOTES_CASES:
+            r = make_recording(u, title="hn")
+            r.notes = notes
+            ids[r.id] = (notes, expected)
+        db.session.commit()
+        db.session.expunge_all()
+        rows = db.session.execute(
+            select(Recording).where(Recording.id.in_(ids)).options(*list_load_options())).scalars().all()
+        assert len(rows) == len(ids)
+        for r in rows:
+            notes, expected = ids[r.id]
+            assert "notes" in sa_inspect(r).unloaded
+            assert r.to_list_dict()["has_notes"] is expected, repr(notes)
+            assert "notes" in sa_inspect(r).unloaded
+            # The single-row path (no list expression) gives the same flag.
+            assert bool(notes and notes.strip()) is expected
+
+
+def test_paginated_list_has_notes_ignores_whitespace(owner):
+    with _db():
+        u = db.session.get(User, owner)
+        ids = {}
+        for notes, expected in _NOTES_CASES:
+            r = make_recording(u, title="hw")
+            r.notes = notes
+            ids[r.id] = expected
+        db.session.commit()
+    c = new_client()
+    login(c, owner)
+    by_id = {r["id"]: r for r in c.get("/api/recordings?per_page=100").get_json()["recordings"]}
+    for rid, expected in ids.items():
+        assert by_id[rid]["has_notes"] is expected
+        assert "notes" not in by_id[rid]
+
 def test_paginated_status_filter(owner):
     # The merge picker uses ?status=COMPLETED to fetch only mergeable recordings.
     with _db():
@@ -417,6 +467,99 @@ def test_paginated_speaker_filter(owner):
     ids = {r["id"] for r in resp.get_json()["recordings"]}
     assert match_id in ids
     assert nomatch_id not in ids
+
+
+def _search_ids(user_id, q):
+    c = new_client()
+    login(c, user_id)
+    resp = c.get("/api/recordings", query_string={"q": q, "per_page": 100})
+    assert resp.status_code == 200, resp.get_json()
+    return {r["id"] for r in resp.get_json()["recordings"]}
+
+
+def test_like_helpers_escape_backslash_first():
+    from src.utils.search import LIKE_ESCAPE, contains_pattern, escape_like
+    assert LIKE_ESCAPE == "\\"
+    assert escape_like("plain text") == "plain text"
+    assert escape_like("50%") == "50\\%"
+    assert escape_like("a_b") == "a\\_b"
+    # The backslash is escaped before the escapes for % and _ are added,
+    # otherwise those escapes would be doubled.
+    assert escape_like("C:\\temp") == "C:\\\\temp"
+    assert escape_like("\\%") == "\\\\\\%"
+    assert contains_pattern("x%_y") == "%x\\%\\_y%"
+
+
+def test_paginated_text_search_treats_input_literally(owner):
+    # #485: % and _ typed in the search box are literal characters, and a
+    # backslash still matches itself once the pattern declares ESCAPE.
+    marker = f"lit{uuid.uuid4().hex[:8]}"
+    with _db():
+        u = db.session.get(User, owner)
+        units = make_recording(u, title=f"plain {marker} 500 units").id
+        percent = make_recording(u, title=f"{marker} 50% target").id
+        underscore = make_recording(u, title=f"under_score {marker}").id
+        x_score = make_recording(u, title=f"underXscore {marker}").id
+        backslash = make_recording(u, title=f"path C:\\temp {marker}").id
+        no_backslash = make_recording(u, title=f"path C:temp {marker}").id
+    mine = {units, percent, underscore, x_score, backslash, no_backslash}
+
+    assert _search_ids(owner, "50%") & mine == {percent}
+    assert _search_ids(owner, "%") & mine == {percent}
+    assert _search_ids(owner, "under_score") & mine == {underscore}
+    assert _search_ids(owner, "_") & mine == {underscore}
+    assert _search_ids(owner, "C:\\temp") & mine == {backslash}
+    assert _search_ids(owner, f"{marker} 50%") & mine == {percent}
+
+
+def test_paginated_text_search_still_matches_title_transcript_and_notes(owner, other):
+    from src.models import InternalShare, SharedRecordingState
+    marker = f"pos{uuid.uuid4().hex[:8]}"
+    with _db():
+        u = db.session.get(User, owner)
+        o = db.session.get(User, other)
+        in_title = make_recording(u, title=f"meeting {marker}").id
+        in_transcript = make_recording(
+            u, title="t-only",
+            transcription=f'[{{"speaker": "SPEAKER_00", "sentence": "said {marker} aloud", '
+                          f'"start_time": 1.0, "end_time": 2.0}}]').id
+        in_participants = make_recording(u, title="p-only", participants=f"Dana {marker}").id
+        noted = make_recording(u, title="n-only")
+        noted.notes = f"remember {marker}"
+        noted_id = noted.id
+        # Another user's recording shared with the owner, matched only by
+        # the owner's personal notes on it
+        shared = make_recording(o, title="shared-only")
+        shared_id = shared.id
+        db.session.add(InternalShare(recording_id=shared_id, owner_id=o.id,
+                                     shared_with_user_id=u.id, can_edit=False))
+        db.session.add(SharedRecordingState(recording_id=shared_id, user_id=u.id,
+                                            personal_notes=f"my note {marker}"))
+        unrelated = make_recording(u, title="nothing here").id
+        db.session.commit()
+    try:
+        with patch("src.app.ENABLE_INTERNAL_SHARING", True), \
+             patch.object(rec_module, "ENABLE_INTERNAL_SHARING", True):
+            ids = _search_ids(owner, marker)
+        assert {in_title, in_transcript, in_participants, noted_id, shared_id} <= ids
+        assert unrelated not in ids
+    finally:
+        with _db():
+            SharedRecordingState.query.filter_by(recording_id=shared_id).delete()
+            InternalShare.query.filter_by(recording_id=shared_id).delete()
+            db.session.commit()
+
+
+def test_paginated_speaker_filter_percent_is_literal(owner):
+    marker = f"spk{uuid.uuid4().hex[:8]}"
+    with _db():
+        u = db.session.get(User, owner)
+        literal = make_recording(u, title=f"spk {marker}", participants="Dana 100%").id
+        other_rec = make_recording(u, title=f"spk2 {marker}", participants="Dana 100x").id
+    # The speaker token writes spaces as underscores
+    ids = _search_ids(owner, "speaker:dana_100%")
+    assert literal in ids
+    assert other_rec not in ids
 
 
 def test_paginated_needs_transcription_filter(owner):
@@ -668,7 +811,7 @@ def test_get_detail_non_owner_denied(owner, other):
     c = new_client()
     login(c, other)
     resp = c.get(f"/api/recordings/{rid}")
-    assert resp.status_code == 403
+    assert resp.status_code == 404
 
 
 def test_get_detail_not_found(owner):
@@ -709,7 +852,7 @@ def test_status_only_non_owner_denied(owner, other):
     c = new_client()
     login(c, other)
     resp = c.get(f"/recording/{rid}/status")
-    assert resp.status_code == 403
+    assert resp.status_code == 404
 
 
 def test_status_only_not_found(owner):
@@ -737,7 +880,7 @@ def test_full_status_non_owner_denied(owner, other):
     c = new_client()
     login(c, other)
     resp = c.get(f"/status/{rid}")
-    assert resp.status_code == 403
+    assert resp.status_code == 404
 
 
 def test_batch_status_only_accessible(owner, other):
@@ -847,7 +990,7 @@ def test_audio_non_owner_denied(owner, other):
     login(c, other)
     with use_storage(storage):
         resp = c.get(f"/audio/{rid}")
-    assert resp.status_code == 403
+    assert resp.status_code == 404
 
 
 def test_audio_download_secure_filename(owner):
@@ -914,7 +1057,7 @@ def test_reprocess_transcription_non_owner_denied(owner, other):
     login(c, other)
     with use_storage(storage), capture_enqueue() as calls:
         resp = c.post(f"/recording/{rid}/reprocess_transcription", json={})
-    assert resp.status_code == 403
+    assert resp.status_code == 404
     assert calls == []
 
 
@@ -968,7 +1111,7 @@ def test_reprocess_summary_enqueues(owner):
     c = new_client()
     login(c, owner)
     # client (the OpenRouter client) must not be None for the endpoint to proceed.
-    with patch.object(rec_module, "client", object()), capture_enqueue() as calls:
+    with patch.object(rec_module, "client", object()), patch("src.services.llm.client", object()), capture_enqueue() as calls:
         resp = c.post(f"/recording/{rid}/reprocess_summary", json={})
     assert resp.status_code in (200, 202)
     assert len(calls) == 1
@@ -983,7 +1126,7 @@ def test_reprocess_summary_custom_prompt_append(owner):
 
     c = new_client()
     login(c, owner)
-    with patch.object(rec_module, "client", object()), capture_enqueue() as calls:
+    with patch.object(rec_module, "client", object()), patch("src.services.llm.client", object()), capture_enqueue() as calls:
         resp = c.post(f"/recording/{rid}/reprocess_summary",
                       json={"custom_prompt": "Be brief", "prompt_mode": "append"})
     assert resp.status_code in (200, 202)
@@ -999,7 +1142,7 @@ def test_reprocess_summary_no_transcription_400(owner):
 
     c = new_client()
     login(c, owner)
-    with patch.object(rec_module, "client", object()), capture_enqueue() as calls:
+    with patch.object(rec_module, "client", object()), patch("src.services.llm.client", object()), capture_enqueue() as calls:
         resp = c.post(f"/recording/{rid}/reprocess_summary", json={})
     assert resp.status_code == 400
     assert calls == []
@@ -1012,7 +1155,7 @@ def test_reprocess_summary_transcription_error_400(owner):
 
     c = new_client()
     login(c, owner)
-    with patch.object(rec_module, "client", object()), capture_enqueue() as calls:
+    with patch.object(rec_module, "client", object()), patch("src.services.llm.client", object()), capture_enqueue() as calls:
         resp = c.post(f"/recording/{rid}/reprocess_summary", json={})
     assert resp.status_code == 400
     assert calls == []
@@ -1025,9 +1168,9 @@ def test_reprocess_summary_non_owner_denied(owner, other):
 
     c = new_client()
     login(c, other)
-    with patch.object(rec_module, "client", object()), capture_enqueue() as calls:
+    with patch.object(rec_module, "client", object()), patch("src.services.llm.client", object()), capture_enqueue() as calls:
         resp = c.post(f"/recording/{rid}/reprocess_summary", json={})
-    assert resp.status_code == 403
+    assert resp.status_code == 404
     assert calls == []
 
 
@@ -1038,7 +1181,7 @@ def test_reprocess_summary_client_unavailable_503(owner):
 
     c = new_client()
     login(c, owner)
-    with patch.object(rec_module, "client", None), capture_enqueue() as calls:
+    with patch.object(rec_module, "client", None), patch("src.services.llm.client", None), capture_enqueue() as calls:
         resp = c.post(f"/recording/{rid}/reprocess_summary", json={})
     assert resp.status_code == 503
     assert calls == []
@@ -1056,7 +1199,7 @@ def test_generate_summary_enqueues(owner):
 
     c = new_client()
     login(c, owner)
-    with patch.object(rec_module, "client", object()), capture_enqueue() as calls:
+    with patch.object(rec_module, "client", object()), patch("src.services.llm.client", object()), capture_enqueue() as calls:
         resp = c.post(f"/recording/{rid}/generate_summary", json={})
     assert resp.status_code in (200, 202)
     assert len(calls) == 1
@@ -1070,9 +1213,9 @@ def test_generate_summary_non_owner_denied(owner, other):
 
     c = new_client()
     login(c, other)
-    with patch.object(rec_module, "client", object()), capture_enqueue() as calls:
+    with patch.object(rec_module, "client", object()), patch("src.services.llm.client", object()), capture_enqueue() as calls:
         resp = c.post(f"/recording/{rid}/generate_summary", json={})
-    assert resp.status_code == 403
+    assert resp.status_code == 404
     assert calls == []
 
 
@@ -1107,7 +1250,7 @@ def test_delete_recording_non_owner_denied(owner, other):
     login(c, other)
     with use_storage(storage):
         resp = c.delete(f"/recording/{rid}")
-    assert resp.status_code == 403
+    assert resp.status_code == 404
     assert storage.deleted == []
     with _db():
         assert db.session.get(Recording, rid) is not None
@@ -1209,12 +1352,12 @@ def test_bulk_delete_too_many_400(owner):
 def test_bulk_reprocess_summary_enqueues(owner):
     with _db():
         u = db.session.get(User, owner)
-        a = make_recording(u, status="COMPLETED", transcription="content a").id
-        b = make_recording(u, status="COMPLETED", transcription="content b").id
+        a = make_recording(u, status="COMPLETED", transcription="content of recording a").id
+        b = make_recording(u, status="COMPLETED", transcription="content of recording b").id
 
     c = new_client()
     login(c, owner)
-    with capture_enqueue() as calls:
+    with patch("src.services.llm.client", object()), capture_enqueue() as calls:
         resp = c.post("/api/recordings/bulk-reprocess",
                       json={"recording_ids": [a, b], "type": "summary"})
     assert resp.status_code == 200
@@ -1244,12 +1387,12 @@ def test_bulk_reprocess_skips_non_owned(owner, other):
     with _db():
         u = db.session.get(User, owner)
         o = db.session.get(User, other)
-        mine = make_recording(u, status="COMPLETED", transcription="x").id
-        theirs = make_recording(o, status="COMPLETED", transcription="y").id
+        mine = make_recording(u, status="COMPLETED", transcription="my own recording text").id
+        theirs = make_recording(o, status="COMPLETED", transcription="their recording text").id
 
     c = new_client()
     login(c, owner)
-    with capture_enqueue() as calls:
+    with patch("src.services.llm.client", object()), capture_enqueue() as calls:
         resp = c.post("/api/recordings/bulk-reprocess",
                       json={"recording_ids": [mine, theirs], "type": "summary"})
     assert resp.status_code == 200
@@ -1305,7 +1448,7 @@ def test_toggle_deletion_exempt_non_owner_denied(owner, other):
     c = new_client()
     login(c, other)
     resp = c.post(f"/api/recordings/{rid}/toggle_deletion_exempt")
-    assert resp.status_code == 403
+    assert resp.status_code == 404
 
 
 def test_process_chunks_non_owner_denied(owner, other):
@@ -1316,7 +1459,7 @@ def test_process_chunks_non_owner_denied(owner, other):
     c = new_client()
     login(c, other)
     resp = c.post(f"/api/recording/{rid}/process_chunks")
-    assert resp.status_code == 403
+    assert resp.status_code == 404
 
 
 # =========================================================================== #
@@ -1478,6 +1621,65 @@ def test_download_transcript_explicit_template_id(owner):
     body = resp.data.decode()
     assert "PICK Alice/Hello there" in body
     assert "DEF " not in body
+
+
+# --- /download/transcript : filename encoding ----------------------------- #
+
+def test_download_transcript_ascii_title_plain_filename(owner):
+    """An ASCII title is sent as a plain `filename=` parameter, unchanged."""
+    with _db():
+        u = db.session.get(User, owner)
+        rid = make_recording(u, transcription="body", title="Weekly sync").id
+
+    c = new_client()
+    login(c, owner)
+    resp = c.get(f"/recording/{rid}/download/transcript")
+    assert resp.status_code == 200
+    cd = resp.headers["Content-Disposition"]
+    assert 'filename="Weekly sync.txt"' in cd
+    assert "filename*" not in cd
+
+
+def test_download_transcript_unicode_title_uses_rfc5987(owner):
+    """A non-ASCII title survives in `filename*` next to an ASCII fallback.
+
+    Regression test: the filename used to be run through
+    `re.sub(r'[^a-zA-Z0-9_\\-\\.]', '_', filename)`, which turned a Cyrillic (or
+    Chinese, Greek, accented Latin) title into a row of underscores.
+    """
+    from urllib.parse import unquote
+
+    title = "Внутренний созвон"
+    with _db():
+        u = db.session.get(User, owner)
+        rid = make_recording(u, transcription="body", title=title).id
+
+    c = new_client()
+    login(c, owner)
+    resp = c.get(f"/recording/{rid}/download/transcript")
+    assert resp.status_code == 200
+    cd = resp.headers["Content-Disposition"]
+    # ASCII fallback for clients that ignore filename*.
+    assert f'filename="transcript-{rid}.txt"' in cd
+    # The real name rides along percent-encoded, and decodes back verbatim.
+    marker = "filename*=UTF-8''"
+    assert marker in cd
+    assert unquote(cd.split(marker, 1)[1]) == f"{title}.txt"
+    assert "___" not in cd
+
+
+def test_download_transcript_strips_path_illegal_characters(owner):
+    """Characters illegal in a filename are dropped, the rest is kept."""
+    with _db():
+        u = db.session.get(User, owner)
+        rid = make_recording(u, transcription="body", title='a/b:c"d|e?f*g').id
+
+    c = new_client()
+    login(c, owner)
+    resp = c.get(f"/recording/{rid}/download/transcript")
+    assert resp.status_code == 200
+    cd = resp.headers["Content-Disposition"]
+    assert 'filename="abcdefg.txt"' in cd
 
 
 # --- /download/summary : content-presence guard (line 303) ---------------- #

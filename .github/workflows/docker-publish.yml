@@ -19,6 +19,10 @@ env:
   # Use explicit image name instead of github.repository
   IMAGE_NAME: learnedmachine/speakr
 
+# Read-only by default; a job that needs more declares it
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -40,10 +44,9 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
-
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.11'
 
@@ -51,17 +54,77 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
       - name: Install dependencies
-        run: pip install -r requirements.txt pytest pytest-cov
+        run: pip install --require-hashes --no-deps -r requirements.lock && pip install pytest pytest-cov
 
       - name: Run full test suite (gates the release)
         env:
           # App tests run on an isolated SQLite DB (conftest.py);
           # test_postgres_migrations reads TEST_DATABASE_URI for real PG.
           TEST_DATABASE_URI: postgresql://speakr:speakr@localhost:5432/speakr_test
-        run: pytest tests/ -q --cov=src --cov-report=term-missing --cov-fail-under=54
+        run: pytest tests/ -q --cov=src --cov-report=term-missing --cov-fail-under=60
+
+  smoke-lite:
+    # Build the lite image for amd64 into the local daemon and open every page
+    # of it in a browser (tests/e2e/test_browser_smoke.py) before anything is
+    # pushed. The build jobs below wait for this job, so a broken image is
+    # never published. It shares the GitHub Actions build cache with them.
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          sudo docker image prune -af
+          df -h /
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build lite image (amd64, local)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: speakr:smoke
+          cache-from: type=gha,scope=lite-amd64
+          cache-to: type=gha,scope=lite-amd64,mode=max
+          build-args: |
+            PRODUCTION=1
+            LIGHTWEIGHT=1
+
+      - name: Start the image with the example settings
+        run: |
+          python3 tests/e2e/smoke_env.py > smoke.env
+          docker run -d --name speakr-smoke -p 8899:8899 --env-file smoke.env speakr:smoke
+          for i in $(seq 1 90); do curl -fs -o /dev/null http://127.0.0.1:8899/login && break; sleep 2; done
+          curl -fs -o /dev/null http://127.0.0.1:8899/login
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Install Playwright
+        run: |
+          pip install pytest playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Browser smoke test against the image
+        env:
+          SPEAKR_BROWSER_SMOKE: '1'
+          SPEAKR_BASE_URL: http://127.0.0.1:8899
+        run: pytest tests/e2e/test_browser_smoke.py -q -p no:cacheprovider --noconftest -rs
+
+      - name: Container log
+        if: always()
+        run: docker logs speakr-smoke 2>&1 | tail -n 200 || true
 
   build:
-    needs: test
+    needs: [test, smoke-lite]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -79,20 +142,17 @@ jobs:
           df -h /
 
       - name: Checkout repository
-        uses: actions/checkout@v5
-
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Set up QEMU for multi-platform builds
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       # Set up Docker Buildx
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       # Login to Docker Hub
       - name: Log into registry ${{ env.REGISTRY }}
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -101,7 +161,7 @@ jobs:
       # Extract metadata (tags, labels) for Docker
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -112,20 +172,22 @@ jobs:
       # Build and push full Docker image
       - name: Build and push Docker image
         id: build-and-push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # No Actions cache for the full image. Its PyTorch layers for two
+          # architectures alone fill the 10 GB cache, and a layer evicted
+          # mid-build failed the v0.10.10 release build ("cache entry no longer
+          # exists"). It is built only for releases.
           build-args: |
             PRODUCTION=1
 
   build-lite:
-    needs: test
+    needs: [test, smoke-lite]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -141,20 +203,17 @@ jobs:
           df -h /
 
       - name: Checkout repository
-        uses: actions/checkout@v5
-
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Set up QEMU for multi-platform builds
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       # Set up Docker Buildx
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       # Login to Docker Hub
       - name: Log into registry ${{ env.REGISTRY }}
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -163,7 +222,7 @@ jobs:
       # Extract metadata for lite image
       - name: Extract Docker metadata (lite)
         id: meta-lite
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           # Never tag the lite image as `latest`; `latest` is the full image,
@@ -180,15 +239,17 @@ jobs:
       # Build and push lightweight Docker image (no PyTorch/sentence-transformers)
       - name: Build and push lite Docker image
         id: build-and-push-lite
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta-lite.outputs.tags }}
           labels: ${{ steps.meta-lite.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: |
+            type=gha,scope=lite
+            type=gha,scope=lite-amd64
+          cache-to: type=gha,scope=lite,mode=max
           build-args: |
             PRODUCTION=1
             LIGHTWEIGHT=1

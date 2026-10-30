@@ -40,6 +40,8 @@ Restart Speakr after updating environment variables.
 - `email` (recommended): used for matching and domain allowlist.
 - `preferred_username` or `name`: used for username/full name if provided.
 
+The claims may live in the ID token or at the UserInfo endpoint; both work. When the ID token carries only the bare claims (`sub`, `iss`, `aud`), as Keycloak, Azure AD, and LemonLDAP::NG do by default, Speakr fetches the UserInfo endpoint automatically and merges its claims, verifying the endpoint's `sub` matches the ID token's. No mapper configuration is needed on the IdP side to embed claims in the ID token.
+
 ## Keycloak quick start
 
 1. In Keycloak, create a new client (e.g., `speakr`) with:
@@ -88,6 +90,10 @@ Restart Speakr after updating environment variables.
 - If `SSO_AUTO_REGISTER=false`, only existing users with a linked SSO subject can sign in.
 - Email domain allowlist is enforced only when an email is present.
 
+## Staying signed in
+
+A **Remember me** option is shown below the SSO button on the sign-in page. When it is ticked, the sign-in lasts `REMEMBER_COOKIE_DAYS` days (default 30); otherwise it ends when the browser is closed. Before v0.10.15, every SSO sign-in was remembered for a year.
+
 ## Disabling password login
 
 Set `SSO_DISABLE_PASSWORD_LOGIN=true` to enforce SSO-only authentication for regular users. When enabled:
@@ -104,7 +110,11 @@ When a user logs in via SSO with an email that matches an existing Speakr accoun
 
 For self-hosted deployments where you control both Speakr and the IdP, this is generally not a concern. If you're using an IdP where users can set unverified email addresses, be aware that this could allow account linking without email ownership verification.
 
-To close this off, set `SSO_REQUIRE_VERIFIED_EMAIL=true`. When enabled, an SSO login whose `email_verified` claim is not true is refused before the email is used to link to (or provision) a local account, so a malicious or misconfigured IdP cannot take over an account by asserting its address. It accepts the claim as either a boolean or the string `"true"`. Users already linked by SSO subject are unaffected and keep signing in even if the IdP omits the claim. It defaults to `false` for backwards compatibility — only enable it once you've confirmed your IdP reliably sends `email_verified`, since IdPs that omit it will otherwise have all email-bearing logins rejected. You can also use `SSO_ALLOWED_DOMAINS` to restrict which email domains can authenticate.
+This is closed off by default: `SSO_REQUIRE_VERIFIED_EMAIL` defaults to `true`. An SSO login whose `email_verified` claim is not true is refused before the email is used to link to (or provision) a local account, so a malicious or misconfigured IdP cannot take over an account by asserting its address. The claim is accepted as either a boolean or the string `"true"`. Users already linked by SSO subject are unaffected and keep signing in even if the IdP omits the claim.
+
+If your IdP does not send an `email_verified` claim and you trust it, set `SSO_REQUIRE_VERIFIED_EMAIL=false` to restore the previous behavior; otherwise all email-bearing logins from that IdP are rejected. When you opt out this way, a warning is logged at startup so the relaxed setting stays visible. You can also use `SSO_ALLOWED_DOMAINS` to restrict which email domains can authenticate.
+
+> **Changed in v0.10.2-alpha:** `SSO_REQUIRE_VERIFIED_EMAIL` now defaults to `true` (previously `false`). Deployments whose IdP does not send `email_verified` must set it to `false` to keep the old behavior.
 
 ## Linking existing users
 

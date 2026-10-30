@@ -3,6 +3,18 @@
  * Handles public and internal sharing of recordings
  */
 
+import {
+    MAX_SHARE_SELECTION,
+    availableSearchResults,
+    canGrantPermission,
+    changedPermissions,
+    isSearchableQuery,
+    summarizeBatchResults,
+    toggleSelection,
+} from '../utils/share-picker.js';
+
+const { ref } = Vue;
+
 export function useSharing(state, utils) {
     const {
         showShareModal, showSharesListModal, showShareDeleteModal,
@@ -12,17 +24,34 @@ export function useSharing(state, utils) {
         internalShareUserSearch, internalShareSearchResults,
         internalShareRecording, internalSharePermissions, internalShareMaxPermissions,
         recordingInternalShares, isLoadingInternalShares,
-        isSearchingUsers, allUsers, isLoadingAllUsers,
+        isSearchingUsers,
         enableInternalSharing, showUsernamesInUI
     } = state;
 
     const { showToast, setGlobalError } = utils;
+    const t = (key, params = {}) => (utils.t ? utils.t(key, params) : key);
 
     let userSearchTimeout = null;
+    // Each search gets a number, so a slow older response cannot replace a newer one
+    let userSearchSeq = 0;
+
+    // People picked in the share modal, shared with together on Add (D#519)
+    const selectedShareUsers = ref([]);
+    const isSharingSelected = ref(false);
+    const shareSelectionLimited = ref(false);
+    const maxShareSelection = MAX_SHARE_SELECTION;
+
+    // Shared Transcripts list (#416): what the user shared (public links,
+    // people and groups) and what others shared with them.
+    const sharesTab = ref('by_me');
+    const sharesByMe = ref([]);
+    const sharesWithMe = ref([]);
+    const sharesPublicEnabled = ref(true);
+    const sharesInternalEnabled = ref(false);
 
     // Helper function to format share dates
     const formatShareDate = (dateString) => {
-        if (!dateString) return 'Unknown date';
+        if (!dateString) return t('sharing.unknownDate');
 
         try {
             // Backend sends naive UTC (isoformat with no zone). new Date() parses
@@ -39,21 +68,25 @@ export function useSharing(state, utils) {
             const diffMs = now - date;
             const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
 
+            // The interface locale picks the words and the 12/24-hour clock (#480).
+            const locale = window.i18n?.getIntlLocale?.();
+            const time = () => date.toLocaleTimeString(locale, { hour: 'numeric', minute: '2-digit' });
+
             // If today
             if (diffDays === 0) {
-                return 'Today at ' + date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+                return t('sidebar.today') + ', ' + time();
             }
             // If yesterday
             else if (diffDays === 1) {
-                return 'Yesterday at ' + date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+                return t('sidebar.yesterday') + ', ' + time();
             }
             // If within last week
             else if (diffDays < 7) {
-                return date.toLocaleDateString('en-US', { weekday: 'long', hour: 'numeric', minute: '2-digit', hour12: true });
+                return date.toLocaleDateString(locale, { weekday: 'long', hour: 'numeric', minute: '2-digit' });
             }
             // Otherwise show full date
             else {
-                return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true });
+                return date.toLocaleDateString(locale, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' });
             }
         } catch (e) {
             console.error('Error formatting date:', e);
@@ -133,7 +166,7 @@ export function useSharing(state, utils) {
                 })
             });
             const data = await response.json();
-            if (!response.ok) throw new Error(data.error || 'Failed to create share link');
+            if (!response.ok) throw new Error(data.error || t('sharing.createLinkFailed'));
 
             generatedShareLink.value = data.share_url;
             existingShareDetected.value = data.existing && !forceNew;
@@ -155,12 +188,12 @@ export function useSharing(state, utils) {
             }
 
             if (data.existing && !forceNew) {
-                showToast('Using existing share link', 'fa-link');
+                showToast(t('sharing.usingExistingLink'), 'fa-link');
             } else {
-                showToast('Share link created successfully!', 'fa-check-circle');
+                showToast(t('sharing.linkCreated'), 'fa-check-circle');
             }
         } catch (error) {
-            setGlobalError(`Failed to create share link: ${error.message}`);
+            setGlobalError(t('sharing.createLinkFailedWithError', { error: error.message }));
         }
     };
 
@@ -176,7 +209,7 @@ export function useSharing(state, utils) {
         try {
             const response = await fetch(`/api/share/${shareId}`, { method: 'DELETE' });
             const data = await response.json();
-            if (!response.ok) throw new Error(data.error || 'Failed to delete share');
+            if (!response.ok) throw new Error(data.error || t('sharing.deleteLinkFailed'));
 
             // Remove from the shares list (both modals use different arrays)
             recordingPublicShares.value = recordingPublicShares.value.filter(s => s.id !== shareId);
@@ -185,33 +218,33 @@ export function useSharing(state, utils) {
             // Update the recording's share count in the UI
             await refreshRecordingShareCounts();
 
-            showToast('Share link deleted successfully.', 'fa-check-circle');
+            showToast(t('sharing.linkDeleted'), 'fa-check-circle');
             showShareDeleteModal.value = false;
             shareToDelete.value = null;
         } catch (error) {
-            setGlobalError(`Failed to delete share: ${error.message}`);
+            setGlobalError(t('sharing.deleteLinkFailedWithError', { error: error.message }));
         }
     };
 
     const copyPublicShareLink = (shareUrl) => {
         navigator.clipboard.writeText(shareUrl).then(() => {
-            showToast('Share link copied to clipboard!', 'fa-check-circle');
+            showToast(t('sharing.linkCopied'), 'fa-check-circle');
         }).catch(() => {
-            setGlobalError('Failed to copy link to clipboard');
+            setGlobalError(t('sharing.copyLinkFailed'));
         });
     };
 
     const copyPublicShareLinkWithFeedback = (shareUrl, shareId) => {
         navigator.clipboard.writeText(shareUrl).then(() => {
             copiedShareId.value = shareId;
-            showToast('Share link copied to clipboard!', 'fa-check-circle');
+            showToast(t('sharing.linkCopied'), 'fa-check-circle');
 
             // Reset after delay
             setTimeout(() => {
                 copiedShareId.value = null;
             }, 1500);
         }).catch(() => {
-            setGlobalError('Failed to copy link to clipboard');
+            setGlobalError(t('sharing.copyLinkFailed'));
         });
     };
 
@@ -259,7 +292,7 @@ export function useSharing(state, utils) {
     const copyShareLink = () => {
         if (!generatedShareLink.value) return;
         navigator.clipboard.writeText(generatedShareLink.value).then(() => {
-            showToast('Share link copied to clipboard!');
+            showToast(t('sharing.linkCopied'));
         });
     };
 
@@ -272,7 +305,7 @@ export function useSharing(state, utils) {
 
         navigator.clipboard.writeText(input.value).then(() => {
             copiedShareId.value = shareId;
-            showToast('Share link copied to clipboard!', 'fa-check');
+            showToast(t('sharing.linkCopied'), 'fa-check');
 
             // Apply success state
             button.style.transition = 'background-color 0.2s ease';
@@ -299,12 +332,18 @@ export function useSharing(state, utils) {
         isLoadingShares.value = true;
         showSharesListModal.value = true;
         try {
-            const response = await fetch('/api/shares');
+            const response = await fetch('/api/shares/overview');
             const data = await response.json();
-            if (!response.ok) throw new Error(data.error || 'Failed to load shared items');
-            userShares.value = data;
+            if (!response.ok) throw new Error(data.error || t('sharing.loadSharedItemsFailed'));
+            userShares.value = data.public_links || [];
+            sharesByMe.value = (data.shared_by_me || []).map(r => ({
+                ...r, recipients: r.recipients.map(p => ({ ...p, confirming: false })),
+            }));
+            sharesWithMe.value = data.shared_with_me || [];
+            sharesPublicEnabled.value = data.public_sharing_enabled !== false;
+            sharesInternalEnabled.value = !!data.internal_sharing_enabled;
         } catch (error) {
-            setGlobalError(`Failed to load shared items: ${error.message}`);
+            setGlobalError(t('sharing.loadSharedItemsFailedWithError', { error: error.message }));
         } finally {
             isLoadingShares.value = false;
         }
@@ -313,6 +352,32 @@ export function useSharing(state, utils) {
     const closeSharesList = () => {
         showSharesListModal.value = false;
         userShares.value = [];
+        sharesByMe.value = [];
+        sharesWithMe.value = [];
+    };
+
+    // Revoke one person's access from the list. The first click asks, the
+    // second revokes; a group share follows its tag or folder and has no
+    // button here.
+    const revokeShareFromList = async (entry, recipient) => {
+        if (!recipient.confirming) {
+            recipient.confirming = true;
+            return;
+        }
+        try {
+            const response = await fetch(`/api/internal-shares/${recipient.share_id}`, { method: 'DELETE' });
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(data.error || t('sharing.revokeFailed'));
+            entry.recipients = entry.recipients.filter(p => p.share_id !== recipient.share_id);
+            if (!entry.recipients.length) {
+                sharesByMe.value = sharesByMe.value.filter(r => r !== entry);
+            }
+            showToast(t('sharedTranscripts.accessRevoked'), 'fa-user-times');
+            await refreshRecordingShareCounts();
+        } catch (error) {
+            recipient.confirming = false;
+            setGlobalError(t('sharing.revokeFailedWithError', { error: error.message }));
+        }
     };
 
     const updateShare = async (share) => {
@@ -326,10 +391,10 @@ export function useSharing(state, utils) {
                 })
             });
             const data = await response.json();
-            if (!response.ok) throw new Error(data.error || 'Failed to update share');
-            showToast('Share permissions updated.', 'fa-check-circle');
+            if (!response.ok) throw new Error(data.error || t('sharing.updateFailed'));
+            showToast(t('sharing.permissionsUpdated'), 'fa-check-circle');
         } catch (error) {
-            setGlobalError(`Failed to update share: ${error.message}`);
+            setGlobalError(t('sharing.updateFailedWithError', { error: error.message }));
         }
     };
 
@@ -347,82 +412,159 @@ export function useSharing(state, utils) {
     // Internal Sharing
     // =========================================
 
-    const loadAllUsers = async () => {
-        if (!showUsernamesInUI.value) return;
-
-        isLoadingAllUsers.value = true;
-        try {
-            const response = await fetch('/api/users/search?q=');
-            if (!response.ok) {
-                if (response.status === 403) {
-                    throw new Error('Internal sharing is not enabled');
-                }
-                throw new Error('Failed to load users');
-            }
-            const data = await response.json();
-            allUsers.value = data;
-        } catch (error) {
-            setGlobalError(`Failed to load users: ${error.message}`);
-            allUsers.value = [];
-        } finally {
-            isLoadingAllUsers.value = false;
-        }
-    };
-
-    const searchInternalShareUsers = async () => {
+    // The share modal searches the server once at least two characters are
+    // typed and never loads every account (D#519). With usernames hidden, the
+    // exact-username field uses shareWithUsername instead.
+    const searchInternalShareUsers = () => {
         const query = internalShareUserSearch.value.trim();
-
-        // If SHOW_USERNAMES_IN_UI is enabled, filter allUsers locally
-        if (showUsernamesInUI.value) {
-            // Get list of user IDs that already have access
-            const sharedUserIds = new Set(recordingInternalShares.value.map(share => share.user_id));
-
-            // Filter out already-shared users
-            const availableUsers = allUsers.value.filter(user => !sharedUserIds.has(user.id));
-
-            if (query.length === 0) {
-                internalShareSearchResults.value = availableUsers;
-            } else {
-                internalShareSearchResults.value = availableUsers.filter(user =>
-                    user.username.toLowerCase().includes(query.toLowerCase()) ||
-                    (user.email && user.email.toLowerCase().includes(query.toLowerCase()))
-                );
-            }
-            return;
-        }
-
-        // Otherwise, use server-side search
-        if (query.length < 2) {
-            internalShareSearchResults.value = [];
-            return;
-        }
-
         clearTimeout(userSearchTimeout);
+        const seq = ++userSearchSeq;
+
+        if (!isSearchableQuery(query)) {
+            internalShareSearchResults.value = [];
+            isSearchingUsers.value = false;
+            return;
+        }
+
         userSearchTimeout = setTimeout(async () => {
             isSearchingUsers.value = true;
             try {
                 const response = await fetch(`/api/users/search?q=${encodeURIComponent(query)}`);
                 if (!response.ok) {
                     if (response.status === 403) {
-                        throw new Error('Internal sharing is not enabled');
+                        throw new Error(t('sharing.internalSharingDisabled'));
                     }
-                    throw new Error('Failed to search users');
+                    throw new Error(t('sharing.searchUsersFailed'));
                 }
                 const data = await response.json();
-                internalShareSearchResults.value = data;
+                if (seq !== userSearchSeq) return;
+                internalShareSearchResults.value = availableSearchResults(
+                    data, recordingInternalShares.value, selectedShareUsers.value
+                );
             } catch (error) {
-                setGlobalError(`Failed to search users: ${error.message}`);
+                if (seq !== userSearchSeq) return;
+                setGlobalError(t('sharing.searchUsersFailedWithError', { error: error.message }));
                 internalShareSearchResults.value = [];
             } finally {
-                isSearchingUsers.value = false;
+                if (seq === userSearchSeq) isSearchingUsers.value = false;
             }
         }, 300);
+    };
+
+    const isShareSelected = (user) => selectedShareUsers.value.some(item => item.id === user.id);
+
+    // A click on a search result selects or deselects that person. Nothing is
+    // shared until Add.
+    const toggleShareSelection = (user) => {
+        const result = toggleSelection(selectedShareUsers.value, user);
+        selectedShareUsers.value = result.selected;
+        shareSelectionLimited.value = result.limited;
+    };
+
+    const removeShareSelection = (user) => {
+        selectedShareUsers.value = selectedShareUsers.value.filter(item => item.id !== user.id);
+        shareSelectionLimited.value = false;
+    };
+
+    // Share with everyone selected, with the permission checkboxes as they are.
+    // The checkboxes keep their state for the next Add.
+    const shareWithSelected = async () => {
+        if (!internalShareRecording.value || !selectedShareUsers.value.length || isSharingSelected.value) return;
+
+        isSharingSelected.value = true;
+        try {
+            const response = await fetch(`/api/recordings/${internalShareRecording.value.id}/share-internal`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    user_ids: selectedShareUsers.value.map(user => user.id),
+                    can_edit: Boolean(internalSharePermissions.value.can_edit),
+                    can_reshare: Boolean(internalSharePermissions.value.can_reshare)
+                })
+            });
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(data.error || t('sharing.shareRecordingFailed'));
+            }
+
+            const summary = summarizeBatchResults(data.results);
+            const keep = new Set(summary.keepIds);
+            selectedShareUsers.value = selectedShareUsers.value.filter(user => keep.has(user.id));
+            shareSelectionLimited.value = false;
+            if (!selectedShareUsers.value.length) {
+                internalShareUserSearch.value = '';
+                internalShareSearchResults.value = [];
+            }
+
+            const parts = [];
+            if (summary.shared) parts.push(t('sharing.sharedWithCount', { count: summary.shared }));
+            if (summary.alreadyShared) parts.push(t('sharing.alreadySharedCount', { count: summary.alreadyShared }));
+            if (summary.shared || summary.alreadyShared) {
+                showToast(parts.join(' '), 'fa-share-alt');
+            }
+            if (summary.failed) {
+                setGlobalError(t('sharing.notSharedCount', { count: summary.failed }));
+            }
+
+            if (summary.shared) {
+                await reloadInternalShares();
+                await refreshRecordingShareCounts();
+            }
+            searchInternalShareUsers();
+        } catch (error) {
+            setGlobalError(t('sharing.shareRecordingFailedWithError', { error: error.message }));
+        } finally {
+            isSharingSelected.value = false;
+        }
+    };
+
+    // Changing the permissions of an existing manual share (D#517). The edited
+    // copy lives on the row until it is saved or cancelled.
+    const startPermissionEdit = (item) => {
+        item.permissionDraft = { can_edit: Boolean(item.can_edit), can_reshare: Boolean(item.can_reshare) };
+        item.savingPermissions = false;
+    };
+
+    const cancelPermissionEdit = (item) => {
+        item.permissionDraft = null;
+        item.savingPermissions = false;
+    };
+
+    const savePermissionEdit = async (item, shareId) => {
+        if (!item.permissionDraft || item.savingPermissions) return;
+        const changes = changedPermissions(item, item.permissionDraft);
+        if (!changes) {
+            cancelPermissionEdit(item);
+            return;
+        }
+
+        item.savingPermissions = true;
+        try {
+            const response = await fetch(`/api/internal-shares/${shareId}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(changes)
+            });
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(data.error || t('sharing.updateFailed'));
+            }
+            item.can_edit = Boolean(data.share.can_edit);
+            item.can_reshare = Boolean(data.share.can_reshare);
+            cancelPermissionEdit(item);
+            showToast(t('sharing.permissionsChanged'), 'fa-check-circle');
+        } catch (error) {
+            item.savingPermissions = false;
+            setGlobalError(t('sharing.changePermissionsFailedWithError', { error: error.message }));
+        }
     };
 
     const openUnifiedShareModal = async (recording) => {
         internalShareRecording.value = recording;
         internalShareUserSearch.value = '';
         internalShareSearchResults.value = [];
+        selectedShareUsers.value = [];
+        shareSelectionLimited.value = false;
         internalSharePermissions.value = { can_edit: false, can_reshare: false };
         recordingPublicShares.value = [];
         shareOptions.share_summary = true;
@@ -472,23 +614,17 @@ export function useSharing(state, utils) {
             const response = await fetch(`/api/recordings/${recording.id}/shares-internal`);
             if (!response.ok) {
                 if (response.status === 403) {
-                    throw new Error('Internal sharing is not enabled');
+                    throw new Error(t('sharing.internalSharingDisabled'));
                 }
-                throw new Error('Failed to load shares');
+                throw new Error(t('sharing.loadSharesFailed'));
             }
             const data = await response.json();
             recordingInternalShares.value = data.shares || [];
         } catch (error) {
-            setGlobalError(`Failed to load shares: ${error.message}`);
+            setGlobalError(t('sharing.loadSharesFailedWithError', { error: error.message }));
             recordingInternalShares.value = [];
         } finally {
             isLoadingInternalShares.value = false;
-        }
-
-        // If SHOW_USERNAMES_IN_UI is enabled, load all users
-        if (showUsernamesInUI.value) {
-            await loadAllUsers();
-            internalShareSearchResults.value = allUsers.value;
         }
     };
 
@@ -499,7 +635,10 @@ export function useSharing(state, utils) {
         internalShareSearchResults.value = [];
         recordingInternalShares.value = [];
         recordingPublicShares.value = [];
-        allUsers.value = [];
+        selectedShareUsers.value = [];
+        shareSelectionLimited.value = false;
+        clearTimeout(userSearchTimeout);
+        userSearchSeq += 1;
     };
 
     // Legacy function names for backward compatibility
@@ -515,12 +654,12 @@ export function useSharing(state, utils) {
         try {
             const response = await fetch(`/api/recordings/${internalShareRecording.value.id}/shares-internal`);
             if (!response.ok) {
-                throw new Error('Failed to load shares');
+                throw new Error(t('sharing.loadSharesFailed'));
             }
             const data = await response.json();
             recordingInternalShares.value = data.shares || [];
         } catch (error) {
-            setGlobalError(`Failed to reload shares: ${error.message}`);
+            setGlobalError(t('sharing.reloadSharesFailedWithError', { error: error.message }));
         } finally {
             isLoadingInternalShares.value = false;
         }
@@ -531,7 +670,7 @@ export function useSharing(state, utils) {
 
         const username = internalShareUserSearch.value.trim();
         if (!username) {
-            setGlobalError('Please enter a username');
+            setGlobalError(t('sharing.enterUsername'));
             return;
         }
 
@@ -541,15 +680,15 @@ export function useSharing(state, utils) {
             const searchResponse = await fetch(`/api/users/search?q=${encodeURIComponent(username)}`);
             if (!searchResponse.ok) {
                 if (searchResponse.status === 403) {
-                    throw new Error('Internal sharing is not enabled');
+                    throw new Error(t('sharing.internalSharingDisabled'));
                 }
-                throw new Error('Failed to find user');
+                throw new Error(t('sharing.findUserFailed'));
             }
 
             const users = await searchResponse.json();
 
             if (users.length === 0) {
-                setGlobalError(`User "${username}" not found`);
+                setGlobalError(t('sharing.userNotFound', { username }));
                 return;
             }
 
@@ -560,7 +699,7 @@ export function useSharing(state, utils) {
             // Clear input on success
             internalShareUserSearch.value = '';
         } catch (error) {
-            setGlobalError(error.message || 'Failed to share with user');
+            setGlobalError(error.message || t('sharing.shareWithUserFailed'));
         } finally {
             isSearchingUsers.value = false;
         }
@@ -582,14 +721,11 @@ export function useSharing(state, utils) {
 
             const data = await response.json();
             if (!response.ok) {
-                throw new Error(data.error || 'Failed to share recording');
+                throw new Error(data.error || t('sharing.shareRecordingFailed'));
             }
 
-            const displayName = showUsernamesInUI.value ? username : `User #${userId}`;
-            showToast(`Recording shared with ${displayName}`, 'fa-share-alt');
-
-            // Reset permissions for next share
-            internalSharePermissions.value = { can_edit: false, can_reshare: false };
+            const displayName = showUsernamesInUI.value ? username : t('sharing.userNumber', { id: userId });
+            showToast(t('sharing.sharedWithUser', { name: displayName }), 'fa-share-alt');
 
             // Reload shares to show the new share in the list
             await reloadInternalShares();
@@ -597,7 +733,7 @@ export function useSharing(state, utils) {
             // Update the recording's share count in the UI
             await refreshRecordingShareCounts();
         } catch (error) {
-            setGlobalError(`Failed to share recording: ${error.message}`);
+            setGlobalError(t('sharing.shareRecordingFailedWithError', { error: error.message }));
         }
     };
 
@@ -611,17 +747,17 @@ export function useSharing(state, utils) {
 
             if (!response.ok) {
                 const data = await response.json();
-                throw new Error(data.error || 'Failed to revoke share');
+                throw new Error(data.error || t('sharing.revokeFailed'));
             }
 
             recordingInternalShares.value = recordingInternalShares.value.filter(s => s.id !== shareId);
-            const displayName = showUsernamesInUI.value ? username : 'User';
-            showToast(`Access revoked for ${displayName}`, 'fa-user-times');
+            const displayName = showUsernamesInUI.value ? username : t('sharing.userGeneric');
+            showToast(t('sharing.accessRevokedFor', { name: displayName }), 'fa-user-times');
 
             // Update the recording's share count in the UI
             await refreshRecordingShareCounts();
         } catch (error) {
-            setGlobalError(`Failed to revoke share: ${error.message}`);
+            setGlobalError(t('sharing.revokeFailedWithError', { error: error.message }));
         }
     };
 
@@ -645,6 +781,12 @@ export function useSharing(state, utils) {
         // Shares list
         openSharesList,
         closeSharesList,
+        sharesTab,
+        sharesByMe,
+        sharesWithMe,
+        sharesPublicEnabled,
+        sharesInternalEnabled,
+        revokeShareFromList,
         updateShare,
         confirmDeleteShare,
         cancelDeleteShare,
@@ -652,8 +794,19 @@ export function useSharing(state, utils) {
         copiedShareId,
 
         // Internal sharing
-        loadAllUsers,
         searchInternalShareUsers,
+        selectedShareUsers,
+        isSharingSelected,
+        shareSelectionLimited,
+        maxShareSelection,
+        isShareSelected,
+        toggleShareSelection,
+        removeShareSelection,
+        shareWithSelected,
+        canGrantPermission,
+        startPermissionEdit,
+        cancelPermissionEdit,
+        savePermissionEdit,
         openUnifiedShareModal,
         closeUnifiedShareModal,
         openInternalShareModal,

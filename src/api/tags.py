@@ -20,6 +20,7 @@ from sqlalchemy.exc import IntegrityError
 from src.database import db
 from src.models import *
 from src.utils import *
+from src.utils.localization import api_error
 
 # Create blueprint
 tags_bp = Blueprint('tags', __name__)
@@ -31,6 +32,28 @@ USERS_CAN_DELETE = os.environ.get('USERS_CAN_DELETE', 'true').lower() == 'true'
 ENABLE_INTERNAL_SHARING = os.environ.get('ENABLE_INTERNAL_SHARING', 'false').lower() == 'true'
 USE_ASR_ENDPOINT = os.environ.get('USE_ASR_ENDPOINT', 'false').lower() == 'true'
 ENABLE_AUTO_PROCESSING = os.environ.get('ENABLE_AUTO_PROCESSING', 'false').lower() == 'true'
+
+# Tag colors are stored verbatim and interpolated into HTML style attributes on
+# the account page. Restrict them to strict hex values so a value cannot break
+# out of the attribute and inject an event handler (GHSA-pp32-69wg-97h3). The
+# UI color picker only ever sends hex; a direct JSON request could otherwise
+# supply arbitrary text.
+_HEX_COLOR_RE = re.compile(r'^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$')
+_DEFAULT_TAG_COLOR = '#3B82F6'
+
+
+def _validate_tag_color(color):
+    """Validate an incoming tag color.
+
+    Returns (ok, value). When ok is False, value is None and the caller answers
+    with the invalid_tag_color error. A missing (None) color is allowed and
+    normalized to the default by the caller.
+    """
+    if color is None:
+        return True, None
+    if isinstance(color, str) and _HEX_COLOR_RE.match(color.strip()):
+        return True, color.strip()
+    return False, None
 
 
 def _sanitize_folder_name(name):
@@ -117,7 +140,9 @@ def init_tags_helpers(**kwargs):
 def get_tags():
     """Get all tags for the current user, including group tags they have access to."""
     # Get user's personal tags
-    user_tags = Tag.query.filter_by(user_id=current_user.id, group_id=None).order_by(Tag.name).all()
+    from src.services.recording_list import tag_dicts, tag_load_options
+    user_tags = (Tag.query.filter_by(user_id=current_user.id, group_id=None)
+                 .options(*tag_load_options()).order_by(Tag.name).all())
 
     # Get user's team memberships with roles
     memberships = GroupMembership.query.filter_by(user_id=current_user.id).all()
@@ -127,21 +152,22 @@ def get_tags():
     # Get group tags for all teams the user is a member of
     team_tags = []
     if team_ids:
-        team_tags = Tag.query.filter(Tag.group_id.in_(team_ids)).order_by(Tag.name).all()
+        team_tags = Tag.query.filter(Tag.group_id.in_(team_ids)).options(*tag_load_options()).order_by(Tag.name).all()
 
     # Build response with edit permissions
     result = []
+    dicts = dict(zip([t.id for t in user_tags + team_tags], tag_dicts(user_tags + team_tags)))
 
     # Personal tags - user can always edit their own
     for tag in user_tags:
-        tag_dict = tag.to_dict()
+        tag_dict = dicts[tag.id]
         tag_dict['can_edit'] = True
         tag_dict['user_role'] = None
         result.append(tag_dict)
 
     # Group tags - only admins can edit
     for tag in team_tags:
-        tag_dict = tag.to_dict()
+        tag_dict = dicts[tag.id]
         user_role = team_roles.get(tag.group_id, 'member')
         tag_dict['can_edit'] = (user_role == 'admin')
         tag_dict['user_role'] = user_role
@@ -158,7 +184,11 @@ def create_tag():
     data = request.get_json()
 
     if not data or not data.get('name'):
-        return jsonify({'error': 'Tag name is required'}), 400
+        return jsonify(api_error('tag_name_required')), 400
+
+    color_ok, color_val = _validate_tag_color(data.get('color'))
+    if not color_ok:
+        return jsonify(api_error('invalid_tag_color')), 400
 
     group_id = data.get('group_id')
 
@@ -170,17 +200,17 @@ def create_tag():
         ).first()
 
         if not membership or membership.role != 'admin':
-            return jsonify({'error': 'Only group admins can create group tags'}), 403
+            return jsonify(api_error('group_tag_create_admin_only')), 403
 
         # Check if group tag with same name already exists for this group
         existing_tag = Tag.query.filter_by(name=data['name'], group_id=group_id).first()
         if existing_tag:
-            return jsonify({'error': 'A tag with this name already exists for this group'}), 400
+            return jsonify(api_error('group_tag_name_exists_for_group')), 400
     else:
         # Check if personal tag with same name already exists for this user
         existing_tag = Tag.query.filter_by(name=data['name'], user_id=current_user.id, group_id=None).first()
         if existing_tag:
-            return jsonify({'error': 'Tag with this name already exists'}), 400
+            return jsonify(api_error('tag_name_exists')), 400
 
     # Handle retention_days: -1 means protected from deletion
     retention_days = data.get('retention_days')
@@ -196,7 +226,7 @@ def create_tag():
         from src.models import NamingTemplate
         template = NamingTemplate.query.filter_by(id=naming_template_id, user_id=current_user.id).first()
         if not template:
-            return jsonify({'error': 'Naming template not found'}), 404
+            return jsonify(api_error('naming_template_not_found')), 404
 
     # Validate export_template_id if provided
     export_template_id = data.get('export_template_id')
@@ -204,24 +234,25 @@ def create_tag():
         from src.models import ExportTemplate
         template = ExportTemplate.query.filter_by(id=export_template_id, user_id=current_user.id).first()
         if not template:
-            return jsonify({'error': 'Export template not found'}), 404
+            return jsonify(api_error('export_template_not_found')), 404
 
     # Handle auto-process
     is_auto_process = data.get('is_auto_process', False)
     auto_process_folder_name = None
     if is_auto_process:
         if not ENABLE_AUTO_PROCESSING:
-            return jsonify({'error': 'Auto-processing is not enabled'}), 400
+            return jsonify(api_error('auto_processing_disabled')), 400
         if group_id:
-            return jsonify({'error': 'Watch folders are not available for group tags'}), 400
+            return jsonify(api_error('watch_folder_group_tag_unsupported')), 400
         auto_process_folder_name = _sanitize_folder_name(data['name'])
 
     tag = Tag(
         name=data['name'],
         user_id=current_user.id,
         group_id=group_id,
-        color=data.get('color', '#3B82F6'),
+        color=color_val or _DEFAULT_TAG_COLOR,
         custom_prompt=data.get('custom_prompt'),
+        title_prompt=data.get('title_prompt'),
         default_language=data.get('default_language'),
         default_min_speakers=data.get('default_min_speakers'),
         default_max_speakers=data.get('default_max_speakers'),
@@ -245,7 +276,7 @@ def create_tag():
     except IntegrityError as e:
         db.session.rollback()
         current_app.logger.error(f"Tag creation failed due to integrity constraint: {str(e)}")
-        return jsonify({'error': 'A tag with this name already exists'}), 400
+        return jsonify(api_error('tag_name_exists')), 400
 
     response = tag.to_dict()
 
@@ -269,7 +300,7 @@ def update_tag(tag_id):
     """Update a tag."""
     tag = db.session.get(Tag, tag_id)
     if not tag:
-        return jsonify({'error': 'Tag not found'}), 404
+        return jsonify(api_error('tag_not_found')), 404
 
     # Check permissions
     if tag.group_id:
@@ -280,11 +311,11 @@ def update_tag(tag_id):
         ).first()
 
         if not membership or membership.role != 'admin':
-            return jsonify({'error': 'Only group admins can edit group tags'}), 403
+            return jsonify(api_error('group_tag_edit_admin_only')), 403
     else:
         # Personal tag - must be the owner
         if tag.user_id != current_user.id:
-            return jsonify({'error': 'You do not have permission to edit this tag'}), 403
+            return jsonify(api_error('tag_edit_denied')), 403
 
     data = request.get_json()
 
@@ -296,7 +327,7 @@ def update_tag(tag_id):
             existing_tag = Tag.query.filter_by(name=data['name'], user_id=current_user.id).filter(Tag.id != tag_id).first()
 
         if existing_tag:
-            return jsonify({'error': 'Another tag with this name already exists'}), 400
+            return jsonify(api_error('tag_rename_conflict')), 400
         tag.name = data['name']
 
     # Handle group_id changes (converting between personal and group tags)
@@ -311,14 +342,19 @@ def update_tag(tag_id):
             ).first()
 
             if not membership or membership.role != 'admin':
-                return jsonify({'error': 'Only group admins can assign tags to groups'}), 403
+                return jsonify(api_error('tag_group_assign_admin_only')), 403
 
         tag.group_id = new_group_id
 
     if 'color' in data:
-        tag.color = data['color']
+        color_ok, color_val = _validate_tag_color(data['color'])
+        if not color_ok:
+            return jsonify(api_error('invalid_tag_color')), 400
+        tag.color = color_val or _DEFAULT_TAG_COLOR
     if 'custom_prompt' in data:
         tag.custom_prompt = data['custom_prompt']
+    if 'title_prompt' in data:
+        tag.title_prompt = data['title_prompt'] or None
     if 'default_language' in data:
         tag.default_language = data['default_language']
     if 'default_min_speakers' in data:
@@ -359,7 +395,7 @@ def update_tag(tag_id):
             from src.models import NamingTemplate
             template = NamingTemplate.query.filter_by(id=naming_template_id, user_id=current_user.id).first()
             if not template:
-                return jsonify({'error': 'Naming template not found'}), 404
+                return jsonify(api_error('naming_template_not_found')), 404
         tag.naming_template_id = naming_template_id if naming_template_id else None
     if 'export_template_id' in data:
         export_template_id = data['export_template_id']
@@ -367,7 +403,7 @@ def update_tag(tag_id):
             from src.models import ExportTemplate
             template = ExportTemplate.query.filter_by(id=export_template_id, user_id=current_user.id).first()
             if not template:
-                return jsonify({'error': 'Export template not found'}), 404
+                return jsonify(api_error('export_template_not_found')), 404
         tag.export_template_id = export_template_id if export_template_id else None
 
     # Handle auto-process toggle
@@ -376,9 +412,9 @@ def update_tag(tag_id):
         if new_value and not tag.is_auto_process:
             # Enabling auto-process
             if not ENABLE_AUTO_PROCESSING:
-                return jsonify({'error': 'Auto-processing is not enabled'}), 400
+                return jsonify(api_error('auto_processing_disabled')), 400
             if tag.group_id:
-                return jsonify({'error': 'Watch folders are not available for group tags'}), 400
+                return jsonify(api_error('watch_folder_group_tag_unsupported')), 400
             if not tag.auto_process_folder_name:
                 tag.auto_process_folder_name = _sanitize_folder_name(tag.name)
             tag.is_auto_process = True
@@ -393,7 +429,7 @@ def update_tag(tag_id):
     except IntegrityError as e:
         db.session.rollback()
         current_app.logger.error(f"Tag update failed due to integrity constraint: {str(e)}")
-        return jsonify({'error': 'A tag with this name already exists'}), 400
+        return jsonify(api_error('tag_name_exists')), 400
 
     response = tag.to_dict()
 
@@ -418,7 +454,7 @@ def delete_tag(tag_id):
     """Delete a tag."""
     tag = db.session.get(Tag, tag_id)
     if not tag:
-        return jsonify({'error': 'Tag not found'}), 404
+        return jsonify(api_error('tag_not_found')), 404
 
     # Check permissions
     if tag.group_id:
@@ -429,11 +465,11 @@ def delete_tag(tag_id):
         ).first()
 
         if not membership or membership.role != 'admin':
-            return jsonify({'error': 'Only group admins can delete group tags'}), 403
+            return jsonify(api_error('group_tag_delete_admin_only')), 403
     else:
         # Personal tag - must belong to the user
         if tag.user_id != current_user.id:
-            return jsonify({'error': 'You do not have permission to delete this tag'}), 403
+            return jsonify(api_error('tag_delete_denied')), 403
 
     # Clean up auto-process folder if enabled
     if tag.is_auto_process:
@@ -452,12 +488,12 @@ def delete_tag(tag_id):
 def create_group_tag(group_id):
     """Create a group-scoped tag (group admins only)."""
     if not ENABLE_INTERNAL_SHARING:
-        return jsonify({'error': 'Group tags require internal sharing to be enabled. Please set ENABLE_INTERNAL_SHARING=true in your configuration.'}), 403
+        return jsonify(api_error('group_tags_require_internal_sharing')), 403
 
     # Verify team exists
     team = db.session.get(Group, group_id)
     if not team:
-        return jsonify({'error': 'Group not found'}), 404
+        return jsonify(api_error('group_not_found')), 404
 
     # Verify user is a team admin
     membership = GroupMembership.query.filter_by(
@@ -466,13 +502,17 @@ def create_group_tag(group_id):
     ).first()
 
     if not membership or membership.role != 'admin':
-        return jsonify({'error': 'Only group admins can create group tags'}), 403
+        return jsonify(api_error('group_tag_create_admin_only')), 403
 
     data = request.get_json()
     name = data.get('name', '').strip()
 
     if not name:
-        return jsonify({'error': 'Tag name is required'}), 400
+        return jsonify(api_error('tag_name_required')), 400
+
+    color_ok, color_val = _validate_tag_color(data.get('color'))
+    if not color_ok:
+        return jsonify(api_error('invalid_tag_color')), 400
 
     # Check if a group tag with this name already exists for this team
     existing_tag = Tag.query.filter_by(
@@ -481,7 +521,7 @@ def create_group_tag(group_id):
     ).first()
 
     if existing_tag:
-        return jsonify({'error': 'A group tag with this name already exists'}), 400
+        return jsonify(api_error('group_tag_name_exists')), 400
 
     # Validate naming_template_id if provided
     naming_template_id = data.get('naming_template_id')
@@ -489,7 +529,7 @@ def create_group_tag(group_id):
         from src.models import NamingTemplate
         template = NamingTemplate.query.filter_by(id=naming_template_id, user_id=current_user.id).first()
         if not template:
-            return jsonify({'error': 'Naming template not found'}), 404
+            return jsonify(api_error('naming_template_not_found')), 404
 
     # Validate export_template_id if provided
     export_template_id = data.get('export_template_id')
@@ -497,15 +537,16 @@ def create_group_tag(group_id):
         from src.models import ExportTemplate
         template = ExportTemplate.query.filter_by(id=export_template_id, user_id=current_user.id).first()
         if not template:
-            return jsonify({'error': 'Export template not found'}), 404
+            return jsonify(api_error('export_template_not_found')), 404
 
     # Create the group tag with all supported parameters
     tag = Tag(
         name=name,
         user_id=current_user.id,  # Creator
         group_id=group_id,
-        color=data.get('color', '#3B82F6'),
+        color=color_val or _DEFAULT_TAG_COLOR,
         custom_prompt=data.get('custom_prompt'),
+        title_prompt=data.get('title_prompt'),
         default_language=data.get('default_language'),
         default_min_speakers=data.get('default_min_speakers'),
         default_max_speakers=data.get('default_max_speakers'),
@@ -527,7 +568,7 @@ def create_group_tag(group_id):
     except IntegrityError as e:
         db.session.rollback()
         current_app.logger.error(f"Tag creation failed due to integrity constraint: {str(e)}")
-        return jsonify({'error': 'A tag with this name already exists'}), 400
+        return jsonify(api_error('tag_name_exists')), 400
 
     return jsonify(tag.to_dict()), 201
 
@@ -540,7 +581,7 @@ def get_group_tags(group_id):
     # Verify team exists
     team = db.session.get(Group, group_id)
     if not team:
-        return jsonify({'error': 'Group not found'}), 404
+        return jsonify(api_error('group_not_found')), 404
 
     # Verify user is a team member
     membership = GroupMembership.query.filter_by(
@@ -549,12 +590,13 @@ def get_group_tags(group_id):
     ).first()
 
     if not membership:
-        return jsonify({'error': 'You must be a team member to view group tags'}), 403
+        return jsonify(api_error('group_tags_members_only')), 403
 
     # Get all group tags
-    tags = Tag.query.filter_by(group_id=group_id).all()
+    from src.services.recording_list import tag_dicts, tag_load_options
+    tags = Tag.query.filter_by(group_id=group_id).options(*tag_load_options()).order_by(Tag.id).all()
 
-    return jsonify({'tags': [tag.to_dict() for tag in tags]})
+    return jsonify({'tags': tag_dicts(tags)})
 
 
 

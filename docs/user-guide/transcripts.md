@@ -22,11 +22,13 @@ When you need to assign real names to speaker labels, click the speaker identifi
 
 The speaker identification modal shows each detected speaker with a sample of their dialogue to help you identify them. When you've identified speakers in previous recordings, Speakr's voice recognition system analyzes voice embeddings and provides intelligent suggestions with confidence scores. You can enter real names for each speaker, and these names will replace the generic labels throughout the transcription. The system remembers these assignments and builds voice profiles, making it easier and faster to identify the same speakers in subsequent recordings.
 
+**Identify from conversation** works differently: names mentioned in the conversation, for example when people introduce or address each other, are found with the text model and filled in for review. By default, only the speakers that are still unnamed are named; with **Re-identify all from conversation** in its menu, every speaker is identified again. A text model is required and voice profiles are not used, so voice matches appear as suggestions whether or not you use it. Without a configured text model the button is disabled.
+
 ### Managing Saved Speakers
 
 All speakers you identify are automatically saved to your speaker database. You can manage these saved speakers through the dedicated [Speakers Management tab](settings.md#speakers-management-tab) in your [account settings](settings.md). Navigate to Account > Speakers Management to view all your saved speakers.
 
-![Speakers Management](../assets/images/screenshots/settings speakr management.png)
+![Speakers Management](../assets/images/screenshots/settings-speakers-management.png)
 
 The Speakers Management interface displays all your saved speakers in a responsive grid layout. Each speaker card shows the speaker's name, usage statistics including how many times they've been identified, when they were last used in a recording, and when they were first added to your database. The interface includes internal scrolling to handle large numbers of speakers while keeping the header and action buttons always visible.
 
@@ -55,6 +57,8 @@ The ASR editor presents your transcription as a table of segments, where each ro
 **Adjust Timestamps**: The start and end times for each segment can be fine-tuned using the adjustment arrows. This is helpful when the automatic segmentation isn't quite right, allowing you to precisely mark when each person starts and stops speaking.
 
 **Edit Text Content**: The main content of each utterance can be edited directly in its text field. You can correct transcription errors, fix grammar, add punctuation, or clarify unclear speech while maintaining the segment structure.
+
+**Find and Replace**: Click the search icon in the header of either editor, or press Ctrl+F (Cmd+F on a Mac), to open the find and replace bar. The number of matches is shown as you type. Enter moves to the next match and Shift+Enter to the previous one; **Replace** replaces the selected match, and **Replace all** replaces every match in the transcript text. **Aa** limits the search to the same capitals, and **ab** to whole words. Speaker names are not changed (use the speaker editor for those), and nothing is saved until you save the transcript, so Cancel discards the replacements. After correcting a name throughout, regenerate the summary to carry the correction into it.
 
 **Manage Segments**: Use the trash icon to remove segments that shouldn't be in the transcription (such as false detections or noise). You can also add new segments if the ASR system missed something, positioning them with appropriate timestamps.
 
@@ -215,13 +219,13 @@ If the recording was uploaded with a tag, folder, or user-default prompt that us
 
 ## Event Extraction
 
-When event extraction is enabled in your account settings, Speakr automatically identifies calendar-worthy events from your recordings during the summary generation process. This feature intelligently detects meetings, deadlines, appointments, and other time-sensitive items mentioned in your conversations.
+When event extraction is enabled in your account settings, calendar-worthy events in each recording are identified after it is processed. Events are extracted whether or not a summary is generated: with automatic summarization turned off, they are found in the transcript itself. This feature intelligently detects meetings, deadlines, appointments, and other time-sensitive items mentioned in your conversations.
 
-![Event Extraction](../assets/images/screenshots/event extraction.png)
+![Event Extraction](../assets/images/screenshots/event-extraction.png)
 
 ### Viewing Extracted Events
 
-After a recording is processed with event extraction enabled, an Events tab appears in the right panel if any events were detected. The tab shows a clean list of identified events, each displaying the event title, date, time, and description extracted from the conversation. Events are automatically parsed with intelligent date recognition that understands relative references like "next Tuesday" or "in two weeks" based on the recording date.
+After a recording is processed with event extraction enabled, an Events tab appears in the right panel if any events were detected. The tab shows a clean list of identified events, each displaying the event title, date, time, and description extracted from the conversation. Events are automatically parsed with intelligent date recognition that understands relative references like "next Tuesday" or "in two weeks" based on the recording date, counted in your timezone (Account → Preferences).
 
 ### Exporting to Calendar
 
@@ -229,7 +233,7 @@ Each extracted event can be exported as an ICS file that's compatible with virtu
 
 ### Enabling Event Extraction
 
-Event extraction can be toggled on or off in your Account Settings under the Custom Prompts tab. When enabled, the system adds event extraction instructions to your summary prompt, asking the AI to identify calendar-worthy items during summary generation. This feature works with any LLM provider configured in your system and adapts to different conversation styles, from formal meetings to casual discussions. The quality of event extraction depends on the AI model being used, with more advanced models providing better detection of nuanced scheduling references.
+Event extraction can be toggled on or off in your Account Settings under the Custom Prompts tab. When it is enabled, the AI is asked in a separate request to identify calendar-worthy items, with the summary when there is one and the transcript otherwise. This feature works with any LLM provider configured in your system and adapts to different conversation styles, from formal meetings to casual discussions. The quality of event extraction depends on the AI model being used, with more advanced models providing better detection of nuanced scheduling references.
 
 ## Interactive Chat
 

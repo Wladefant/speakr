@@ -8,16 +8,51 @@ structured information about their codecs, streams, and formats.
 import json
 import logging
 import os
+import shutil
 import subprocess
 from datetime import datetime
 from typing import Optional, Dict, Any, Tuple
 
+from src.utils.ffmpeg_utils import decode_ffmpeg_output
+
 logger = logging.getLogger(__name__)
+
+# Every valid WebM/Matroska file begins with this 4-byte EBML magic. A browser
+# MediaRecorder can occasionally hand us a .webm whose header is not at the
+# front (chunk-assembly artifact — see try_repair_malformed_webm / issue #340).
+_EBML_MAGIC = b'\x1a\x45\xdf\xa3'
 
 
 class FFProbeError(Exception):
     """Raised when ffprobe fails to analyze a file."""
     pass
+
+
+class FFProbeTimeoutError(FFProbeError):
+    """Raised when ffprobe runs past its timeout.
+
+    A timeout says nothing about the input (a large MP4 with its index at the
+    end can take long to probe), unlike a file ffprobe cannot read.
+    """
+    pass
+
+
+class FFProbeNotFoundError(FFProbeError):
+    """Raised when the ffprobe executable is not found."""
+    pass
+
+
+def has_audio_stream(codec_info: Dict[str, Any]) -> bool:
+    """True when the probed file has at least one audio stream."""
+    return bool(codec_info.get('has_audio') or codec_info.get('audio_codec'))
+
+
+def probe_rejected_input(error: FFProbeError) -> bool:
+    """True when ffprobe ran to completion and could not read the file.
+
+    A timeout or a missing ffprobe says nothing about the file itself.
+    """
+    return not isinstance(error, (FFProbeTimeoutError, FFProbeNotFoundError))
 
 
 def probe(filename: str, cmd: str = 'ffprobe', timeout: Optional[int] = None) -> Dict[str, Any]:
@@ -51,16 +86,18 @@ def probe(filename: str, cmd: str = 'ffprobe', timeout: Optional[int] = None) ->
         out, err = p.communicate(timeout=timeout)
         
         if p.returncode != 0:
-            error_msg = err.decode('utf-8', errors='ignore')
+            error_msg = decode_ffmpeg_output(err)
             raise FFProbeError(f'ffprobe failed: {error_msg}')
-        
-        return json.loads(out.decode('utf-8'))
+
+        # ffprobe copies metadata tag values into its JSON as raw bytes, so
+        # the output is not guaranteed to be valid UTF-8 (e.g. GBK ID3 tags).
+        return json.loads(decode_ffmpeg_output(out))
     except subprocess.TimeoutExpired:
         if p:
             p.kill()
-        raise FFProbeError(f'ffprobe timed out after {timeout} seconds')
+        raise FFProbeTimeoutError(f'ffprobe timed out after {timeout} seconds')
     except FileNotFoundError:
-        raise FFProbeError('ffprobe command not found. Please ensure ffmpeg is installed.')
+        raise FFProbeNotFoundError('ffprobe command not found. Please ensure ffmpeg is installed.')
     except json.JSONDecodeError as e:
         raise FFProbeError(f'Failed to parse ffprobe output: {e}')
 
@@ -95,12 +132,11 @@ def mp3_duration_is_estimated(filename: str, timeout: Optional[int] = None) -> b
         result = subprocess.run(
             args,
             capture_output=True,
-            text=True,
             timeout=timeout,
         )
         if result.returncode != 0:
             return False
-        return 'Estimating duration from bitrate' in (result.stderr or '')
+        return 'Estimating duration from bitrate' in decode_ffmpeg_output(result.stderr)
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
         logger.warning(f"Could not check MP3 duration header for {filename}: {e}")
         return False
@@ -177,11 +213,95 @@ def get_codec_info(filename: str, timeout: Optional[int] = None) -> Dict[str, An
                     result['channels'] = stream.get('channels')
             
             elif codec_type == 'video':
+                # Cover art embedded in an audio file (MP3, M4A, FLAC) is a
+                # one-frame video stream marked attached_pic; it is not video.
+                if (stream.get('disposition') or {}).get('attached_pic'):
+                    continue
                 result['has_video'] = True
                 if result['video_codec'] is None:  # Use first video stream
                     result['video_codec'] = codec_name
 
     return result
+
+
+def try_repair_malformed_webm(filename: str, timeout: Optional[int] = None,
+                              max_scan_bytes: int = 8 * 1024 * 1024) -> Optional[Dict[str, Any]]:
+    """Repair a WebM/Matroska file whose EBML header is not at the front.
+
+    A browser's MediaRecorder can assemble chunks such that the leading bytes of
+    the uploaded .webm are not the EBML magic (``1A 45 DF A3``) — the real header
+    appears further in. ffprobe/ffmpeg then reject the file ("EBML header parsing
+    failed"). This is most often seen on crash-recovered recordings whose chunk
+    order was scrambled in client storage (issue #340).
+
+    When the file does not start with the EBML magic but contains it within the
+    first ``max_scan_bytes``, this trims the leading bytes so the file starts at
+    the real header. The trimmed candidate is written to a temp file and probed;
+    the original is replaced ONLY if the trimmed file probes cleanly, so a false
+    positive (the magic appearing by chance inside media data) never destroys the
+    upload.
+
+    Args:
+        filename: Path to the file to repair in place.
+        timeout: Optional probe timeout in seconds.
+        max_scan_bytes: How far into the file to search for the header.
+
+    Returns:
+        The codec-info dict for the repaired file if the repair succeeded and the
+        file now probes cleanly, otherwise None (file left untouched).
+    """
+    try:
+        with open(filename, 'rb') as f:
+            head = f.read(max_scan_bytes)
+    except OSError as e:
+        logger.warning(f"WebM repair: could not read {filename}: {e}")
+        return None
+
+    if head[:4] == _EBML_MAGIC:
+        return None  # already well-formed at the front — nothing to repair
+
+    offset = head.find(_EBML_MAGIC)
+    if offset <= 0:
+        # Header not found ahead of the current start (or already at 0): either
+        # this isn't a recoverable WebM or the header is missing entirely.
+        return None
+
+    tmp_path = f"{filename}.repair.tmp"
+    try:
+        with open(filename, 'rb') as src, open(tmp_path, 'wb') as dst:
+            src.seek(offset)
+            shutil.copyfileobj(src, dst, length=1024 * 1024)
+    except OSError as e:
+        logger.warning(f"WebM repair: could not write trimmed candidate for {filename}: {e}")
+        _quiet_remove(tmp_path)
+        return None
+
+    # Only commit the repair if the trimmed file actually probes as valid media.
+    try:
+        codec_info = get_codec_info(tmp_path, timeout=timeout)
+    except FFProbeError as e:
+        logger.warning(f"WebM repair: trimmed candidate for {filename} still not probeable: {e}")
+        _quiet_remove(tmp_path)
+        return None
+
+    try:
+        os.replace(tmp_path, filename)
+    except OSError as e:
+        logger.warning(f"WebM repair: could not replace {filename} with trimmed file: {e}")
+        _quiet_remove(tmp_path)
+        return None
+
+    logger.info(f"WebM repair: trimmed {offset} leading bytes to reach EBML header in {filename}")
+    return codec_info
+
+
+def _quiet_remove(path: str) -> None:
+    """Best-effort removal of a temp file; never raises."""
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
 
 
 def is_video_file(filename: str, timeout: Optional[int] = None, codec_info: Optional[Dict[str, Any]] = None) -> bool:
@@ -383,7 +503,7 @@ def _get_duration_from_packets(filename: str, timeout: Optional[int] = None) -> 
             return None
 
         # Parse the output to find the last timestamp
-        lines = out.decode('utf-8').strip().split('\n')
+        lines = decode_ffmpeg_output(out).strip().split('\n')
         last_valid_time = None
         for line in reversed(lines):
             line = line.strip()
@@ -490,7 +610,9 @@ def _get_file_mtime(filename: str) -> Optional[datetime]:
 
     try:
         stat_info = os.stat(filename)
-        return datetime.fromtimestamp(stat_info.st_mtime)
+        # Naive UTC, the storage convention (was server-local time, #412 B6).
+        from datetime import timezone as _tz
+        return datetime.fromtimestamp(stat_info.st_mtime, tz=_tz.utc).replace(tzinfo=None)
     except (OSError, ValueError) as e:
         logger.warning(f"Failed to get file mtime for {filename}: {e}")
         return None

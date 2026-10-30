@@ -14,7 +14,7 @@ The search bar at the top responds instantly as you type, filtering the table to
 
 Creating a user account starts with clicking the Add User button in the top right corner. The modal that appears asks for the essentials - username, email address, and password. You'll also decide immediately whether this person needs admin privileges, though you can always change this later.
 
-The username becomes their identity within Speakr, appearing in the interface and organizing their recordings. The email address serves dual purposes - it's their login credential and their contact point for any system communications. The password you set is temporary; users should change it immediately after their first login through their [account settings](../user-guide/settings.md). Configure initial [language preferences](../user-guide/settings.md#language-preferences) and [custom prompts](../user-guide/settings.md#custom-prompts-tab).
+The username becomes their identity within Speakr, appearing in the interface and organizing their recordings. It is 2 to 20 characters long. The email address serves dual purposes - it's their login credential and their contact point for any system communications. The password you set is temporary; users should change it immediately after their first login through their [account settings](../user-guide/settings.md). Configure initial [language preferences](../user-guide/settings.md#language-preferences) and [custom prompts](../user-guide/settings.md#custom-prompts-tab).
 
 Admin privileges are powerful and should be granted sparingly. Admin users can see and modify all [system settings](system-settings.md), manage other users including other admins, configure [default prompts](prompts.md), and monitor the [vector store](vector-store.md). Most users will never need these capabilities.
 
@@ -39,7 +39,7 @@ Control LLM costs by setting monthly token budgets for individual users. When cr
 - **Budget Reset**: Token counts reset automatically at the start of each calendar month
 - **No Limit**: Leave the budget field empty for unlimited usage
 
-Token budgets are set in increments of 10,000 tokens with a minimum of 100,000. The budget covers all AI operations including summarization, chat, title generation, and event extraction. View detailed token usage statistics in the [System Statistics](statistics.md#token-usage-statistics) section.
+Token budgets are set in increments of 10,000 tokens with a minimum of 100,000. The budget covers all AI operations including summarization, chat, title generation, and event extraction. View detailed token usage statistics in the [System Statistics](statistics.md#users) users table.
 
 ### Transcription Budget Management
 
@@ -52,13 +52,30 @@ Control transcription costs by setting monthly transcription budgets for individ
 - **Budget Reset**: Transcription minutes reset automatically at the start of each calendar month
 - **No Limit**: Leave the budget field empty for unlimited transcription usage
 
-Transcription budgets are set in minutes with a minimum of 10 minutes. The budget covers all transcription operations regardless of which connector is used (OpenAI Whisper, OpenAI Transcribe, or self-hosted ASR). View detailed transcription usage statistics in the [System Statistics](statistics.md#transcription-usage-statistics) section.
+Transcription budgets are set in minutes with a minimum of 10 minutes. The budget covers all transcription operations regardless of which connector is used (OpenAI Whisper, OpenAI Transcribe, or self-hosted ASR). View detailed transcription usage statistics in the [System Statistics](statistics.md#users) users table.
 
 **Cost Tracking**: The system tracks estimated costs based on the transcription connector used:
 
 - **OpenAI Whisper**: $0.006 per minute
 - **OpenAI Transcribe**: $0.003-$0.006 per minute depending on model
 - **Self-hosted ASR**: $0 (no external API costs)
+
+### Storage Quotas
+
+Limit how much audio and video each user keeps on the server. Set **Storage quota (MB)** when creating or editing a user; leave it empty for no limit. The Edit User dialog and the users table show the storage in use against the quota, and so does the users table in [System Statistics](statistics.md#users).
+
+**What counts**: the size of the user's own recordings whose audio is kept, including archived recordings and recordings protected from auto-deletion. Recordings with their audio removed do not count, and a recording shared with someone counts for its owner only.
+
+**When the quota is reached**:
+
+- **Uploads** from the browser, the API, the share target, the ASR Voice Recorder app and sliced uploads are refused when the file would exceed the quota. The user sees how much is used and how large the file is. The API response is `507` with the code `storage_quota_exceeded`.
+- **Recordings made in the app** cannot be started once the quota is reached. A recording already in progress is always kept, even if the quota is exceeded.
+- **The watch folder**: a file that does not fit is left in place, and the user is told once, in their notifications. The file is added on a later scan once there is room.
+- **Merging**: to keep the originals with their audio, there must be room for the merged copy. A merge in which the originals are deleted, or kept without their audio, is always allowed.
+
+Users see their storage, and the quota when there is one, under **Account → Usage and Limits** and in the header. They free space by deleting recordings or by removing their audio.
+
+**Default for new accounts**: with the System Setting `default_storage_quota_mb`, every account created afterwards is given a quota (0 means no limit). This default is used for accounts created by an administrator, by registration and by SSO; the quota of an existing account does not change.
 
 ## Managing Existing Users
 
@@ -81,6 +98,8 @@ Patterns often emerge when you regularly review this data. You might notice seas
 Every user account is a potential security vector. Strong passwords are your first defense, but they're not enough alone. Encourage users to use unique passwords, change them regularly, and never share them with others.
 
 Admin accounts require extra vigilance. Each admin can do everything you can do, including creating more admins or deleting all users. Limit admin access to the absolute minimum needed for operations. When someone no longer needs admin privileges, revoke them immediately.
+
+After repeated wrong passwords from one address, password sign-in for that account from that address is refused for a set number of minutes; see [Login Lock](system-settings.md#login-lock). A locked account is shown with a lock icon beside its username, and the lock is ended with **Unlock login** in the Edit User dialog.
 
 Inactive accounts pose particular risks. They might have weak or compromised passwords that no one is monitoring. Regular audits help you identify and remove these vulnerabilities before they become problems.
 
