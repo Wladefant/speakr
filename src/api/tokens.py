@@ -5,6 +5,7 @@ This blueprint handles creating, listing, and revoking API tokens
 for user authentication.
 """
 
+import os
 import secrets
 from datetime import datetime, timedelta
 from flask import Blueprint, request, jsonify
@@ -13,9 +14,17 @@ from flask_login import login_required, current_user
 from src.database import db
 from src.models import APIToken
 from src.utils.token_auth import hash_token
+from src.utils.localization import api_error, translate
 
 # Create blueprint
 tokens_bp = Blueprint('tokens', __name__, url_prefix='/api/tokens')
+
+# Active tokens an account may hold (#484); 0 means no limit. Tokens an
+# account already holds above the limit stay valid.
+try:
+    API_MAX_TOKENS_PER_USER = max(0, int(os.environ.get('API_MAX_TOKENS_PER_USER', '10')))
+except ValueError:
+    API_MAX_TOKENS_PER_USER = 10
 
 # Extensions (injected after app initialization)
 bcrypt = None
@@ -101,7 +110,28 @@ def create_token():
 
     # Validate expiration
     if not isinstance(expires_in_days, int) or expires_in_days < 0:
-        return jsonify({'error': 'expires_in_days must be a non-negative integer'}), 400
+        return jsonify(api_error('invalid_expires_in_days')), 400
+
+    # Scopes (mailr spec G1). Absent = a full token, as before scopes existed.
+    scopes_value = None
+    if 'scopes' in data:
+        from src.models.api_token import parse_scopes
+        scopes_value, error = parse_scopes(data.get('scopes'))
+        if error:
+            return jsonify({'error': error, 'code': 'invalid_parameter'}), 400
+
+    if API_MAX_TOKENS_PER_USER:
+        now = datetime.utcnow()
+        active = (APIToken.query.filter_by(user_id=current_user.id, revoked=False)
+                  .filter(db.or_(APIToken.expires_at.is_(None), APIToken.expires_at > now))
+                  .count())
+        if active >= API_MAX_TOKENS_PER_USER:
+            return jsonify({
+                'error': translate('server.apiError.token_limit_reached', max=API_MAX_TOKENS_PER_USER),
+                'code': 'token_limit_reached',
+                'max_tokens': API_MAX_TOKENS_PER_USER,
+                'active_tokens': active,
+            }), 409
 
     # Generate the token
     plaintext_token = generate_token()
@@ -117,7 +147,8 @@ def create_token():
         user_id=current_user.id,
         token_hash=token_hash,
         name=name,
-        expires_at=expires_at
+        expires_at=expires_at,
+        scopes=scopes_value,
     )
 
     db.session.add(api_token)
@@ -151,13 +182,13 @@ def revoke_token(token_id):
     ).first()
 
     if not api_token:
-        return jsonify({'error': 'Token not found'}), 404
+        return jsonify(api_error('token_not_found')), 404
 
     # Delete the token
     db.session.delete(api_token)
     db.session.commit()
 
-    return jsonify({'message': 'Token revoked successfully'}), 200
+    return jsonify({'message': translate('server.apiMessage.tokenRevoked')}), 200
 
 
 @tokens_bp.route('/<int:token_id>', methods=['PATCH'])
@@ -183,16 +214,30 @@ def update_token(token_id):
     ).first()
 
     if not api_token:
-        return jsonify({'error': 'Token not found'}), 404
+        return jsonify(api_error('token_not_found')), 404
 
-    # Update the name
-    data = request.get_json()
+    data = request.get_json() or {}
     new_name = data.get('name')
+    if 'scopes' not in data and not new_name:
+        return jsonify(api_error('name_required')), 400
 
-    if not new_name:
-        return jsonify({'error': 'name is required'}), 400
+    # Scopes can only be narrowed (mailr spec G1): a wider set needs a new
+    # token, so a stolen session cannot silently widen an integration token.
+    if 'scopes' in data:
+        from src.models.api_token import parse_scopes, TOKEN_SCOPES
+        new_value, error = parse_scopes(data.get('scopes'))
+        if error:
+            return jsonify({'error': error, 'code': 'invalid_parameter'}), 400
+        current = api_token.scope_set
+        new = None if new_value is None else frozenset(__import__('json').loads(new_value))
+        widening = (new is None and current is not None) or (current is not None and not new <= current)
+        if widening:
+            return jsonify({'error': translate('server.apiError.scope_narrow_only'),
+                            'code': 'invalid_parameter'}), 400
+        api_token.scopes = new_value
 
-    api_token.name = new_name
+    if new_name:
+        api_token.name = new_name
     db.session.commit()
 
     return jsonify(api_token.to_dict()), 200

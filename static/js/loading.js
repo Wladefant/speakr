@@ -12,11 +12,12 @@ window.AppLoader = {
      * Initialize the loading system
      */
     init() {
-        if (this.initialized) return;
+        if (this.initialized || window.__appLoaderHidden) return;
         this.initialized = true;
         this.initTime = Date.now();
 
         // Add loading class to body
+        document.documentElement.classList.add('app-loading');
         document.body.classList.add('app-loading');
 
         // Create loading overlay if it doesn't exist
@@ -103,8 +104,12 @@ window.AppLoader = {
      * Hide the loading overlay
      */
     hide() {
+        // Remembered so a late init (either overlay script) cannot bring the
+        // overlay back after the page has shown itself.
+        window.__appLoaderHidden = true;
         try {
             // Remove app-loading class immediately to show content
+            document.documentElement.classList.remove('app-loading');
             document.body.classList.remove('app-loading');
 
             // Find all loading overlays (might be multiple)
@@ -131,6 +136,7 @@ window.AppLoader = {
         } catch (error) {
             console.error('Error hiding loader:', error);
             // Force hide everything as last resort
+            document.documentElement.classList.remove('app-loading');
             document.body.classList.remove('app-loading');
             const overlays = document.querySelectorAll('.app-loading-overlay');
             overlays.forEach(o => {
@@ -157,6 +163,7 @@ window.AppLoader = {
                     // Force hide even if error occurs
                     const overlay = document.querySelector('.app-loading-overlay');
                     if (overlay) overlay.remove();
+                    document.documentElement.classList.remove('app-loading');
                     document.body.classList.remove('app-loading');
                 }
             }
@@ -188,8 +195,9 @@ window.AppLoader = {
             }
         }, 10000);
 
-        // Start checking after a minimum display time
-        setTimeout(checkReady, 300);
+        // Check from the next frame. The overlay itself is shown only after
+        // 400 ms, so a minimum display time here only delayed the page.
+        requestAnimationFrame(checkReady);
     }
 };
 

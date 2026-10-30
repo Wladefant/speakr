@@ -131,12 +131,20 @@ Under the recording buttons is a collapsible **Input devices** section. Expanded
 
 ![Input device picker](../assets/images/screenshots/recording-input-device-picker.png)
 
-- **Primary input** — defaults to your OS's default microphone. Pick a specific input here if you want a USB headset, BlackHole, VB-Cable, or a Pulse / PipeWire monitor source as your primary capture device. Virtual / monitor entries are badged.
+- **Primary input** — defaults to your OS's default microphone. Pick a specific input here if you want a USB headset, wireless receiver, audio interface, BlackHole, VB-Cable, or a Pulse / PipeWire monitor source as your primary capture device. Virtual / monitor entries are badged. The primary selection is used by both **Microphone** and **Mic + System** recording.
 - **Also mix in (optional)** — pick a second input device and Speakr will capture both streams in parallel and mix them via Web Audio into one MediaRecorder track. This is the canonical solution for **capturing both sides of a meeting** on macOS or Linux where the browser can't capture full system audio natively — set your real mic as Primary, set BlackHole / `speakr_loopback` / VB-Cable as the secondary, and one recording captures your voice plus the remote participants.
 
-Device labels are blank until you grant microphone permission. The first time you expand the picker, click the **Request microphone permission** link so the OS shows the prompt; subsequent recordings remember the permission and the labels populate.
+Opening **New Recording** does not request microphone permission. Device labels are normally blank until permission is granted. You can expand the picker and click **Request microphone permission**, or simply press **Microphone** and respond to the browser's normal permission prompt.
 
-**Persistence**: the primary + secondary device choices are saved in `localStorage` so you configure them once and they survive across sessions.
+On mobile, after permission is granted, Speakr checks the labeled inputs. If a likely separate physical microphone is available and you have not already selected one, the existing **Input devices** section expands with an **Another microphone is available** notice before recording starts. Choose the input and continue, or keep the system default. When only the built-in/default microphone is present, recording starts immediately with no extra Speakr prompt. Detection is deliberately conservative: it only triggers on devices whose labels clearly indicate an external input (USB receivers, wireless and headset microphones, webcams, audio interfaces), so a device the browser exposes without a recognisable label starts no prompt — you can still select it manually from the picker. The prompt also never appears when a recording is being resumed after an interruption; a continued session always keeps its original input.
+
+![Mobile external microphone choice](../assets/images/screenshots/recording-external-microphone-mobile.png)
+
+Desktop browsers already provide their own microphone chooser, so Speakr does not automatically open a second selection step there. The collapsed **Input devices** picker remains available for an explicit device choice or multi-input mixing, and any microphone chosen in the browser's permission dialog remains active unless you deliberately override it in Speakr.
+
+Automatic mobile detection is deliberately conservative. If your browser hides labels or grouping metadata, open **Input devices** and select the device manually. Speakr refreshes the list when the browser reports a device change and again when recording starts. A previously selected device that has been disconnected falls back to the system default with a warning.
+
+**Persistence**: the primary + secondary device choices are saved in `localStorage` so you configure them once and they survive across sessions. Choosing to keep the default when Speakr offers another microphone is remembered only for the current browser session and is reconsidered when the candidate device set changes.
 
 ### Disable echo cancellation, noise suppression & auto-gain
 
@@ -212,7 +220,7 @@ After stopping a recording or dropping a file, the upload modal stays open so yo
 
 The tag system is one of Speakr's most powerful organizational features. Expand the **Options** group to see the tag picker. Tags appear as colored pills that you can select to categorize your recording. You can apply multiple tags to a single recording, making it easy to cross-reference content across different categories.
 
-![Tag Selection and Stacking](../assets/images/screenshots/tag selection and stacking.png)
+![Tag Selection and Stacking](../assets/images/screenshots/upload-tag-stacking.png)
 
 It's important to select relevant tags before uploading your file so that the appropriate summary prompts are applied during summarization. Each tag can have custom AI prompts associated with it, which influence how the summary is generated. For example, a "Meeting" tag might focus the summary on action items and decisions, while a "Lecture" tag might emphasize key concepts and learning points.
 
@@ -236,6 +244,8 @@ The **Initial Prompt** field provides context to the transcription engine about 
 
 Both fields follow a precedence hierarchy: values you set in the upload form override tag defaults, which override folder defaults, which override your personal defaults in [account settings](settings.md#custom-prompts-tab). If you regularly transcribe similar content, set your defaults at the tag or user level so you don't have to enter them every time.
 
+The same fields, along with the saved-template picker, are also available in the in-app recorder: after stopping a recording, expand **Upload Settings**, then **Advanced ASR Options**. Values set there travel with the recording through every upload path, including crash recovery and incognito processing.
+
 #### Transcription Model
 
 When your administrator has configured `TRANSCRIPTION_MODELS_AVAILABLE` (or curated a model list from the admin dashboard), the upload form gains a **Transcription model** dropdown that lets you pick the specific model used for this recording. The default option uses whichever model the resolved tag, folder, or admin default specifies. The dropdown is hidden if only one option would be available, since there is no real choice to offer.
@@ -250,7 +260,17 @@ If a selected tag, folder, or your account default summary prompt contains `{{na
 
 The sticky modal footer holds **Cancel** (dismisses without uploading) and **Upload N files** (begins transcription immediately with your selected settings). The recording appears in your library with a processing indicator while transcription runs in the background. If you started a recording from inside the modal and the upload completes, Speakr auto-navigates to the new recording's detail view; bulk drag-drop uploads of multiple files leave you on whatever you were viewing.
 
-If incognito mode is enabled at the server, a toggle in the upload modal lets you process recordings without saving them to your account. Incognito uploads accept one file at a time.
+### Joining Several Files into One Recording
+
+A recorder or phone often splits a long meeting into several files. When two or more files are in the upload list, a switch above the list offers **Separate recordings** (the default, one recording per file) or **One recording**. With **One recording** selected:
+
+- The files are numbered in the order they are joined. Speakr sorts them by each file's modified time, then by name with numbers compared as numbers, so `part2` comes before `part10`. Drag a file, or use its up and down arrows, to change the order.
+- The total length is shown once every file's duration is known, and an optional title field names the joined recording. Left blank, the title is generated as for any upload.
+- The upload button reads **Upload and join N files**. Folder, tags, language, speaker counts, hotwords and prompt variables apply to the joined recording.
+
+Each file is uploaded and checked as usual. Once the last one arrives, Speakr joins the audio in order and transcribes the result once, so you get one continuous transcript and summary without transcribing the pieces separately. The meeting date is the earliest of the files' dates. As with merging, if any file is a video, the joined recording keeps the audio only. If one file fails to upload, the others are discarded and a message names the file, so you can add the files again and retry. Up to 20 files can be joined, and joining is not available in incognito mode.
+
+If incognito mode is enabled at the server, a toggle in the upload modal lets you process recordings without saving them to your account. Incognito uploads accept one file at a time. In-app recordings made with incognito on are captured entirely in the browser — even when server-side chunk streaming is enabled, no audio reaches the server until you explicitly process the recording — so the 200 MB in-browser recording cap applies to them.
 
 ### Mobile Upload Experience
 
@@ -306,7 +326,7 @@ This is an opt-in feature that is off by default. If you don't see it, ask your 
 
 When a call drops or a meeting freezes, you can end up with two separate recordings of what was really one session. Merging combines several recordings, in the order you choose, into a single new recording that is transcribed, diarized, and summarized from scratch — so you get one continuous transcript and summary instead of several partial ones. The audio is combined; if any source is a video, the merged recording keeps the audio only.
 
-There are two ways to start a merge:
+If the pieces are still files on your computer, join them while uploading instead (see [Joining Several Files into One Recording](#joining-several-files-into-one-recording)): the upload transcribes them once, where merging transcribes each recording first and then the merged one. There are two ways to start a merge of existing recordings:
 
 - **From the sidebar.** Use the "select multiple" button, tick two or more recordings, and choose **Merge**. A dialog opens where you can reorder the sources with the up and down arrows, add more recordings from a searchable list, set a title, and optionally delete the originals once the merged recording is created.
 - **From the recording view.** After you finish an in-app recording, the **Upload Recording & Notes** button has a small arrow on its right edge. Its menu offers **Merge with an existing recording**, which lets you append the recording you just made onto one or more existing recordings — the common case being an interrupted recording you had to restart. The new recording is added to the end by default, since it continues the earlier one.
@@ -340,6 +360,8 @@ Because notes cannot be meaningfully combined, when more than one source has not
 - Persistent notification during recording
 
 See the [PWA Guide](pwa.md) for installation instructions and important limitations.
+
+**External microphones on Android:** Current Chromium-based browsers can expose class-compliant USB-C receivers and other external inputs through the normal microphone device list. Speakr can select only devices the browser exposes; it cannot force Android to route unsupported hardware. Device labels and `groupId` metadata vary by browser, `devicechange` may not fire on every phone, and device IDs can change after permissions or browser data are reset. If automatic detection does not appear, reconnect the receiver, grant microphone permission, and check **Input devices** manually. Verify the actual recorded source with a short test recording rather than relying only on the displayed device name.
 
 ### Optimizing Audio Quality
 

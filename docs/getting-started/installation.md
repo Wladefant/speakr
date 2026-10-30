@@ -110,9 +110,11 @@ TEXT_MODEL_API_KEY=sk-or-v1-your-key-here
 TEXT_MODEL_NAME=openai/gpt-4o-mini
 ```
 
-If you prefer to use OpenAI directly for text generation, simply change the base URL to `https://api.openai.com/v1` and use your OpenAI API key. You can also use local models through Ollama or LM Studio by pointing to `http://localhost:11434/v1` or similar.
+If you prefer to use OpenAI directly for text generation, simply change the base URL to `https://api.openai.com/v1` and use your OpenAI API key. You can also use local models through Ollama, LM Studio, vLLM or llama.cpp by pointing to `http://localhost:11434/v1` or similar. A local server without authentication needs no key, so `TEXT_MODEL_API_KEY` can be left out.
 
-> **Tip:** For advanced model configuration options—including GPT-5 support, separate chat model settings for different service tiers, and cost optimization strategies—see the [Model Configuration](../admin-guide/model-configuration.md) guide.
+Many current models reason before they answer, which makes summaries and titles slower and, on paid services, more expensive. The reasoning effort, or whether the model reasons at all, can be set with `TEXT_MODEL_EXTRA_BODY`; the field to use differs by provider and model, as listed in [Provider-Specific Request Parameters](../admin-guide/model-configuration.md#provider-specific-request-parameters).
+
+> **Tip:** For advanced model configuration options—including GPT-5 support, reasoning settings for each provider, separate chat model settings for different service tiers, and cost optimization strategies—see the [Model Configuration](../admin-guide/model-configuration.md) guide.
 
 #### For Legacy OpenAI Whisper API
 
@@ -142,7 +144,7 @@ For the best transcription and diarization quality, self-hosting an ASR service 
     - Repository: [murtaza-nasir/whisperx-asr-service](https://github.com/murtaza-nasir/whisperx-asr-service)
     - Uses `pyannote/speaker-diarization-community-1` model with exclusive diarization
     - **Superior transcription and diarization quality** with large models (large-v3, distil-large-v3)
-    - Supports 256-dimensional speaker embeddings for voice profile identification
+    - Returns speaker embeddings for voice profile identification
     - Better timestamp alignment between speakers and words
     - **Required for:** Voice profiles, automatic speaker recognition, speaker embeddings
     - **Environment file:** `config/env.whisperx.example`
@@ -156,6 +158,12 @@ For the best transcription and diarization quality, self-hosting an ASR service 
     - **Does not support:** Voice profiles, speaker embeddings, automatic speaker recognition
     - **Environment file:** `config/env.asr.example`
     - **Note:** Do not set `ASR_RETURN_SPEAKER_EMBEDDINGS=true` with this service as it will cause errors
+
+3. **OpenASR** - Local server with diarization and, from openasr#379 onward, speaker embeddings
+    - Website: [openasr.org](https://openasr.org)
+    - **Supports:** Speaker diarization with an exact speaker count, voice profiles when embeddings are enabled
+    - **Environment file:** `config/env.transcription.example` (OpenASR section)
+    - **Setting:** `ASR_RETURN_SPEAKER_EMBEDDINGS=true` to enable voice profile features on a server that supports it
 
 > **Important:** Before proceeding with this configuration, you'll need to set up one of the ASR service containers. See [Running ASR Service for Speaker Diarization](#running-asr-service-for-speaker-diarization) for complete instructions on deploying both containers together or separately.
 
@@ -186,7 +194,7 @@ The ASR_BASE_URL depends on your deployment architecture:
 - **Same Docker Compose stack:** Use the service name (e.g., `http://whisperx-asr:9000` or `http://whisper-asr:9000`) - Docker's internal networking
 - **Separate machine:** Use the full URL with IP address or domain name (e.g., `http://192.168.1.100:9000`)
 
-Speaker diarization is automatically enabled when using ASR endpoints. The system will identify different speakers in your recordings and label them as Speaker 1, Speaker 2, and so on. You can optionally override the default speaker detection settings by uncommenting and adjusting ASR_MIN_SPEAKERS and ASR_MAX_SPEAKERS in your environment file.
+Speaker diarization is automatically enabled when using ASR endpoints. The system will identify different speakers in your recordings and label them as Speaker 1, Speaker 2, and so on. You can optionally override the default speaker detection settings by uncommenting and adjusting ASR_MIN_SPEAKERS and ASR_MAX_SPEAKERS in your environment file. These two values are the instance-wide default: a speaker count chosen at upload, or set on a tag or folder, takes precedence. When only a minimum is set on a tag and it is above ASR_MAX_SPEAKERS, the tag value is used for both.
 
 **Voice Profile Configuration:**
 
@@ -224,6 +232,14 @@ TRANSCRIPTION_MODEL=vibevoice
 
 If your vLLM server requires authentication, also set `TRANSCRIPTION_API_KEY`. Configure the text generation model as described above for summaries and chat features.
 
+#### For Tencent Cloud ASR (Chinese and English Meetings)
+
+Use `TRANSCRIPTION_CONNECTOR=tencent_asr` with `TENCENT_SECRET_ID` and
+`TENCENT_SECRET_KEY`. This native connector supports Tencent recording-file
+recognition, timestamps, speaker labels and hotwords, without an ASR bridge
+container or local GPU. See the [Tencent ASR setup guide](../advanced/tencent-asr.md)
+for engines, large files, resource packages and how failed jobs are retried.
+
 #### For AssemblyAI (Cloud-Based Diarization)
 
 AssemblyAI is a cloud transcription provider with strong speaker diarization on long, multi-speaker recordings. It is not OpenAI-compatible (it uses its own asynchronous upload-and-poll API), so it has a dedicated connector. It ingests files up to 10 hours in a single job, so the app does not chunk for it. New accounts get free credits and no credit card is required to create an API key.
@@ -234,6 +250,8 @@ TRANSCRIPTION_API_KEY=your-assemblyai-api-key
 ```
 
 The AssemblyAI endpoint is fixed, so the shared `TRANSCRIPTION_BASE_URL` and `TRANSCRIPTION_MODEL` are intentionally ignored for this connector (a leftover value from another connector will not misroute requests). To pin a speech model, set `ASSEMBLYAI_SPEECH_MODEL` (for example `universal-3-pro`); omit it to use your account default. Speaker diarization and hotwords come from each user's settings (hotwords map to AssemblyAI's word boost). Configure the text generation model as described above for summaries and chat features.
+
+If polling times out or Speakr restarts while AssemblyAI is working on a recording, the job is retried automatically and the same transcript is polled again; the audio is not uploaded and billed a second time. Reprocessing a recording submits it again.
 
 ### Step 4: Configure System Settings
 
@@ -255,7 +273,7 @@ REGISTRATION_ALLOWED_DOMAINS=
 LOG_LEVEL="INFO"
 ```
 
-Setting `ALLOW_REGISTRATION=false` means only the admin can create new user accounts, which is recommended for private installations where you want to control access. If you're running Speakr for a group or family, this prevents random people from creating accounts. If you enable registration and want to restrict it to specific email domains (e.g., for corporate use), set `REGISTRATION_ALLOWED_DOMAINS` to a comma-separated list of domains like `company.com,subsidiary.org`. Leave it empty to allow all domains. The log level controls how much information Speakr writes to its logs. Use `INFO` during initial setup and testing to see what's happening, then switch to `ERROR` for production to reduce log volume and improve performance.
+Setting `ALLOW_REGISTRATION=false` means only the admin can create new user accounts, which is recommended for private installations where you want to control access. If you're running Speakr for a group or family, this prevents random people from creating accounts. With registration disabled, the login page also omits its "Register here" link. Only the value `true` (in any letter case) enables registration; an unset variable defaults to `true`, and any other value disables it. If you enable registration and want to restrict it to specific email domains (e.g., for corporate use), set `REGISTRATION_ALLOWED_DOMAINS` to a comma-separated list of domains like `company.com,subsidiary.org`. Leave it empty to allow all domains. The log level controls how much information Speakr writes to its logs. Use `INFO` during initial setup and testing to see what's happening, then switch to `ERROR` for production to reduce log volume and improve performance.
 
 ### Step 5: Configure Advanced Features
 
@@ -391,7 +409,7 @@ AUTO_PROCESS_WATCH_DIR=/data/auto-process
 AUTO_PROCESS_CHECK_INTERVAL=30
 ```
 
-When enabled, Speakr checks the watch directory every 30 seconds for new audio files. Any files found are automatically moved to the uploads directory and processed using your configured transcription settings. The `admin_only` mode assigns all processed files to the admin user, but you can also configure it for multi-user scenarios with separate directories for each user.
+When enabled, Speakr checks the watch directory every 30 seconds for new audio files. Any files found are automatically moved to the uploads directory and processed using your configured transcription settings. The `admin_only` mode assigns all processed files to the admin user, but you can also configure it for multi-user scenarios with separate directories for each user (`AUTO_PROCESS_MODE=user_directories`). Per-user subfolders may be named after the user id (`user123` or `123`) or after the username itself, mirroring the naming of the per-user export folders.
 
 To use this feature, you'll need to mount an additional volume in your Docker Compose configuration, which we'll cover in the next steps.
 
@@ -448,7 +466,7 @@ mkdir -p uploads instance
 chmod 755 uploads instance
 ```
 
-The `uploads` directory stores all your audio files and their transcriptions, organized by user. The `instance` directory contains the SQLite database that tracks all your recordings, users, and settings. Setting the permissions to 755 ensures the Docker container can read and write to these directories while maintaining reasonable security.
+The `uploads` directory stores all your audio files and their transcriptions, organized by user. The `instance` directory contains the SQLite database that tracks all your recordings, users, and settings. Setting the permissions to 755 lets the Docker container read and write these directories. At startup Speakr removes world read access from the SQLite database and its `-wal` and `-shm` files when the container user owns them, so that other accounts on the host cannot read transcripts or password hashes; the owner and the file's group keep their access. A backup job on the host that reads the database has to run as that owner or in that group.
 
 If you're using the automated file processing feature, create that directory as well:
 
@@ -498,6 +516,86 @@ Once logged in, test the installation by creating a test recording or uploading 
 
 If transcription fails, check the Docker logs for API authentication errors or connection issues. Common problems include incorrect API keys, insufficient API credits, or network connectivity issues.
 
+## Production Security Hardening
+
+Speakr ships with safe defaults, but a production deployment on a public
+network should confirm the following.
+
+### Secret key
+
+`SECRET_KEY` signs session cookies and email / password-reset tokens. If you
+leave it unset, Speakr now generates a strong random key on first start and
+persists it to `instance/secret_key` inside your data volume, so a deployment
+is never silently exploitable. The old built-in default key is refused at
+startup.
+
+For most single-host installs the auto-generated key is fine and is captured
+by any normal backup of the data volume. Set `SECRET_KEY` explicitly when you
+run multiple app hosts that must share sessions, or when you want to control
+key rotation:
+
+```bash
+SECRET_KEY=$(python -c "import secrets; print(secrets.token_hex(32))")
+```
+
+The key does **not** encrypt stored data — losing it only forces users to log
+in again and invalidates outstanding reset links, never any recordings or
+transcripts. You do not need to archive it separately to restore your data.
+
+### HTTPS and the session cookie
+
+Terminate TLS at a reverse proxy (nginx, Caddy, Traefik) and serve Speakr over
+HTTPS. When you do, set:
+
+```bash
+SESSION_COOKIE_SECURE=true
+```
+
+so the session cookie is only ever sent over TLS. It defaults to `false` so
+plain-HTTP LAN installs keep working out of the box.
+
+### Security headers
+
+The app sets `X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`,
+`Permissions-Policy`, a `Content-Security-Policy`, and (over HTTPS)
+`Strict-Transport-Security` on every response, so you are protected even
+without a hardening proxy. If your proxy already sets all of these, you can
+disable the app's copies with `SECURITY_HEADERS_ENABLED=false`. To customise:
+
+```bash
+# Replace the whole Content-Security-Policy:
+CONTENT_SECURITY_POLICY=default-src 'self'; ...
+# Tune or disable HSTS (empty string disables it, e.g. if your proxy sets it):
+HSTS_HEADER=max-age=63072000; includeSubDomains
+```
+
+Note the default CSP allows `'unsafe-inline'` and `'unsafe-eval'` for scripts
+because the bundled Vue build compiles templates in the browser; the policy
+still restricts framing, object/base/form targets, and the origins scripts,
+images, and connections may use.
+
+### Reverse-proxy hops
+
+`TRUSTED_PROXY_HOPS` (default `1`) is the number of proxies in front of the app
+whose `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host` and
+`X-Forwarded-Prefix` headers are trusted. These headers give the client address
+(used for rate limiting), HTTPS detection and the host name. Set it to the number
+of proxies in front of Speakr.
+
+When Speakr is reachable directly, without a proxy, set `TRUSTED_PROXY_HOPS=0`
+so that these headers cannot be forged, and set `APP_BASE_URL` so that the links
+in password-reset and verification emails and public share links always use your
+address.
+
+`TRUSTED_PROXIES` names the proxies themselves: a comma-separated list of
+addresses or CIDR ranges, such as `172.16.0.0/12` for the default Docker
+networks. When it is set, the forwarded headers are read only from requests whose
+connection comes from one of those addresses; a client that reaches Speakr
+directly cannot set its own address, scheme or host. When it is unset, the
+headers are read from any client, and Speakr logs a warning at startup.
+The client address is also used for the
+[login lock](../admin-guide/system-settings.md#login-lock).
+
 ## Advanced Deployment Scenarios
 
 ### Running ASR Service for Speaker Diarization
@@ -543,6 +641,8 @@ docker compose up -d
 # Verify it's running
 curl http://localhost:9000/health
 ```
+
+Prebuilt images are also published per release, so you can pull instead of building: `learnedmachine/whisperx-asr-service:latest` covers Pascal through Hopper GPUs as well as CPU, and `learnedmachine/whisperx-asr-service:blackwell` covers RTX 50xx cards (the plain `:blackwell` tag is available as of v0.4.0). To use one, replace the `build:` section in the compose snippet below with the corresponding `image:` line.
 
 See the [WhisperX ASR Service README](https://github.com/murtaza-nasir/whisperx-asr-service#readme) for detailed configuration options, troubleshooting, and performance tuning.
 
@@ -592,7 +692,18 @@ services:
       - COMPUTE_TYPE=float16
       - BATCH_SIZE=16
       - HF_TOKEN=your_huggingface_token_here
+      # Store all Hugging Face downloads (including the pyannote diarization
+      # model) in the cache volume below. Without this, the diarization model
+      # is cached inside the container filesystem and is lost whenever the
+      # container is recreated.
+      - HF_HOME=/.cache
       - TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=true  # Required for PyTorch 2.6+
+      # Uncomment after one successful online run with diarization to run
+      # fully offline (models must already be in the cache volume):
+      # - HF_HUB_OFFLINE=1
+      # Unload idle models from VRAM after this many seconds
+      # (0 = keep resident, the default):
+      # - MODEL_KEEP_ALIVE_SECONDS=3600
     deploy:
       resources:
         reservations:

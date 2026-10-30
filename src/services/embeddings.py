@@ -3,8 +3,11 @@ Embedding generation and semantic search services.
 """
 
 import os
+import re
+import json
 import time
 import random
+from urllib.parse import urlsplit
 import numpy as np
 from flask import current_app
 from sqlalchemy.orm import joinedload
@@ -29,6 +32,7 @@ if cosine_similarity is None:
 
 from src.database import db
 from src.models import Recording, TranscriptChunk, InternalShare, RecordingTag
+from src.utils.search import LIKE_ESCAPE, contains_pattern
 
 ENABLE_INTERNAL_SHARING = os.environ.get('ENABLE_INTERNAL_SHARING', 'false').lower() == 'true'
 
@@ -51,6 +55,8 @@ except (TypeError, ValueError):
 # When EMBEDDING_BASE_URL is set, embeddings are produced via an OpenAI-
 # compatible /v1/embeddings call rather than locally.
 USE_API_EMBEDDINGS = bool(EMBEDDING_BASE_URL)
+# Match the official host, never a substring in a path or lookalike domain.
+_USE_VOYAGE_API = urlsplit(EMBEDDING_BASE_URL).hostname == "api.voyageai.com"
 
 # Identifier persisted to system_setting so the dimensionality compatibility
 # check covers both "model changed" and "provider changed" scenarios.
@@ -118,6 +124,10 @@ def get_embedding_api_client():
 
 
 _API_EMBED_MAX_ATTEMPTS = int(os.environ.get('EMBEDDING_API_MAX_RETRIES', '3'))
+# After a full retry cycle fails, skip the embedding API for this long so
+# every search doesn't pay the retry latency while the provider is down.
+_API_EMBED_COOLDOWN_SECONDS = int(os.environ.get('EMBEDDING_API_COOLDOWN_SECONDS', '120'))
+_api_embed_down_until = 0.0
 _API_EMBED_BASE_BACKOFF_SECONDS = float(os.environ.get('EMBEDDING_API_BACKOFF_SECONDS', '1.5'))
 
 # Substrings of error messages that suggest the failure is transient and
@@ -137,7 +147,20 @@ def _is_transient_embedding_error(exc):
     return any(hint in msg for hint in _TRANSIENT_ERROR_HINTS)
 
 
-def _api_embed(texts, user_id=None):
+# Set to True the first time the provider rejects the 'dimensions' parameter
+# (models without Matryoshka support, e.g. BAAI/bge-m3, return a 400). Later
+# calls then omit the parameter instead of failing the whole pipeline. Probing
+# the provider beats a hardcoded list of dimension-capable model names, which
+# would silently disable a setting that newer models do support.
+_dimensions_rejected = False
+
+
+def _is_dimensions_rejection(exc):
+    """True when the error looks like the model rejecting the 'dimensions' kwarg."""
+    return 'dimension' in str(exc).lower()
+
+
+def _api_embed(texts, user_id=None, input_type="document"):
     """Call the OpenAI-compatible embeddings endpoint and return numpy vectors.
 
     Retries on transient errors (rate limits, timeouts, 5xx, connection
@@ -154,13 +177,48 @@ def _api_embed(texts, user_id=None):
     When ``user_id`` is provided and the response includes a ``usage``
     block, record the call against the daily token-usage aggregate.
     """
+    global _dimensions_rejected, _api_embed_down_until
+
     client = get_embedding_api_client()
     if client is None or not texts:
         return []
 
-    kwargs = {'input': texts, 'model': EMBEDDING_MODEL}
-    if EMBEDDING_DIMENSIONS is not None:
-        kwargs['dimensions'] = EMBEDDING_DIMENSIONS
+    # Batch large inputs: providers cap the number of inputs per embeddings
+    # request (Gemini far lower than OpenAI), and a long recording can have
+    # hundreds of chunks. All-or-nothing semantics are preserved: any failed
+    # batch fails the whole call so callers keep their existing chunks.
+    batch_size = max(1, int(os.environ.get('EMBEDDING_API_BATCH_SIZE', '96')))
+    if len(texts) > batch_size:
+        out = []
+        for i in range(0, len(texts), batch_size):
+            part = _api_embed(texts[i:i + batch_size], user_id=user_id, input_type=input_type)
+            if len(part) != len(texts[i:i + batch_size]):
+                return []
+            out.extend(part)
+        return out
+
+    # Circuit breaker: after a full retry cycle fails, skip the API entirely
+    # for a cooldown window instead of burning ~9s of retries on every call
+    # (searches fall back to keyword matching immediately; indexing fails
+    # fast with the usual empty-list sentinel and is retried later).
+    if time.time() < _api_embed_down_until:
+        current_app.logger.debug(
+            "Embedding API in failure cooldown; skipping call and using fallback")
+        return []
+
+    if _USE_VOYAGE_API:
+        # Voyage accepts null/base64, not OpenAI's "float". Explicit null
+        # requests JSON floats and prevents the SDK's implicit base64 path.
+        extra_body = {'input_type': input_type}
+        if EMBEDDING_DIMENSIONS is not None:
+            extra_body['output_dimension'] = EMBEDDING_DIMENSIONS
+        kwargs = {'input': texts, 'model': EMBEDDING_MODEL,
+                  'encoding_format': None, 'extra_body': extra_body}
+    else:
+        # Explicit floats also work with providers that cannot emit base64.
+        kwargs = {'input': texts, 'model': EMBEDDING_MODEL, 'encoding_format': 'float'}
+        if EMBEDDING_DIMENSIONS is not None and not _dimensions_rejected:
+            kwargs['dimensions'] = EMBEDDING_DIMENSIONS
 
     last_exc = None
     for attempt in range(1, _API_EMBED_MAX_ATTEMPTS + 1):
@@ -190,16 +248,28 @@ def _api_embed(texts, user_id=None):
                 except Exception as track_err:
                     current_app.logger.warning(f"Failed to record embedding usage: {track_err}")
 
+            _api_embed_down_until = 0
             return [np.array(d.embedding, dtype=np.float32) for d in response.data]
 
         except Exception as e:
             last_exc = e
+            if 'dimensions' in kwargs and _is_dimensions_rejection(e):
+                _dimensions_rejected = True
+                kwargs.pop('dimensions')
+                current_app.logger.warning(
+                    f"Embedding model '{EMBEDDING_MODEL}' rejected the 'dimensions' "
+                    f"parameter (EMBEDDING_DIMENSIONS={EMBEDDING_DIMENSIONS}): {e}. "
+                    "Retrying without it; the setting will be ignored for the rest "
+                    "of this process."
+                )
+                continue
             transient = _is_transient_embedding_error(e)
             if not transient or attempt == _API_EMBED_MAX_ATTEMPTS:
                 current_app.logger.error(
                     f"Embedding API call failed (attempt {attempt}/{_API_EMBED_MAX_ATTEMPTS}, "
                     f"transient={transient}): {e}"
                 )
+                _api_embed_down_until = time.time() + _API_EMBED_COOLDOWN_SECONDS
                 return []
             # Exponential backoff with light jitter so concurrent retries
             # do not all hit the provider at the same instant.
@@ -215,6 +285,126 @@ def _api_embed(texts, user_id=None):
     current_app.logger.error(f"Embedding API call exhausted retries: {last_exc}")
     return []
 
+
+
+# Segment-aware chunking target. ~1400 chars ≈ 300-350 tokens: large enough
+# that a rapid back-and-forth exchange stays together in one chunk, small
+# enough to stay a precise retrieval unit.
+CHUNK_TARGET_CHARS = int(os.environ.get('CHUNK_TARGET_CHARS', '1400'))
+
+
+def build_transcript_segments(transcription):
+    """Parse a stored transcription into [{speaker, text, start, end}].
+
+    Returns None when the transcription is not the JSON segment format
+    (plain-text transcripts fall back to character windowing).
+    """
+    if not transcription:
+        return None
+    try:
+        data = json.loads(transcription)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, list):
+        return None
+    segments = []
+    for seg in data:
+        if not isinstance(seg, dict):
+            continue
+        text = (seg.get('sentence') or seg.get('text') or '').strip()
+        if not text:
+            continue
+        segments.append({
+            'speaker': (seg.get('speaker') or '').strip() or None,
+            'text': text,
+            'start': seg.get('start_time'),
+            'end': seg.get('end_time'),
+        })
+    return segments if segments else None
+
+
+def _segment_line(seg):
+    """Render one segment as a transcript-style line: 'Speaker: text'."""
+    return f"{seg['speaker']}: {seg['text']}" if seg['speaker'] else seg['text']
+
+
+def _finalize_segment_chunk(segs):
+    """Build a chunk dict from a run of consecutive segments."""
+    text = "\n".join(_segment_line(s) for s in segs)
+    speakers = [s['speaker'] for s in segs if s['speaker']]
+    # Dominant speaker goes in the metadata column (single exact name, so the
+    # speaker-rename maintenance which matches by equality keeps working);
+    # every speaker remains visible inline in the chunk text itself.
+    dominant = max(set(speakers), key=speakers.count) if speakers else None
+    starts = [s['start'] for s in segs if s['start'] is not None]
+    ends = [s['end'] for s in segs if s['end'] is not None]
+    return {
+        'text': text,
+        'speaker_name': dominant,
+        'start_time': min(starts) if starts else None,
+        'end_time': max(ends) if ends else None,
+    }
+
+
+def chunk_transcript_segments(transcription, max_chunk_chars=None):
+    """Segment-aware chunking for diarized (JSON) transcripts.
+
+    Strategy: render each segment as a 'Speaker: text' line and pack WHOLE
+    segments into chunks up to ``max_chunk_chars``, never splitting a
+    speaker turn across chunks (except single turns longer than the limit,
+    which are sentence-split on their own). Chunk boundaries are size-based,
+    not turn-based, so a quickfire exchange of many short turns lands
+    together in one chunk with every speaker labeled inline. Consecutive
+    chunks overlap by one segment for continuity.
+
+    Returns a list of chunk dicts: {text, speaker_name (dominant),
+    start_time, end_time}. Plain-text transcripts fall back to the classic
+    character windows with null metadata.
+    """
+    # Backwards-compatibility escape hatch: CHUNKING_STRATEGY=legacy keeps
+    # the pre-segment-aware behavior byte-identical (500-char windows over
+    # the stored string, no speaker/time metadata) for admins who do not
+    # want indexing behavior to change. Existing chunks are never touched
+    # by an upgrade either way; the strategy only applies when a recording
+    # is (re)indexed.
+    if os.environ.get('CHUNKING_STRATEGY', 'segment').strip().lower() == 'legacy':
+        return [{'text': t, 'speaker_name': None, 'start_time': None, 'end_time': None}
+                for t in chunk_transcription(transcription)]
+
+    max_chunk_chars = max_chunk_chars or CHUNK_TARGET_CHARS
+    segments = build_transcript_segments(transcription)
+    if segments is None:
+        return [{'text': t, 'speaker_name': None, 'start_time': None, 'end_time': None}
+                for t in chunk_transcription(transcription, max_chunk_length=max_chunk_chars,
+                                             overlap=max(50, max_chunk_chars // 20))]
+
+    chunks = []
+    current = []
+    current_len = 0
+    for seg in segments:
+        line_len = len(_segment_line(seg)) + 1
+        if line_len > max_chunk_chars:
+            # A single oversized turn: flush what we have, then sentence-split
+            # the turn into its own chunks carrying its speaker and times.
+            if current:
+                chunks.append(_finalize_segment_chunk(current))
+                current, current_len = [], 0
+            for piece in chunk_transcription(seg['text'], max_chunk_length=max_chunk_chars,
+                                             overlap=max(50, max_chunk_chars // 20)):
+                chunks.append(_finalize_segment_chunk([{**seg, 'text': piece}]))
+            continue
+        if current and current_len + line_len > max_chunk_chars:
+            chunks.append(_finalize_segment_chunk(current))
+            # One-segment overlap so a thought spanning the boundary stays
+            # findable from either side.
+            tail = current[-1]
+            current = [tail] if len(_segment_line(tail)) + line_len <= max_chunk_chars else []
+            current_len = sum(len(_segment_line(s)) + 1 for s in current)
+        current.append(seg)
+        current_len += line_len
+    if current:
+        chunks.append(_finalize_segment_chunk(current))
+    return chunks
 
 
 def chunk_transcription(transcription, max_chunk_length=500, overlap=50):
@@ -360,53 +550,58 @@ def process_recording_chunks(recording_id):
 
     Returns True on full success, False on any failure including the case
     where embedding generation returned fewer vectors than there were
-    chunks. On failure the transaction is rolled back so the recording's
-    existing chunks are preserved; this prevents the "old chunks deleted,
-    new chunks not inserted" silent-failure mode that occurs when the
-    embedding API blips mid-run.
+    chunks. Embeddings are generated before the old chunks are deleted, so
+    a failure leaves the recording's existing chunks intact and never holds
+    a database write lock across the (potentially slow) embedding API call.
     """
     try:
         recording = db.session.get(Recording, recording_id)
         if not recording or not recording.transcription:
             return False
 
-        # Delete existing chunks for this recording. The deletion is staged
-        # in this transaction; if anything below fails we rollback and the
-        # old chunks survive. Only the final commit makes the swap
-        # permanent.
-        TranscriptChunk.query.filter_by(recording_id=recording_id).delete()
-
-        # Create chunks
-        chunks = chunk_transcription(recording.transcription)
+        # Create chunks and generate their embeddings BEFORE touching the
+        # transcript_chunk table. The embeddings call is a network round-trip
+        # that can take 30+ seconds against a cold local model; running it
+        # inside an open write transaction held SQLite's single writer lock
+        # for the whole duration and starved concurrent writers such as the
+        # summarize-job enqueue (issue #355). Doing the slow work first keeps
+        # the delete + insert + commit window down to milliseconds.
+        chunks = chunk_transcript_segments(recording.transcription)
 
         if not chunks:
+            TranscriptChunk.query.filter_by(recording_id=recording_id).delete()
             db.session.commit()
             return True
 
         # Generate embeddings (recording owner gets billed for API-mode usage)
-        embeddings = generate_embeddings(chunks, user_id=recording.user_id)
+        embeddings = generate_embeddings([c['text'] for c in chunks], user_id=recording.user_id)
 
         # Verify we got one embedding per chunk. _api_embed returns [] on
         # exhausted retries, and a partial provider response could return
-        # fewer than expected. Either case is a failure: rolling back keeps
-        # the recording's old chunks intact so the admin retry pass (or a
-        # later Re-embed all) can try again.
+        # fewer than expected. Either case is a failure; the recording's
+        # existing chunks are untouched so the admin retry pass (or a later
+        # Re-embed all) can try again.
         if len(embeddings) != len(chunks):
-            db.session.rollback()
             current_app.logger.error(
                 f"Embedding generation returned {len(embeddings)} vectors for "
-                f"{len(chunks)} chunks on recording {recording_id}; rolling "
-                f"back to preserve existing chunks."
+                f"{len(chunks)} chunks on recording {recording_id}; keeping "
+                f"existing chunks."
             )
             return False
 
-        # Store chunks in database
-        for i, (chunk_text, embedding) in enumerate(zip(chunks, embeddings)):
+        # Swap the chunks in one short transaction: the delete is staged and
+        # only the final commit makes it permanent, so a failure here still
+        # rolls back to the old chunks.
+        TranscriptChunk.query.filter_by(recording_id=recording_id).delete()
+        for i, (chunk_data, embedding) in enumerate(zip(chunks, embeddings)):
             chunk = TranscriptChunk(
                 recording_id=recording_id,
                 user_id=recording.user_id,
                 chunk_index=i,
-                content=chunk_text,
+                content=chunk_data['text'],
+                speaker_name=(chunk_data['speaker_name'] or None) and chunk_data['speaker_name'][:100],
+                start_time=chunk_data['start_time'],
+                end_time=chunk_data['end_time'],
                 embedding=serialize_embedding(embedding) if embedding is not None else None
             )
             db.session.add(chunk)
@@ -453,10 +648,15 @@ def basic_text_search_chunks(user_id, query, filters=None, top_k=5):
                     RecordingTag, Recording.id == RecordingTag.recording_id
                 ).filter(RecordingTag.tag_id.in_(filters['tag_ids']))
 
+            if filters.get('folder_ids'):
+                # A subquery, so that no second join to Recording is needed (#428)
+                chunks_query = chunks_query.filter(TranscriptChunk.recording_id.in_(
+                    db.session.query(Recording.id).filter(Recording.folder_id.in_(filters['folder_ids']))))
+
             if filters.get('speaker_names'):
                 # Filter by the participants field on the recording.
                 speaker_conditions = [
-                    Recording.participants.ilike(f'%{speaker_name}%')
+                    Recording.participants.ilike(contains_pattern(speaker_name), escape=LIKE_ESCAPE)
                     for speaker_name in filters['speaker_names']
                 ]
                 chunks_query = chunks_query.filter(db.or_(*speaker_conditions))
@@ -467,10 +667,16 @@ def basic_text_search_chunks(user_id, query, filters=None, top_k=5):
                     TranscriptChunk.recording_id.in_(filters['recording_ids'])
                 )
 
-            if filters.get('date_from'):
-                chunks_query = chunks_query.filter(Recording.meeting_date >= filters['date_from'])
-            if filters.get('date_to'):
-                chunks_query = chunks_query.filter(Recording.meeting_date <= filters['date_to'])
+            if filters.get('date_from') or filters.get('date_to'):
+                # Local calendar days of the user, as UTC bounds; date_to is
+                # inclusive (it used to drop the last day, #412).
+                from src.utils.timezones import local_date_bounds, user_timezone_by_id
+                _start, _end = local_date_bounds(filters.get('date_from'), filters.get('date_to'),
+                                                 user_timezone_by_id(user_id))
+                if _start is not None:
+                    chunks_query = chunks_query.filter(Recording.meeting_date >= _start)
+                if _end is not None:
+                    chunks_query = chunks_query.filter(Recording.meeting_date < _end)
 
         # Text search - filter stop words and rank by match count
         stop_words = {'a', 'an', 'the', 'is', 'are', 'was', 'were', 'be', 'been',
@@ -491,23 +697,53 @@ def basic_text_search_chunks(user_id, query, filters=None, top_k=5):
             query_words = [w for w in query.lower().split() if len(w) > 1]
 
         if query_words:
-            from sqlalchemy import or_, func, case, literal
+            from sqlalchemy import or_, case
 
             # Filter: match ANY keyword (OR) to get candidates
             text_conditions = []
             for word in query_words:
-                text_conditions.append(TranscriptChunk.content.ilike(f'%{word}%'))
+                text_conditions.append(TranscriptChunk.content.ilike(contains_pattern(word), escape=LIKE_ESCAPE))
             chunks_query = chunks_query.filter(or_(*text_conditions))
 
-            # Fetch more candidates than needed so we can rank them
-            chunks = chunks_query.limit(top_k * 5).all()
+            # Rank IN SQL before limiting. The previous code applied
+            # LIMIT before any ranking, so with a common word in the query
+            # ("rate", "team") the candidate set filled up with arbitrary
+            # low-id chunks and the actually-relevant chunks never entered
+            # the ranking at all. Score = number of matched words, with the
+            # full phrase counting double so exact-phrase hits always
+            # outrank scattered single-word matches.
+            score_expr = sum(
+                case((TranscriptChunk.content.ilike(contains_pattern(word), escape=LIKE_ESCAPE), 1), else_=0)
+                for word in query_words
+            )
+            phrase = query.lower().strip()
+            if len(query_words) > 1 and len(phrase) >= 5:
+                score_expr = score_expr + case(
+                    (TranscriptChunk.content.ilike(contains_pattern(phrase), escape=LIKE_ESCAPE), len(query_words)),
+                    else_=0,
+                )
+            chunks = (chunks_query
+                      .order_by(score_expr.desc(), TranscriptChunk.id.desc())
+                      .limit(top_k * 5)
+                      .all())
 
-            # Rank by how many query words each chunk matches
+            # Refine in Python over the now well-chosen candidates: exact
+            # word-boundary matches beat substring matches ("rate" inside
+            # "separate"), and phrase presence keeps its bonus.
             scored_chunks = []
             for chunk in chunks:
                 content_lower = chunk.content.lower()
-                match_count = sum(1 for word in query_words if word in content_lower)
-                score = match_count / len(query_words)  # 0.0 to 1.0
+                match_count = 0.0
+                for word in query_words:
+                    if re.search(r'\b' + re.escape(word) + r'\b', content_lower):
+                        match_count += 1.0
+                    elif word in content_lower:
+                        match_count += 0.5
+                if len(query_words) > 1 and phrase in content_lower:
+                    match_count += len(query_words)
+                # Full word-boundary matches on every word score 1.0; the
+                # phrase bonus only breaks ties above, capped back to 1.0.
+                score = min(match_count / len(query_words), 1.0)
                 scored_chunks.append((chunk, score))
 
             # Sort by score descending, take top_k
@@ -551,7 +787,7 @@ def semantic_search_chunks(user_id, query, filters=None, top_k=5):
         # the API call to the searching user so embedding cost tracking shows
         # who issued the query.
         if USE_API_EMBEDDINGS:
-            api_vectors = _api_embed([query], user_id=user_id)
+            api_vectors = _api_embed([query], user_id=user_id, input_type="query")
             if not api_vectors:
                 return basic_text_search_chunks(user_id, query, filters, top_k)
             query_embedding = api_vectors[0]
@@ -585,10 +821,15 @@ def semantic_search_chunks(user_id, query, filters=None, top_k=5):
                     RecordingTag, Recording.id == RecordingTag.recording_id
                 ).filter(RecordingTag.tag_id.in_(filters['tag_ids']))
 
+            if filters.get('folder_ids'):
+                # A subquery, so that no second join to Recording is needed (#428)
+                chunks_query = chunks_query.filter(TranscriptChunk.recording_id.in_(
+                    db.session.query(Recording.id).filter(Recording.folder_id.in_(filters['folder_ids']))))
+
             if filters.get('speaker_names'):
                 # Filter by the participants field on the recording.
                 speaker_conditions = [
-                    Recording.participants.ilike(f'%{speaker_name}%')
+                    Recording.participants.ilike(contains_pattern(speaker_name), escape=LIKE_ESCAPE)
                     for speaker_name in filters['speaker_names']
                 ]
                 chunks_query = chunks_query.filter(db.or_(*speaker_conditions))
@@ -599,10 +840,16 @@ def semantic_search_chunks(user_id, query, filters=None, top_k=5):
                     TranscriptChunk.recording_id.in_(filters['recording_ids'])
                 )
 
-            if filters.get('date_from'):
-                chunks_query = chunks_query.filter(Recording.meeting_date >= filters['date_from'])
-            if filters.get('date_to'):
-                chunks_query = chunks_query.filter(Recording.meeting_date <= filters['date_to'])
+            if filters.get('date_from') or filters.get('date_to'):
+                # Local calendar days of the user, as UTC bounds; date_to is
+                # inclusive (it used to drop the last day, #412).
+                from src.utils.timezones import local_date_bounds, user_timezone_by_id
+                _start, _end = local_date_bounds(filters.get('date_from'), filters.get('date_to'),
+                                                 user_timezone_by_id(user_id))
+                if _start is not None:
+                    chunks_query = chunks_query.filter(Recording.meeting_date >= _start)
+                if _end is not None:
+                    chunks_query = chunks_query.filter(Recording.meeting_date < _end)
 
         # Get chunks that have embeddings
         chunks = chunks_query.filter(TranscriptChunk.embedding.isnot(None)).all()
@@ -672,4 +919,20 @@ def semantic_search_chunks(user_id, query, filters=None, top_k=5):
 # --- Helper Functions for Document Processing ---
 
 
+def embeddings_are_local():
+    """True when embeddings are computed on machines the administrator runs:
+    the built-in local model, or an endpoint on a loopback or private address
+    or a .local/.lan/.internal host. Used to show "local" in place of $0."""
+    if not USE_API_EMBEDDINGS:
+        return True
+    import ipaddress
+    from urllib.parse import urlparse
+    host = (urlparse(EMBEDDING_BASE_URL).hostname or '').lower()
+    if host in ('localhost',) or host.endswith(('.local', '.lan', '.internal', '.localhost')):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_private or ip.is_loopback or ip.is_link_local
+    except ValueError:
+        return False
 

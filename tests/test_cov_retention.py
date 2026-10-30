@@ -35,6 +35,28 @@ def _make_storage_mock(exists=True):
     return storage
 
 
+def _wipe_recordings():
+    """Delete every recording and every row that refers to one.
+
+    A bulk delete skips the ORM cascades, and PostgreSQL refuses to delete a
+    recording while rows in other tables (events, shares, chunks...) still
+    refer to it, so those tables are emptied first, children before parents.
+    """
+    tables = {"recording"}
+    while True:
+        more = {
+            t.name for t in db.metadata.sorted_tables
+            if t.name not in tables
+            and any(fk.column.table.name in tables for fk in t.foreign_keys)
+        }
+        if not more:
+            break
+        tables |= more
+    for table in reversed(db.metadata.sorted_tables):
+        if table.name in tables:
+            db.session.execute(table.delete())
+
+
 class RetentionTestBase(unittest.TestCase):
     def setUp(self):
         self.ctx = app.app_context()
@@ -51,8 +73,7 @@ class RetentionTestBase(unittest.TestCase):
         # pytest session DB is shared across test files. Wipe any recordings
         # left behind by other suites so this class's global stat-counter
         # assertions are deterministic regardless of run order.
-        RecordingTag.query.delete()
-        Recording.query.delete()
+        _wipe_recordings()
         db.session.commit()
         self._created_recordings = []
         self._created_tags = []
@@ -196,7 +217,7 @@ class TestProcessAutoDeletion(RetentionTestBase):
 
     def test_disabled_returns_error(self):
         stats, _ = self._run(enabled=False)
-        self.assertEqual(stats, {'error': 'Auto-deletion is not enabled'})
+        self.assertEqual(stats, {'error': 'Auto-deletion is not enabled', 'code': 'auto_deletion_disabled'})
 
     def test_full_delete_removes_old_recording_and_audio(self):
         rec = self.make_recording(age_days=100, audio_path='user/old.mp3')

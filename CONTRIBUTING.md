@@ -55,6 +55,172 @@ Please review the [CLA document](CLA.md) before submitting your contribution. Wh
 - Test your changes before submitting
 - Keep PRs focused on a single feature or fix
 
+### Database Migrations
+
+Speakr has no migration framework. Schema changes are hand-written in
+`src/init_db.py` and run on every startup, against SQLite (the shipped default) and
+PostgreSQL (common in larger deployments). Both have to keep working, and a migration
+that misbehaves runs on databases full of other people's recordings, so this area has
+stricter rules than the rest of the codebase.
+
+**Use the helpers in `src/utils/database.py`, never raw DDL.** Each one alters a single
+thing and handles the differences between the two backends, including boolean defaults,
+type names and quoting of reserved words such as `user`.
+
+| Need | Helper |
+|---|---|
+| Add a column | `add_column_if_not_exists()` |
+| Relax `NOT NULL` | `drop_not_null()` |
+| Change a column type | `migrate_column_type()` |
+| Add an index | `create_index_if_not_exists()` |
+
+**Never rebuild a table from a written-out schema.** A migration that does
+`CREATE TABLE x_new (...)`, copies the rows, drops the original and renames has frozen
+that column list at the moment it was written. Every column added afterwards is
+silently destroyed the day the migration runs. Change the one column you care about
+instead, which is what the helpers do.
+
+**Make it idempotent.** Migrations run several times per container start, some of them
+concurrently: from the entrypoint, from the admin user script, and once per worker
+process. A `migration_lock()` keeps them from interleaving, but it fails open after a
+timeout rather than holding the container down, so every migration must still recognise
+that its work is already done and return without acting.
+
+**Register genuinely one-shot work instead of re-detecting it.** A data fix that can
+only ever be needed once, or whose "has this run?" check would scan a whole table on
+every boot, belongs in the ledger:
+
+```python
+run_once(engine, '0002_short_description_of_the_change', my_migration, logger=app.logger)
+```
+
+It runs the callable the first time only and records the id in `schema_migrations`. A
+failure is left unrecorded, so it is retried on the next startup. Number ids in
+sequence and never reuse or renumber one, since existing installations have the old id
+recorded.
+
+**Make failure recoverable.** pysqlite does not open a transaction for DDL, so a bare
+`CREATE TABLE` or `ALTER TABLE` commits immediately even inside a
+`with engine.connect()` block, and a failure later in the sequence leaves it behind
+permanently. If a migration writes more than one statement, drive the transaction
+yourself; `drop_not_null()` shows the pattern.
+
+Migrations run in named `_migration_section(...)` groups, so one failure aborts only
+its own group and the rest still apply; every failed section is named in an error
+banner and recorded in `app.config['MIGRATION_FAILED']`. Put a new migration inside
+the section it belongs to (or add a section), never outside all of them.
+
+**Add a column before anything reads it.** Migrations execute top to bottom in one
+function, so referencing a column that is added further down fails on precisely the
+upgrade path the migration exists for.
+
+**Test the upgrade, not just the result.** `tests/test_upgrade_path.py` takes real
+schemas from older releases, seeds them, runs the current migrations over them, and
+asserts that no column, index or value was lost and that the schema ends up matching
+today's models. Every other test in the suite runs against a database built fresh from
+current models, which is the one shape no upgrading user ever has.
+
+The fixtures live in `tests/fixtures/schemas/` as plain SQL, dumped from each tag's own
+models, so the tests need no old dependencies and no network. Add a version with:
+
+```bash
+python scripts/generate_schema_fixtures.py v0.9.0-alpha
+```
+
+Verify with:
+
+```bash
+python -m pytest -q tests/test_migration_compatibility.py tests/test_upgrade_path.py \
+    tests/test_migration_drop_not_null.py tests/test_migration_infrastructure.py
+
+# and against a real PostgreSQL, which the tests skip without one
+docker compose -f docker-compose.postgres.yml up -d postgres
+TEST_DATABASE_URI=postgresql://speakr:speakr@localhost:5432/speakr python -m pytest -q \
+    tests/test_postgres_migrations.py tests/test_migration_drop_not_null.py
+```
+
+The whole suite also runs on PostgreSQL in CI (`python-tests-postgres`). To run it locally,
+create an empty database used only by the tests and pass it in `PYTEST_DATABASE_URI`:
+
+```bash
+docker compose -f docker-compose.postgres.yml exec postgres createdb -U speakr speakr_suite
+PYTEST_DATABASE_URI=postgresql://speakr:speakr@localhost:5432/speakr_suite python -m pytest -q tests/
+```
+
+`TEST_DATABASE_URI` is read only by the migration tests, which drop every table when they
+finish, so the two variables point at different databases. PostgreSQL enforces what SQLite
+does not: test data has to fit the columns (a username holds at most 20 characters), and
+a test that cleans up deletes the rows that refer to a recording, tag or user before it.
+
+These run in CI, and the pre-commit hook runs them whenever you touch `src/init_db.py`,
+`src/utils/database.py` or `src/models/`.
+
+A migration needs a test asserting on what a bad one would take away, meaning the other
+columns, the indexes and the row values, not merely that the intended change happened.
+Values matter as much as schema: when the #379 migration destroyed 27 columns, the
+`add_column_if_not_exists()` calls further down the same function immediately put the
+names back, so only the emptied values revealed the damage.
+
+### Background Work at Startup
+
+`src/app.py` calls `run_startup_tasks()` at module scope, so **every process that
+imports the app runs it**: the entrypoint's schema check, `docker_create_admin.py`, and
+each gunicorn worker. The shipped image runs three workers, so anything started there
+runs about five times per container, several of them concurrently.
+
+A `global _x_started` flag does not help. Each process has its own copy, so it guards a
+second start inside one process and nothing else.
+
+This is not a hypothetical risk. In #384 the job queue's orphan recovery ran in every
+booting process, and because it resets every row in `processing` back to `queued` with
+no way to tell a job abandoned by a crash from one a sibling is transcribing right now,
+a worker starting up un-claimed live work and the same audio went to the ASR service
+once per worker. It shipped for nine months.
+
+**Anything that starts a thread, watches a directory, or sweeps a table goes through
+`start_single_instance()` in `src/config/startup.py`,** with a lock name registered in
+`SINGLE_INSTANCE_LOCKS`:
+
+```python
+start_single_instance(
+    app, MY_TASK_OWNER_LOCK,
+    lambda: initialize_my_task(app), 'my task')
+```
+
+The election uses a file lock held for the life of the process, so leadership ends on
+process death, including a crash, and the replacement worker wins the next one. It fails
+open: if the election cannot run, the process takes ownership rather than leaving the
+work undone.
+
+Two things stay outside the election. Work every process genuinely needs, such as
+binding the job queue so any worker can accept an upload and enqueue it. And work with
+nothing to duplicate, such as creating a directory.
+
+`tests/test_startup_single_instance.py` enforces this, and the enforcing test is
+structural rather than a list: it neutralises `start_single_instance` and asserts that
+`run_startup_tasks` then starts no threads at all, so a new task that skips the election
+fails it without anyone remembering to add a case.
+
+### Testing Concurrency
+
+Test cross-process behaviour **with processes**. The suite already had
+`tests/test_job_queue_race_condition.py` when #384 was reported, written specifically to
+prove that two workers cannot claim the same job. It passes, and it is correct. It also
+could not have caught the bug: it uses a `ThreadPoolExecutor` inside one process, and
+its own docstring notes that it never calls `start()`. Claiming was never broken. Several
+*processes* running the queue was.
+
+A test near a bug that structurally cannot observe it is worse than no test, because it
+makes the area feel covered.
+
+Prefer real subprocesses over `fork` for these. A gunicorn worker without `--preload`
+imports the app fresh, so a new interpreter is the honest simulation, and forking a
+process that already has background threads holding locks can deadlock the child.
+
+Assert on the duplication itself, not on the lock's return value, and keep the workers
+alive at the same time. Started one after another, each wins every election and the test
+passes while proving nothing.
+
 ### Commit Message Guidelines
 
 Follow the format used in the project:
@@ -101,9 +267,23 @@ docker-compose -f docker-compose.dev.yml up -d --build
 # Or for local development
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
-pip install -r requirements.txt
+pip install --require-hashes --no-deps -r requirements.lock
+python scripts/download_offline_deps.py   # vendor JavaScript, CSS and fonts
+scripts/build_css.sh                      # static/css/tailwind.css (Linux x64/arm64)
 python src/app.py --debug
 ```
+
+The Tailwind stylesheet is compiled from the templates and scripts. After a change to the Tailwind classes in a template or script, run `scripts/build_css.sh` again, or keep `scripts/build_css.sh --watch` running. Only complete class names written out in the source are compiled; a class name assembled from parts at runtime (for example `bg-${color}-500`) is missing from the stylesheet.
+
+### Dependencies
+
+Every Python package, including the dependencies of dependencies, is pinned with its hashes in `requirements.lock` (lite image) and `requirements-embeddings.lock` (full image), and the images are built with `pip install --require-hashes`. The vendored JavaScript, CSS and fonts are pinned to exact versions and checked against their SHA-256 checksums in `scripts/download_offline_deps.py`.
+
+- Give a clear reason for a new dependency in the PR description. A feature that can be built with the existing packages is preferred, and for a heavy dependency needed only by a rarely used feature, you may be asked to keep that part in a fork.
+- After a change to `requirements.txt` or `requirements-embeddings.txt`, run `scripts/lock-requirements.sh` (Docker is required) and commit the lock files. The lock files are checked in CI, and a mismatch is reported as a failure.
+- To update one package: `scripts/lock-requirements.sh --upgrade-package <name>`. Releases that have been public for less than a week are not accepted.
+- The locked packages are checked against the published advisories with `scripts/audit-dependencies.sh` (pip-audit), in CI and before every release. An advisory that does not apply to Speakr is listed in `scripts/audit-exceptions.txt` with a reason and a review date.
+- PRs that change dependencies, the Dockerfile, workflows or scripts, or that add minified, binary or encoded content, are reviewed line by line, so their review can take longer.
 
 ## What Happens After You Submit a PR?
 

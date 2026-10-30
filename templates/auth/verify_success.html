@@ -1,12 +1,11 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="{{ page_language }}">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="robots" content="noindex, nofollow, noarchive, nosnippet, noimageindex">
-    <title>{{ title }} - Speakr</title>
+    <title>{{ t('authPages.emailVerifiedTitle') }} - Speakr</title>
     <link rel="icon" href="{{ url_for('static', filename='img/favicon.ico') }}" type="image/svg+xml">
-    <script src="{{ url_for('static', filename='vendor/js/tailwind.min.js') }}"></script>
     <link rel="stylesheet" href="{{ url_for('static', filename='vendor/css/fontawesome.min.css') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
 
@@ -36,6 +35,10 @@
         }
         applyTheme();
     </script>
+    <!-- Tailwind utilities, compiled at build time (scripts/build_css.sh). Last in
+         <head> so that, as with the former runtime build, they follow the page's
+         own stylesheets in the cascade. -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/tailwind.css') }}">
 </head>
 <body class="bg-[var(--bg-primary)] text-[var(--text-primary)]">
     <div class="container mx-auto px-4 sm:px-6 lg:px-8 py-6 flex flex-col min-h-screen">
@@ -57,13 +60,13 @@
                         </div>
                     </div>
 
-                    <h2 class="text-2xl font-semibold text-[var(--text-primary)] mb-4">Email Verified!</h2>
+                    <h2 class="text-2xl font-semibold text-[var(--text-primary)] mb-4">{{ t('authPages.emailVerifiedHeading') }}</h2>
                     <p class="text-[var(--text-secondary)] mb-6">
-                        Your email address has been successfully verified. You can now log in to your account.
+                        {{ t('authPages.emailVerifiedHelp') }}
                     </p>
 
                     <a href="{{ url_for('auth.login') }}" class="inline-block w-full py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-[var(--text-button)] bg-[var(--bg-button)] hover:bg-[var(--bg-button-hover)] focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[var(--border-focus)] transition-colors duration-200">
-                        <i class="fas fa-sign-in-alt mr-2"></i> Continue to Login
+                        <i class="fas fa-sign-in-alt mr-2"></i> {{ t('authPages.continueToLogin') }}
                     </a>
                 </div>
             </div>

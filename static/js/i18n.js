@@ -9,6 +9,10 @@ class I18n {
         this.currentLocale = 'en';
         this.fallbackLocale = 'en';
         this.loadedLocales = new Set();
+        // Resolved once init() has loaded the translations, so code that
+        // renders before then (the shared page header) can wait for them.
+        this.isReady = false;
+        this.ready = new Promise(resolve => { this._resolveReady = resolve; });
     }
 
     /**
@@ -29,6 +33,48 @@ class I18n {
         if (this.currentLocale !== this.fallbackLocale) {
             await this.loadLocale(this.fallbackLocale);
         }
+
+        this._markReady();
+    }
+
+    _markReady() {
+        if (this.isReady) return;
+        this.isReady = true;
+        this._resolveReady();
+        window.dispatchEvent(new CustomEvent('i18nReady', { detail: { locale: this.currentLocale } }));
+    }
+
+    /**
+     * Use translations embedded in the page (window.__I18N_BOOTSTRAP, from
+     * templates/includes/i18n_bootstrap.html), so the first render is already
+     * translated and no locale file is fetched for it. The locale is chosen as
+     * in init(). When the chosen locale is not among the embedded ones, ready
+     * stays pending and the locale is fetched by init() as before.
+     * @param {{locale: string, translations: Object<string, Object>}} data
+     * @returns {boolean} true when the translations are ready
+     */
+    applyBootstrap(data) {
+        if (!data || typeof data !== 'object' || !data.translations || typeof data.translations !== 'object') {
+            return false;
+        }
+        for (const [code, table] of Object.entries(data.translations)) {
+            if (table && typeof table === 'object') {
+                this.translations[code] = table;
+                this.loadedLocales.add(code);
+            }
+        }
+        let savedLocale = null;
+        try {
+            savedLocale = localStorage.getItem('preferredLanguage');
+        } catch (e) {
+            savedLocale = null;
+        }
+        this.currentLocale = savedLocale || data.locale || this.fallbackLocale;
+        if (!this.loadedLocales.has(this.currentLocale) || !this.loadedLocales.has(this.fallbackLocale)) {
+            return false;
+        }
+        this._markReady();
+        return true;
     }
 
     /**
@@ -41,7 +87,11 @@ class I18n {
         }
 
         try {
-            const response = await fetch(`/static/locales/${locale}.json`);
+            // 'no-cache' forces a conditional revalidation so a browser (or
+            // proxy) heuristic cache can never serve a previous release's
+            // locale file against newer templates — the "Translation not
+            // found" spam after upgrades (issue #357).
+            const response = await fetch(`/static/locales/${locale}.json`, { cache: 'no-cache' });
             if (!response.ok) {
                 throw new Error(`Failed to load locale: ${locale}`);
             }
@@ -83,6 +133,21 @@ class I18n {
      */
     getLocale() {
         return this.currentLocale;
+    }
+
+    /**
+     * The interface locale as a language tag for Intl and the toLocale*String
+     * methods, so dates and numbers follow the selected language (#480).
+     * Undefined, which Intl reads as the browser default, when the stored code
+     * is not a valid tag: Intl throws on one, and a date should still render.
+     * @returns {string|undefined}
+     */
+    getIntlLocale() {
+        try {
+            return Intl.getCanonicalLocales(this.currentLocale)[0];
+        } catch (e) {
+            return undefined;
+        }
     }
 
     /**
@@ -190,7 +255,7 @@ class I18n {
      */
     formatDate(date, options = {}) {
         const d = date instanceof Date ? date : new Date(date);
-        return new Intl.DateTimeFormat(this.currentLocale, options).format(d);
+        return new Intl.DateTimeFormat(this.getIntlLocale(), options).format(d);
     }
 
     /**
@@ -200,28 +265,40 @@ class I18n {
      * @returns {string} Formatted number string
      */
     formatNumber(number, options = {}) {
-        return new Intl.NumberFormat(this.currentLocale, options).format(number);
+        return new Intl.NumberFormat(this.getIntlLocale(), options).format(number);
     }
 
     /**
-     * Format file size with appropriate unit
+     * Format a percentage in the interface language: "12.5%", "12,5 %" in
+     * German (#480). The value is on the 0-100 scale, as every caller holds
+     * it: formatPercent(12.5) is 12.5 %, not 1250 %.
+     * @param {number} percent - Percentage, 0-100 (more is allowed)
+     * @param {object} options - Intl.NumberFormat options; at most one decimal by default
+     * @returns {string} Formatted percentage
+     */
+    formatPercent(percent, options = {}) {
+        const value = Number(percent);
+        return this.formatNumber(Number.isFinite(value) ? value / 100 : 0,
+            { maximumFractionDigits: 1, ...options, style: 'percent' });
+    }
+
+    /**
+     * Format file size with appropriate unit, at most one decimal, in the
+     * interface language's number format: "1.5 MB", "1,5 MB" in German (#481).
+     * src/utils/localization.py format_file_size() is the server-side twin.
      * @param {number} bytes - Size in bytes
      * @returns {string} Formatted file size
      */
     formatFileSize(bytes) {
-        const units = ['bytes', 'kilobytes', 'megabytes', 'gigabytes'];
-        const unitValues = [1, 1024, 1048576, 1073741824];
-        
-        let unitIndex = 0;
-        for (let i = unitValues.length - 1; i >= 0; i--) {
-            if (bytes >= unitValues[i]) {
-                unitIndex = i;
-                break;
-            }
-        }
-        
-        const value = Math.round(bytes / unitValues[unitIndex] * 10) / 10;
-        return this.t(`fileSize.${units[unitIndex]}`, { count: value });
+        const units = ['bytes', 'kilobytes', 'megabytes', 'gigabytes', 'terabytes'];
+        const size = Math.max(Number(bytes) || 0, 0);
+        let unit = 0;
+        while (unit < units.length - 1 && size >= 1024 ** (unit + 1)) unit++;
+        // 1023.97 KB would round to "1024 KB"; that is 1 MB.
+        if (unit < units.length - 1 && Math.round(size / 1024 ** unit * 10) / 10 >= 1024) unit++;
+        // No grouping: below 1 PB the count is under 1024, and German "1.023 B" reads as 1.023.
+        const count = this.formatNumber(size / 1024 ** unit, { maximumFractionDigits: 1, useGrouping: false });
+        return this.t(`fileSize.${units[unit]}`, { count });
     }
 
     /**
@@ -305,6 +382,11 @@ const i18n = new I18n();
 if (typeof window !== 'undefined') {
     // Ensure window.i18n exists with at least a basic t function
     window.i18n = i18n;
+
+    // Translations embedded in the page are used at once (see applyBootstrap).
+    if (window.__I18N_BOOTSTRAP) {
+        i18n.applyBootstrap(window.__I18N_BOOTSTRAP);
+    }
     
     // Add a fallback t function if the class method isn't ready
     if (!window.i18n.t) {

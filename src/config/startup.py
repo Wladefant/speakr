@@ -7,9 +7,73 @@ import time
 import threading
 from datetime import datetime, timedelta
 from flask import current_app
+from src.utils.localization import api_error
 
 ENABLE_AUTO_DELETION = os.environ.get('ENABLE_AUTO_DELETION', 'false').lower() == 'true'
 GLOBAL_RETENTION_DAYS = int(os.environ.get('GLOBAL_RETENTION_DAYS', '0'))
+
+# Cross-process elections for work that must run in exactly one process.
+#
+# src/app.py calls run_startup_tasks() at module scope, so EVERY process that
+# imports it runs this file: the entrypoint's schema check, the admin-user
+# script, and each gunicorn worker (three by default). Anything here that
+# starts a thread, watches a directory or sweeps a table therefore ran that
+# many times over.
+#
+# That is not a hypothetical. It is #384: orphan recovery in every booting
+# process un-claimed jobs a sibling was mid-way through transcribing, and the
+# same audio went to the ASR service once per worker. The process-local
+# `global _x_started` guards several of these used are worthless here, because
+# each process has its own copy of the global.
+#
+# The fix is an election per responsibility. Route background work through
+# start_single_instance() below rather than calling it directly, so that
+# adding a new one forces the question "which process should run this?" to be
+# answered rather than skipped.
+JOB_QUEUE_OWNER_LOCK = 'speakr.job_queue_owner'
+FILE_MONITOR_OWNER_LOCK = 'speakr.file_monitor_owner'
+AUTO_DELETION_OWNER_LOCK = 'speakr.auto_deletion_owner'
+SESSION_CLEANUP_OWNER_LOCK = 'speakr.session_cleanup_owner'
+WEBHOOK_DISPATCHER_OWNER_LOCK = 'speakr.webhook_dispatcher_owner'
+VOICE_EMBEDDING_CHECK_OWNER_LOCK = 'speakr.voice_embedding_check_owner'
+
+# Every lock name this module elects on. The test suite asserts that each
+# background starter in run_startup_tasks() goes through one of these.
+SINGLE_INSTANCE_LOCKS = (
+    JOB_QUEUE_OWNER_LOCK,
+    FILE_MONITOR_OWNER_LOCK,
+    AUTO_DELETION_OWNER_LOCK,
+    SESSION_CLEANUP_OWNER_LOCK,
+    WEBHOOK_DISPATCHER_OWNER_LOCK,
+    VOICE_EMBEDDING_CHECK_OWNER_LOCK,
+)
+
+
+def start_single_instance(app, lock_name, start, description):
+    """Run `start` only in the process that wins the election for `lock_name`.
+
+    Losing is the normal outcome for most processes and is logged at debug;
+    it is not a failure. The election fails open, so the worst case is the
+    pre-election behaviour rather than work that never runs at all.
+    """
+    from src.database import db
+    from src.utils.database import acquire_singleton_lock
+
+    try:
+        if not acquire_singleton_lock(db.engine, lock_name, app.logger):
+            app.logger.debug("%s runs in another process; skipping here", description)
+            return False
+    except Exception as e:
+        # Never let the election itself cost us the work it guards.
+        app.logger.error(
+            "Could not run the election for %s, starting it here anyway: %s", description, e)
+
+    try:
+        start()
+        return True
+    except Exception as e:
+        app.logger.warning("%s failed to start: %s", description, e)
+        return False
 
 
 def initialize_file_monitor(app):
@@ -36,7 +100,7 @@ def get_file_monitor_functions(app):
         def stop_file_monitor():
             pass
         def get_file_monitor_status():
-            return {'running': False, 'error': 'File monitor module not available'}
+            return {'running': False, **api_error('file_monitor_unavailable')}
 
         return start_file_monitor, stop_file_monitor, get_file_monitor_status
 
@@ -108,37 +172,49 @@ def initialize_file_exporter(app):
         app.logger.warning(f"File exporter initialization failed: {e}")
 
 
+def bind_job_queue(app):
+    """Make the queue usable in this process. Every process needs this.
+
+    Binding is not the same as owning: a process that lost the election still
+    accepts uploads and enqueues them, it just runs no workers.
+    """
+    from src.services.job_queue import job_queue
+    job_queue.init_app(app)
+
+
+def start_job_queue(app):
+    """Recover orphaned jobs and run the workers. Owner process only.
+
+    Recovery is the reason this must not run everywhere: it resets every row
+    in `processing` back to `queued` with no way to tell a job abandoned by a
+    crash from one a sibling process is transcribing right now (#384).
+    """
+    from src.services.job_queue import job_queue
+
+    job_queue.mark_as_owner()
+    job_queue.recover_orphaned_jobs()
+    job_queue.start()
+
+    status = job_queue.get_queue_status()
+    t_queue = status['transcription_queue']
+    s_queue = status['summary_queue']
+    app.logger.info(
+        f"Job queues started: "
+        f"transcription ({t_queue['workers']} workers, {t_queue['queued']} queued), "
+        f"summary ({s_queue['workers']} workers, {s_queue['queued']} queued)"
+    )
+
+
 def initialize_job_queue(app):
-    """Initialize and start the background job queue with orphan recovery."""
-    try:
-        from src.services.job_queue import job_queue
-
-        # Initialize job queue with app context
-        job_queue.init_app(app)
-
-        # Recover any jobs that were processing when the app crashed
-        job_queue.recover_orphaned_jobs()
-
-        # Start worker threads
-        job_queue.start()
-
-        # Get queue status
-        status = job_queue.get_queue_status()
-        t_queue = status['transcription_queue']
-        s_queue = status['summary_queue']
-        app.logger.info(
-            f"Job queues started: "
-            f"transcription ({t_queue['workers']} workers, {t_queue['queued']} queued), "
-            f"summary ({s_queue['workers']} workers, {s_queue['queued']} queued)"
-        )
-    except Exception as e:
-        app.logger.error(f"Failed to start job queue: {e}", exc_info=True)
+    """Backwards-compatible wrapper: bind, elect, then start if we won."""
+    bind_job_queue(app)
+    start_single_instance(app, JOB_QUEUE_OWNER_LOCK,
+                          lambda: start_job_queue(app), 'job queue')
 
 
-# Module-level guard so reloads (Flask --reload, gunicorn --reload,
-# container restart-on-change) don't spawn a second cleanup thread on
-# every reinit. The webhook dispatcher in src/services/webhook_dispatch.py
-# uses the same pattern.
+# Guards a SECOND START INSIDE ONE PROCESS (Flask --reload, gunicorn --reload,
+# container restart-on-change). It cannot guard against other processes,
+# because each has its own copy of it; start_single_instance() does that.
 _cleanup_thread_started = False
 
 
@@ -181,6 +257,18 @@ def initialize_recording_session_cleanup(app):
                 reaped = cleanup_expired_sessions(app=app)
                 if reaped:
                     app.logger.info(f"Recording-session cleanup reaped {reaped} session(s)")
+                # Parts of an upload join that never completed.
+                with app.app_context():
+                    from src.services.upload_join import cleanup_stale_parts
+                    removed = cleanup_stale_parts()
+                if removed:
+                    app.logger.info(f"Upload-join cleanup removed {removed} stale part(s)")
+                # Changes-feed tombstones past RECORDING_TOMBSTONE_DAYS.
+                with app.app_context():
+                    from src.services.recording_changes import prune_tombstones
+                    pruned = prune_tombstones()
+                if pruned:
+                    app.logger.info(f"Pruned {pruned} recording tombstone(s)")
             except Exception as e:
                 app.logger.error(f"Recording-session cleanup error: {e}", exc_info=True)
                 # Don't tight-loop on failure
@@ -190,6 +278,32 @@ def initialize_recording_session_cleanup(app):
     thread.start()
     _cleanup_thread_started = True
     app.logger.info("✅ Recording-session cleanup scheduler initialized")
+
+
+def initialize_voice_embedding_check(app):
+    """Check the voice embedding backend on a background thread (#380).
+
+    Off the boot path on purpose: it makes a real transcription request, and a
+    slow or unreachable ASR service must not delay the app coming up. A
+    failure to check is logged and leaves the previous verdict alone; a
+    backend that is down is not a backend that changed.
+    """
+    import threading
+
+    if os.environ.get('DISABLE_VOICE_EMBEDDING_CHECK', 'false').lower() == 'true':
+        app.logger.info("Voice embedding check disabled (DISABLE_VOICE_EMBEDDING_CHECK=true)")
+        return
+
+    def _run():
+        from src.services.voice_embedding_check import check_voice_embeddings
+        try:
+            with app.app_context():
+                result = check_voice_embeddings(app)
+                app.config['VOICE_EMBEDDING_STATUS'] = result
+        except Exception as e:
+            app.logger.warning(f"Voice embedding check failed to run: {e}")
+
+    threading.Thread(target=_run, daemon=True, name="VoiceEmbeddingCheck").start()
 
 
 def run_startup_tasks(app):
@@ -214,21 +328,51 @@ def run_startup_tasks(app):
             f"max_audio_only_video_size_mb={max_audio_only_video_mb})"
         )
 
-        # Initialize job queue for background processing
-        initialize_job_queue(app)
+        # Bind the queue in EVERY process, so any of them can accept an
+        # upload and enqueue it. Only the owner elected below runs workers.
+        bind_job_queue(app)
 
-        # Initialize file monitor after app setup
-        initialize_file_monitor(app)
+        # Everything below that runs in the background goes through
+        # start_single_instance(). Adding one here without an election means
+        # it runs once per gunicorn worker plus twice more from the
+        # entrypoint scripts; see the comment on SINGLE_INSTANCE_LOCKS.
+        start_single_instance(
+            app, JOB_QUEUE_OWNER_LOCK,
+            lambda: start_job_queue(app), 'job queue')
 
-        # Initialize file exporter
-        initialize_file_exporter(app)
+        # Watches one directory. Several watchers racing over the same
+        # dropped file is how one upload becomes several recordings.
+        start_single_instance(
+            app, FILE_MONITOR_OWNER_LOCK,
+            lambda: initialize_file_monitor(app), 'automated file processing')
 
-        # Initialize auto-deletion scheduler
-        initialize_auto_deletion_scheduler(app)
+        # Deletes recordings on a retention policy. Concurrent sweeps race
+        # each other over the same rows and files.
+        start_single_instance(
+            app, AUTO_DELETION_OWNER_LOCK,
+            lambda: initialize_auto_deletion_scheduler(app), 'auto-deletion scheduler')
 
-        # Initialize recording-session cleanup scheduler (#287 c/d)
-        initialize_recording_session_cleanup(app)
+        # Reaps abandoned recording sessions (#287 c/d).
+        start_single_instance(
+            app, SESSION_CLEANUP_OWNER_LOCK,
+            lambda: initialize_recording_session_cleanup(app), 'recording-session cleanup')
 
-        # Initialize webhook dispatcher (#275)
+        # Posts webhook deliveries (#275). Its own guard is a module global,
+        # which is per-process, so without this every worker ran a dispatcher
+        # and each POSTed the same due rows.
         from src.services.webhook_dispatch import start_dispatcher_thread
-        start_dispatcher_thread(app)
+        start_single_instance(
+            app, WEBHOOK_DISPATCHER_OWNER_LOCK,
+            lambda: start_dispatcher_thread(app), 'webhook dispatcher')
+
+        # Checks that the backend still returns voice embeddings compatible
+        # with the stored profiles (#380). Runs on a thread because it makes a
+        # real transcription request and must not hold up the boot.
+        start_single_instance(
+            app, VOICE_EMBEDDING_CHECK_OWNER_LOCK,
+            lambda: initialize_voice_embedding_check(app), 'voice embedding check')
+
+        # Not elected: this only creates a directory and logs. No thread, no
+        # sweep, nothing to duplicate. If it ever grows a background task it
+        # needs to move up into the block above.
+        initialize_file_exporter(app)

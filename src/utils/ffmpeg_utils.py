@@ -1,5 +1,6 @@
 """Centralized FFmpeg utilities for consistent audio/video processing."""
 
+import locale
 import os
 import subprocess
 import tempfile
@@ -24,6 +25,13 @@ except (TypeError, ValueError):
     FFMPEG_TIMEOUT_SECONDS = 3600
 
 
+# What a client is told when FFmpeg cannot decode its upload (#482). The
+# exception text stays in the log: FFmpeg's output names its build and the
+# path of the file.
+AUDIO_DECODE_FAILED_MESSAGE = ('The uploaded file could not be read as audio. '
+                               'It may be corrupt or in an unsupported format.')
+
+
 class FFmpegError(Exception):
     """Custom exception for FFmpeg-related errors."""
     pass
@@ -32,6 +40,34 @@ class FFmpegError(Exception):
 class FFmpegNotFoundError(FFmpegError):
     """Raised when FFmpeg executable is not found."""
     pass
+
+
+class FFmpegTimeoutError(FFmpegError):
+    """Raised when an FFmpeg command runs past FFMPEG_TIMEOUT_SECONDS.
+
+    A timeout says nothing about the input, so callers that answer a client
+    can tell it apart from a file FFmpeg could not decode.
+    """
+    pass
+
+
+def describe_size_reduction(reduction_percent: float) -> str:
+    """Label a size change for a log line: "40.2% smaller", "93.5% larger".
+
+    The old "(-93.5% reduction)" was arithmetically right and read as a
+    win for a file that had doubled.
+    """
+    if reduction_percent > 0.05:
+        return f"{reduction_percent:.1f}% smaller"
+    if reduction_percent < -0.05:
+        return f"{-reduction_percent:.1f}% larger"
+    return "same size"
+
+
+def describe_size_change(original_size: int, final_size: int) -> str:
+    """describe_size_reduction for two byte counts."""
+    pct = ((original_size - final_size) / original_size * 100) if original_size > 0 else 0.0
+    return describe_size_reduction(pct)
 
 
 def convert_to_mp3(
@@ -85,11 +121,12 @@ def extract_audio_from_video(
     output_format: str = 'mp3',
     bitrate: str = DEFAULT_MP3_BITRATE,
     cleanup_original: bool = True,
-    copy_stream: bool = False
+    copy_stream: bool = False,
+    allow_debug_copy: bool = True
 ) -> Tuple[str, str]:
     """
     Extract audio track from video file.
-    
+
     Args:
         video_path: Path to video file
         output_format: Audio format ('mp3', 'wav', 'flac', 'copy')
@@ -97,10 +134,14 @@ def extract_audio_from_video(
         cleanup_original: Whether to delete the original video file
         copy_stream: If True, copy audio stream without re-encoding (fast, preserves quality)
                     If False, re-encode to specified format
-    
+        allow_debug_copy: Whether the PRESERVE_TEMP_AUDIO debug copy is permitted.
+                    Incognito processing passes False — that debug copy is not
+                    tracked by any cleanup and would silently retain audio from
+                    a flow that promises zero retention.
+
     Returns:
         Tuple of (audio_filepath, mime_type)
-        
+
     Raises:
         FFmpegNotFoundError: If FFmpeg is not installed
         FFmpegError: If extraction fails
@@ -143,6 +184,9 @@ def extract_audio_from_video(
                     '-y',
                     '-vn',  # No video
                     '-acodec', 'copy',  # Copy audio stream without re-encoding
+                    # m4a output must be pipe-streamable for the ASR
+                    # webservice: moov atom first (#372).
+                    *(['-movflags', '+faststart'] if output_ext == 'm4a' else []),
                     temp_audio_path
                 ]
                 
@@ -230,7 +274,7 @@ def extract_audio_from_video(
         _run_ffmpeg_command(cmd, f"Audio extraction from {os.path.basename(video_path)}")
         
         # Optionally preserve temp file for debugging
-        if os.getenv('PRESERVE_TEMP_AUDIO', 'false').lower() == 'true':
+        if allow_debug_copy and os.getenv('PRESERVE_TEMP_AUDIO', 'false').lower() == 'true':
             import shutil
             debug_path = temp_audio_path.replace('_temp', '_debug')
             shutil.copy2(temp_audio_path, debug_path)
@@ -324,12 +368,11 @@ def compress_audio(
         
         # Get compressed file size
         compressed_size = os.path.getsize(temp_output_path)
-        ratio = (1 - compressed_size / original_size) * 100 if original_size > 0 else 0
-        
+
         current_app.logger.info(
             f"Compressed {os.path.basename(input_path)}: "
             f"{original_size / 1024 / 1024:.1f}MB -> "
-            f"{compressed_size / 1024 / 1024:.1f}MB ({ratio:.1f}% reduction)"
+            f"{compressed_size / 1024 / 1024:.1f}MB ({describe_size_change(original_size, compressed_size)})"
         )
         
         # Remove original and rename temp to final
@@ -471,25 +514,55 @@ def temp_audio_conversion(input_path: str, target_format: str = 'mp3'):
                 current_app.logger.warning(f"Failed to cleanup temp file {temp_path}: {e}")
 
 
+def decode_ffmpeg_output(data) -> str:
+    """
+    Decode ffmpeg/ffprobe byte output defensively.
+
+    ffmpeg echoes container metadata (e.g. ID3 tags) into its output as raw
+    bytes without transcoding, so the stream is not guaranteed to be valid
+    UTF-8 — a GBK-tagged MP3 crashes a strict decode even inside the Linux
+    container. Try UTF-8, then the system's preferred encoding (covers
+    Windows code pages such as GBK/cp1252 for local runs), and finally
+    replace undecodable bytes. Never raises.
+    """
+    if data is None:
+        return ''
+    if isinstance(data, str):
+        return data
+    try:
+        return data.decode('utf-8')
+    except UnicodeDecodeError:
+        pass
+    preferred = locale.getpreferredencoding(False)
+    if preferred and preferred.lower().replace('-', '') != 'utf8':
+        try:
+            return data.decode(preferred)
+        except (UnicodeDecodeError, LookupError):
+            pass
+    return data.decode('utf-8', errors='replace')
+
+
 def _run_ffmpeg_command(cmd: list, operation_description: str) -> None:
     """
     Execute FFmpeg command with consistent error handling.
-    
+
     Args:
         cmd: FFmpeg command as list of strings
         operation_description: Human-readable description for error messages
-        
+
     Raises:
         FFmpegNotFoundError: If FFmpeg is not installed
         FFmpegError: If FFmpeg command fails
     """
     try:
         current_app.logger.debug(f"Running FFmpeg command: {' '.join(cmd)}")
+        # No text=True: that would strict-decode ffmpeg's output inside
+        # communicate() and raise UnicodeDecodeError on non-UTF-8 metadata
+        # bytes before any error handling below could run.
         result = subprocess.run(
             cmd,
             check=True,
             capture_output=True,
-            text=True,
             timeout=FFMPEG_TIMEOUT_SECONDS,
         )
         current_app.logger.debug(f"FFmpeg {operation_description} completed successfully")
@@ -505,9 +578,9 @@ def _run_ffmpeg_command(cmd: list, operation_description: str) -> None:
         # hanging forever on a stalled/adversarial input.
         error_msg = f"{operation_description} timed out after {FFMPEG_TIMEOUT_SECONDS}s"
         current_app.logger.error(f"FFmpeg error: {error_msg}")
-        raise FFmpegError(error_msg)
+        raise FFmpegTimeoutError(error_msg)
 
     except subprocess.CalledProcessError as e:
-        error_msg = f"{operation_description} failed: {e.stderr}"
+        error_msg = f"{operation_description} failed: {decode_ffmpeg_output(e.stderr)}"
         current_app.logger.error(f"FFmpeg error: {error_msg}")
         raise FFmpegError(error_msg)

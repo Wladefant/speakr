@@ -218,6 +218,27 @@ describe('recording-persistence', () => {
             await expect(mod.saveChunk(bad, 0)).resolves.toBeUndefined();
             expect(console.error).toHaveBeenCalled();
         });
+
+        it('preserves chunk order when writes overlap (issue #340)', async () => {
+            await mod.startRecordingSession({ mode: 'm' });
+
+            // Chunk 0's arrayBuffer resolves AFTER chunk 1's. Without
+            // serialization the two get->modify->put cycles interleave and the
+            // slower (header) chunk loses the race, so it lands out of order —
+            // which is what leaves a recovered WebM's EBML header off the front.
+            const slow = { size: 10, arrayBuffer: () => new Promise(r => setTimeout(() => r(new ArrayBuffer(10)), 25)) };
+            const fast = { size: 20, arrayBuffer: () => new Promise(r => setTimeout(() => r(new ArrayBuffer(20)), 0)) };
+
+            // Issue both without awaiting the first, mirroring rapid
+            // ondataavailable events firing while the DB is still opening.
+            const p0 = mod.saveChunk(slow, 0);
+            const p1 = mod.saveChunk(fast, 1);
+            await Promise.all([p0, p1]);
+
+            const chunks = mock.stores.get(STORE_NAME).get('current').chunks;
+            expect(chunks.map(c => c.index)).toEqual([0, 1]);
+            expect(chunks.map(c => c.size)).toEqual([10, 20]);
+        });
     });
 
     describe('updateRecordingMetadata', () => {
@@ -385,6 +406,34 @@ describe('recording-persistence', () => {
         it('returns null when estimate throws', async () => {
             global.navigator = { storage: { estimate: vi.fn(async () => { throw new Error('nope'); }) } };
             expect(await mod.getDatabaseSize()).toBeNull();
+        });
+    });
+
+    describe('clearRecordingSessionIfStartedAt (#407)', () => {
+        it('clears the session that started at the given time', async () => {
+            const session = await mod.startRecordingSession({ mode: 'meeting' });
+            expect(await mod.clearRecordingSessionIfStartedAt(session.startTime)).toBe(true);
+            expect(mock.stores.get(STORE_NAME).get('current')).toBeUndefined();
+        });
+
+        it('keeps a newer recording that started after the uploaded one', async () => {
+            vi.useFakeTimers();
+            try {
+                vi.setSystemTime(new Date('2026-09-30T10:00:00Z'));
+                const first = await mod.startRecordingSession({ mode: 'meeting' });
+                vi.setSystemTime(new Date('2026-09-30T10:05:00Z'));
+                const second = await mod.startRecordingSession({ mode: 'meeting' });
+                expect(await mod.clearRecordingSessionIfStartedAt(first.startTime)).toBe(false);
+                expect(mock.stores.get(STORE_NAME).get('current').startTime).toBe(second.startTime);
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
+        it('does nothing without a start time', async () => {
+            await mod.startRecordingSession({ mode: 'meeting' });
+            expect(await mod.clearRecordingSessionIfStartedAt(null)).toBe(false);
+            expect(mock.stores.get(STORE_NAME).get('current')).toBeDefined();
         });
     });
 });

@@ -117,7 +117,28 @@ def test_chunking_functions():
         # not return None placeholders. sentence-transformers isn't a hard
         # dependency (it's absent in CI), so assert whichever applies here.
         from src.services.embeddings import USE_API_EMBEDDINGS, LOCAL_EMBEDDINGS_AVAILABLE
-        embeddings = generate_embeddings(["test sentence", "another test"])
+        # The backend itself is stubbed: this test checks the helper's
+        # contract, not a live service or a model download. A busy endpoint
+        # made the API path flaky (#412 F2); the local path loaded the real
+        # sentence-transformers model whenever an earlier test had reloaded
+        # the module without EMBEDDING_BASE_URL, and that load can fail.
+        from contextlib import nullcontext
+        from unittest.mock import patch as _patch
+        import numpy as _np
+
+        class _FakeModel:
+            def encode(self, texts):
+                return _np.ones((len(texts), 8), dtype=_np.float32)
+
+        if USE_API_EMBEDDINGS:
+            stub = _patch("src.services.embeddings._api_embed",
+                          side_effect=lambda texts, user_id=None: [_np.ones(8, dtype=_np.float32) for _ in texts])
+        elif LOCAL_EMBEDDINGS_AVAILABLE:
+            stub = _patch("src.services.embeddings.get_embedding_model", return_value=_FakeModel())
+        else:
+            stub = nullcontext()
+        with stub:
+            embeddings = generate_embeddings(["test sentence", "another test"])
         assert isinstance(embeddings, list)
         if USE_API_EMBEDDINGS or LOCAL_EMBEDDINGS_AVAILABLE:
             assert len(embeddings) == 2, "one embedding per input when a backend is available"
@@ -160,8 +181,15 @@ def test_speaker_and_transcript_edits_reindex_inquire_chunks():
     assert hasattr(rec, 'reindex_recording_chunks_async'), "reindex helper missing"
     us = _inspect.getsource(rec.update_speakers)
     ut = _inspect.getsource(rec.update_transcript)
-    assert 'reindex_recording_chunks_async(recording_id)' in us, \
-        "update_speakers must reindex Inquire chunks after a speaker rename"
+    # Speaker renames go through the shared service (web and API v1, #412),
+    # which rebuilds the chunks.
+    from src.services import speaker_assignment as sa
+    from src.api import api_v1
+    assert 'apply_speaker_names(' in us, "update_speakers must use the shared speaker service"
+    assert 'apply_speaker_names(' in _inspect.getsource(api_v1.assign_speakers), \
+        "API v1 /speakers/assign must use the shared speaker service"
+    assert 'reindex_recording_chunks_async(recording.id)' in _inspect.getsource(sa.apply_speaker_names), \
+        "the speaker service must reindex Inquire chunks after a speaker rename"
     assert 'reindex_recording_chunks_async(recording_id)' in ut, \
         "update_transcript must reindex Inquire chunks after a transcript edit"
 

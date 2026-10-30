@@ -12,6 +12,7 @@ from flask_login import login_required, current_user
 
 from src.database import db
 from src.models import ExportTemplate
+from src.utils.localization import api_error, translate
 
 # Create blueprint
 export_templates_bp = Blueprint('export_templates', __name__)
@@ -36,7 +37,7 @@ def create_export_template():
     """Create a new export template."""
     data = request.json
     if not data or not data.get('name') or not data.get('template'):
-        return jsonify({'error': 'Name and template are required'}), 400
+        return jsonify(api_error('name_and_template_required')), 400
 
     # If this is set as default, unset other defaults
     if data.get('is_default'):
@@ -69,11 +70,11 @@ def update_export_template(template_id):
     ).first()
 
     if not template:
-        return jsonify({'error': 'Template not found'}), 404
+        return jsonify(api_error('template_not_found')), 404
 
     data = request.json
     if not data:
-        return jsonify({'error': 'No data provided'}), 400
+        return jsonify(api_error('no_data_provided')), 400
 
     # If this is set as default, unset other defaults
     if data.get('is_default'):
@@ -103,7 +104,7 @@ def delete_export_template(template_id):
     ).first()
 
     if not template:
-        return jsonify({'error': 'Template not found'}), 404
+        return jsonify(api_error('template_not_found')), 404
 
     db.session.delete(template)
     db.session.commit()
@@ -118,7 +119,7 @@ def create_default_export_templates():
     existing_templates = ExportTemplate.query.filter_by(user_id=current_user.id).count()
 
     if existing_templates > 0:
-        return jsonify({'message': 'User already has templates'}), 200
+        return jsonify({'message': translate('server.apiMessage.userAlreadyHasTemplates')}), 200
 
     # Default template with localized labels
     default_template = ExportTemplate(
@@ -160,3 +161,27 @@ def create_default_export_templates():
         'success': True,
         'templates': [default_template.to_dict()]
     }), 201
+
+
+@export_templates_bp.route('/api/export/apply-filename-template', methods=['POST'])
+@login_required
+def apply_filename_template():
+    """Rename the current user's existing export files to match their current
+    filename template (#348).
+
+    Re-renders every exported recording's filename, renames the files on disk
+    (including "[deleted]_"-prefixed files, which keep their prefix) and
+    updates the stored export_filename values. Missing files are skipped.
+    """
+    from src.file_exporter import ENABLE_AUTO_EXPORT as auto_export_enabled
+    from src.file_exporter import apply_filename_template_for_user
+
+    if not auto_export_enabled:
+        return jsonify(api_error('auto_export_disabled')), 400
+
+    try:
+        result = apply_filename_template_for_user(current_user.id)
+        return jsonify(result)
+    except Exception as e:
+        current_app.logger.error(f"Error applying export filename template: {e}")
+        return jsonify(api_error('export_rename_failed')), 500

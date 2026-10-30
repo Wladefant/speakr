@@ -1,0 +1,59 @@
+# Dependency updates (#434), checked once a month. Pull requests for security
+# advisories are enabled separately, under Settings, Code security.
+#
+# A release is proposed only after it has been public for a week (cooldown):
+# most malicious releases are found and withdrawn within days. Dependabot
+# updates requirements.txt; the lock-check job then fails until the lock
+# files are regenerated with scripts/lock-requirements.sh, so every new
+# version is reviewed before it is locked. Actions are pinned by commit and
+# the base image by digest; Dependabot updates both.
+#
+# Minor and patch updates of Python packages come in one pull request, and
+# all action updates in another. Deliberate pins are ignored: SQLAlchemy
+# stays on 2.0 and the base image stays on Python 3.11 (its digest is still updated).
+#
+# SQLAlchemy 2.1 makes psycopg 3 the default driver for postgresql:// URLs,
+# and the images install psycopg2 (#450). The move to 2.1 and psycopg 3 is
+# planned for January 2027, once the 2.1 series has settled; remove the
+# ignore entry then. 2.0 patch releases still arrive in the group.
+#
+# sentence-transformers (embeddings image) stays on 2.x until the move to
+# transformers 5, also planned for January 2027 (see the transformers entries
+# in scripts/audit-exceptions.txt); both are upgraded and tested together.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      python-minor-and-patch:
+        update-types: [minor, patch]
+    ignore:
+      - dependency-name: sqlalchemy
+        versions: [">=2.1"]
+      - dependency-name: sentence-transformers
+        update-types: ["version-update:semver-major"]
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 2
+    ignore:
+      - dependency-name: python
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 2
+    groups:
+      actions:
+        patterns: ["*"]

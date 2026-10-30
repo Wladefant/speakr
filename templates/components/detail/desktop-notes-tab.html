@@ -8,8 +8,8 @@
     <div v-if="!editingNotes"
          class="flex-1 overflow-y-auto px-4 py-4 prose-flush"
          @click="clickToEditNotes">
-        <div v-if="selectedRecording.notes_html"
-             v-html="selectedRecording.notes_html">
+        <div v-if="notesHtml"
+             v-html="notesHtml">
         </div>
         <div v-else-if="selectedRecording.notes" class="whitespace-pre-wrap">
             ${selectedRecording.notes}
@@ -17,7 +17,7 @@
         <div v-else class="empty">
             <div class="empty__icon"><i class="fas fa-pen"></i></div>
             <div class="empty__title" v-text="t('help.clickToAddNotes')"></div>
-            <div class="empty__body t-meta">Markdown is supported.</div>
+            <div class="empty__body t-meta" v-text="t('notes.markdownSupported')"></div>
         </div>
     </div>
 

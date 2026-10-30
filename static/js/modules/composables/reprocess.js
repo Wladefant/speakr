@@ -4,6 +4,7 @@
  */
 
 import * as IncognitoStorage from '../db/incognito-storage.js';
+import { readJsonResponse } from '../utils/response.js';
 
 export function useReprocess(state, utils) {
     const { nextTick } = Vue;
@@ -20,6 +21,7 @@ export function useReprocess(state, utils) {
     } = state;
 
     const { showToast, setGlobalError, onChatComplete } = utils;
+    const t = (key, params) => (utils.t ? utils.t(key, params) : key);
 
     // Store for active polling intervals
     const reprocessingPolls = new Map();
@@ -102,8 +104,7 @@ export function useReprocess(state, utils) {
                 }
             });
 
-            const data = await response.json();
-            if (!response.ok) throw new Error(data.error || 'Failed to reset recording status');
+            const data = await readJsonResponse(response, t, 'errors.resetStatusFailed');
 
             // Update recording status in list
             const index = recordings.value.findIndex(r => r.id === recordingId);
@@ -115,9 +116,9 @@ export function useReprocess(state, utils) {
                 selectedRecording.value.status = 'FAILED';
             }
 
-            showToast('Recording status reset to FAILED', 'fa-undo');
+            showToast(t('messages.statusResetToFailed'), 'fa-undo');
         } catch (error) {
-            setGlobalError(`Failed to reset status: ${error.message}`);
+            setGlobalError(t('errors.resetStatusFailedDetail', { error: error.message }));
         }
     };
 
@@ -157,7 +158,7 @@ export function useReprocess(state, utils) {
 
     const reprocessTranscription = async (recordingId, language, minSpeakers, maxSpeakers, hotwords, initialPrompt, transcriptionModel) => {
         if (!recordingId) {
-            setGlobalError('No recording ID provided for reprocessing.');
+            setGlobalError(t('errors.noRecordingToReprocess'));
             return;
         }
 
@@ -181,8 +182,7 @@ export function useReprocess(state, utils) {
                 body: JSON.stringify(requestBody)
             });
 
-            const data = await response.json();
-            if (!response.ok) throw new Error(data.error || 'Failed to start transcription reprocessing');
+            const data = await readJsonResponse(response, t, 'errors.reprocessTranscriptionFailed');
 
             // Update recording status in list
             const index = recordings.value.findIndex(r => r.id === recordingId);
@@ -194,12 +194,12 @@ export function useReprocess(state, utils) {
                 selectedRecording.value.status = 'PROCESSING';
             }
 
-            showToast('Transcription reprocessing started', 'fa-sync-alt');
+            showToast(t('messages.transcriptionReprocessingStarted'), 'fa-sync-alt');
 
             // Start polling for progress
             startReprocessingPoll(recordingId);
         } catch (error) {
-            setGlobalError(`Failed to start transcription reprocessing: ${error.message}`);
+            setGlobalError(t('errors.startTranscriptionReprocessingFailedDetail', { error: error.message }));
         }
     };
 
@@ -209,7 +209,7 @@ export function useReprocess(state, utils) {
 
     const reprocessSummary = async (recordingId, promptSource, selectedTagId, customPrompt, promptMode, promptVariables) => {
         if (!recordingId) {
-            setGlobalError('No recording ID provided for reprocessing.');
+            setGlobalError(t('errors.noRecordingToReprocess'));
             return;
         }
 
@@ -254,8 +254,7 @@ export function useReprocess(state, utils) {
                 body: JSON.stringify(requestBody)
             });
 
-            const data = await response.json();
-            if (!response.ok) throw new Error(data.error || 'Failed to start summary reprocessing');
+            const data = await readJsonResponse(response, t, 'errors.reprocessSummaryFailed');
 
             // Update recording status in list
             const index = recordings.value.findIndex(r => r.id === recordingId);
@@ -267,12 +266,12 @@ export function useReprocess(state, utils) {
                 selectedRecording.value.status = 'SUMMARIZING';
             }
 
-            showToast('Summary reprocessing started', 'fa-sync-alt');
+            showToast(t('messages.summaryReprocessingStarted'), 'fa-sync-alt');
 
             // Start polling for progress
             startReprocessingPoll(recordingId);
         } catch (error) {
-            setGlobalError(`Failed to start summary reprocessing: ${error.message}`);
+            setGlobalError(t('errors.startSummaryReprocessingFailedDetail', { error: error.message }));
         }
     };
 
@@ -327,8 +326,7 @@ export function useReprocess(state, utils) {
                     })
                 });
 
-                const data = await response.json();
-                if (!response.ok) throw new Error(data.error || 'Failed to generate summary');
+                const data = await readJsonResponse(response, t, 'errors.generateSummaryFailed');
 
                 // Update the incognito recording with the new summary
                 selectedRecording.value.summary = data.summary;
@@ -340,7 +338,7 @@ export function useReprocess(state, utils) {
                     summary_html: data.summary_html
                 });
 
-                showToast('Summary generated', 'fa-file-alt');
+                showToast(t('messages.summaryGenerated'), 'fa-file-alt');
                 return;
             }
 
@@ -360,8 +358,7 @@ export function useReprocess(state, utils) {
                 body: JSON.stringify(body),
             });
 
-            const data = await response.json();
-            if (!response.ok) throw new Error(data.error || 'Failed to start summary generation');
+            const data = await readJsonResponse(response, t, 'errors.generateSummaryFailed');
 
             selectedRecording.value.status = 'SUMMARIZING';
 
@@ -370,12 +367,12 @@ export function useReprocess(state, utils) {
                 recordingInList.status = 'SUMMARIZING';
             }
 
-            showToast('Summary generation started', 'fa-file-alt');
+            showToast(t('messages.summaryGenerationStarted'), 'fa-file-alt');
 
             // Start polling for progress
             startReprocessingPoll(selectedRecording.value.id);
         } catch (error) {
-            setGlobalError(`Failed to generate summary: ${error.message}`);
+            setGlobalError(t('errors.generateSummaryFailedDetail', { error: error.message }));
         }
     };
 
@@ -398,9 +395,9 @@ export function useReprocess(state, utils) {
             try {
                 // Use lightweight status-only endpoint
                 const response = await fetch(`/recording/${recordingId}/status`);
-                if (!response.ok) throw new Error('Status check failed');
-
-                const statusData = await response.json();
+                // Polls every few seconds, so a raw parse error here would
+                // repeat until the poll gives up. Same reader as the rest.
+                const statusData = await readJsonResponse(response, t, 'errors.statusCheckFailed');
 
                 // Update status (and audio_ready, when the endpoint reports it)
                 // in the recordings list.

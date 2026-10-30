@@ -3,6 +3,8 @@
  * Handles AI chat functionality with streaming responses
  */
 
+import { filenameFromContentDisposition } from '../utils/content-disposition.js';
+
 export function useChat(state, utils) {
     const {
         showChat, isChatMaximized, chatMessages, chatInput,
@@ -10,6 +12,89 @@ export function useChat(state, utils) {
     } = state;
 
     const { showToast, setGlobalError, onChatComplete, t } = utils;
+
+    // ------------------------------------------------------------------
+    // Timestamp chips: the chat prompt asks the model to cite moments as
+    // bracketed transcript timestamps ([00:07:35]); render them as
+    // clickable chips that seek the in-view recording's player. Unlike
+    // Inquire citations there is no numbering or Sources list — chat is
+    // always about the single recording in view.
+    // ------------------------------------------------------------------
+
+    const CHAT_TS_RE = /\[(\d{1,2}):(\d{2})(?::(\d{2}))?\]/g;
+
+    const formatChatSeconds = (s) => {
+        const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+        return h > 0
+            ? h + ':' + String(m).padStart(2, '0') + ':' + String(sec).padStart(2, '0')
+            : m + ':' + String(sec).padStart(2, '0');
+    };
+
+    /** Replace [h:mm:ss] / [m:ss] in sanitized chat HTML with seek chips. */
+    const decorateChatTimestamps = (html) => {
+        if (!html || !/\[\d/.test(html)) return html;
+        try {
+            const tpl = document.createElement('template');
+            tpl.innerHTML = html;
+            const walker = document.createTreeWalker(tpl.content, NodeFilter.SHOW_TEXT, {
+                acceptNode: (node) =>
+                    node.parentElement && node.parentElement.closest('code, pre, a')
+                        ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT,
+            });
+            const targets = [];
+            let n;
+            while ((n = walker.nextNode())) {
+                if (CHAT_TS_RE.test(n.nodeValue)) targets.push(n);
+                CHAT_TS_RE.lastIndex = 0;
+            }
+            for (const node of targets) {
+                const frag = document.createDocumentFragment();
+                let last = 0;
+                const text = node.nodeValue;
+                for (const m of text.matchAll(CHAT_TS_RE)) {
+                    // [a:b] is m:ss; [a:b:c] is h:mm:ss
+                    const seconds = m[3] !== undefined
+                        ? (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3])
+                        : (+m[1]) * 60 + (+m[2]);
+                    frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+                    const chip = document.createElement('button');
+                    chip.type = 'button';
+                    chip.className = 'chat-ts-chip';
+                    chip.dataset.seek = String(seconds);
+                    chip.title = t('chat.playFromHere') || 'Play from here';
+                    chip.textContent = formatChatSeconds(seconds);
+                    frag.appendChild(chip);
+                    last = m.index + m[0].length;
+                }
+                frag.appendChild(document.createTextNode(text.slice(last)));
+                node.parentNode.replaceChild(frag, node);
+            }
+            return tpl.innerHTML;
+        } catch (_) {
+            return html;
+        }
+    };
+
+    const renderChatHtml = (content) => decorateChatTimestamps(window.renderMarkdownSafe(content));
+
+    /** Delegated click handler for the chat messages containers. */
+    const handleChatBubbleClick = (event) => {
+        const chip = event.target.closest && event.target.closest('.chat-ts-chip');
+        if (!chip) return;
+        const seconds = parseInt(chip.dataset.seek, 10);
+        if (!isFinite(seconds)) return;
+        // The detail view's player streams from /audio/; incognito uses a
+        // blob URL, so fall back to any media element on the page.
+        const all = [...document.querySelectorAll('audio, video')];
+        const media = all.find((el) => ((el.currentSrc || el.src || '').includes('/audio/')))
+            || all.find((el) => (el.currentSrc || el.src));
+        if (!media) return;
+        const target = isFinite(media.duration)
+            ? Math.min(seconds, Math.max(0, media.duration - 1))
+            : seconds;
+        media.currentTime = target;
+        media.play().catch(() => {});
+    };
 
     // Helper function to check if chat is scrolled to bottom (within bottom 5%)
     const isChatScrolledToBottom = () => {
@@ -109,7 +194,7 @@ export function useChat(state, utils) {
 
             if (!response.ok) {
                 const errorData = await response.json();
-                throw new Error(errorData.error || 'Failed to get chat response');
+                throw new Error(errorData.error || t('chat.responseFailed'));
             }
 
             const reader = response.body.getReader();
@@ -182,7 +267,7 @@ export function useChat(state, utils) {
                                         }
 
                                         assistantMessage.content += textContent;
-                                        assistantMessage.html = marked.parse(assistantMessage.content);
+                                        assistantMessage.html = renderChatHtml(assistantMessage.content);
 
                                         if (shouldScroll) {
                                             await Vue.nextTick();
@@ -190,6 +275,13 @@ export function useChat(state, utils) {
                                         }
                                     }
                                     if (data.end_of_stream) {
+                                        // Provider hit its output-token limit: keep the
+                                        // partial answer but tell the user it was cut off
+                                        // instead of presenting it as complete (issue #349).
+                                        if (data.truncated && assistantMessage && assistantMessage.content) {
+                                            assistantMessage.content += `\n\n_⚠️ ${t('chat.responseTruncated')}_`;
+                                            assistantMessage.html = renderChatHtml(assistantMessage.content);
+                                        }
                                         return;
                                     }
                                     if (data.error) {
@@ -218,19 +310,19 @@ export function useChat(state, utils) {
             // note below it so the user can still copy what they got.
             if (assistantMessage) {
                 const partial = (assistantMessage.content || '').trim();
-                const errSuffix = `\n\n_⚠️ Connection ended before the response completed: ${error.message}_`;
+                const errSuffix = `\n\n_⚠️ ${t('chat.connectionEnded', { error: error.message })}_`;
                 if (partial) {
                     assistantMessage.content = partial + errSuffix;
-                    assistantMessage.html = marked.parse(assistantMessage.content);
+                    assistantMessage.html = renderChatHtml(assistantMessage.content);
                 } else {
-                    assistantMessage.content = `Error: ${error.message}`;
-                    assistantMessage.html = `<span class="text-red-500">Error: ${error.message}</span>`;
+                    assistantMessage.content = t('chat.errorWithMessage', { error: error.message });
+                    assistantMessage.html = `<span class="text-red-500">${t('chat.errorWithMessage', { error: error.message })}</span>`;
                 }
             } else {
                 chatMessages.value.push({
                     role: 'assistant',
-                    content: `Error: ${error.message}`,
-                    html: `<span class="text-red-500">Error: ${error.message}</span>`
+                    content: t('chat.errorWithMessage', { error: error.message }),
+                    html: `<span class="text-red-500">${t('chat.errorWithMessage', { error: error.message })}</span>`
                 });
             }
         } finally {
@@ -297,19 +389,7 @@ export function useChat(state, utils) {
             a.href = url;
 
             const contentDisposition = response.headers.get('Content-Disposition');
-            let filename = 'chat.docx';
-            if (contentDisposition) {
-                const utf8Match = /filename\*=utf-8''(.+)/.exec(contentDisposition);
-                if (utf8Match) {
-                    filename = decodeURIComponent(utf8Match[1]);
-                } else {
-                    const regularMatch = /filename="(.+)"/.exec(contentDisposition);
-                    if (regularMatch) {
-                        filename = regularMatch[1];
-                    }
-                }
-            }
-            a.download = filename;
+            a.download = filenameFromContentDisposition(contentDisposition, 'chat.docx');
 
             document.body.appendChild(a);
             a.click();
@@ -380,6 +460,7 @@ export function useChat(state, utils) {
     return {
         isChatScrolledToBottom,
         scrollChatToBottom,
+        handleChatBubbleClick,
         toggleChatMaximize,
         sendChatMessage,
         handleChatKeydown,

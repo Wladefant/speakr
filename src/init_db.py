@@ -11,12 +11,23 @@ This module handles:
 import os
 import fcntl
 import tempfile
+from contextlib import contextmanager
+
 from sqlalchemy import text, inspect
 
 from src.database import db
 from src.models import Recording, TranscriptChunk, SystemSetting, User
 from src.services.embeddings import process_recording_chunks
-from src.utils import add_column_if_not_exists, migrate_column_type, create_index_if_not_exists
+from src.utils import (
+    add_column_if_not_exists,
+    migrate_column_type,
+    create_index_if_not_exists,
+    drop_not_null,
+    migration_lock,
+    run_once,
+)
+from src.utils.database import (drop_index_if_exists, ensure_migration_ledger,
+                                remove_world_access_to_sqlite_files)
 
 # Configuration
 ENABLE_INQUIRE_MODE = os.environ.get('ENABLE_INQUIRE_MODE', 'false').lower() == 'true'
@@ -53,6 +64,122 @@ def classify_embedding_identifier_state(current_identifier, stored_identifier, l
     return stored_identifier, migrated_from_legacy, outcome
 
 
+def _remove_orphaned_user_new(engine, app):
+    """Drop the 'user_new' table stranded by the pre-0.10.5 password migration.
+
+    That migration rebuilt the user table from hand-written DDL. pysqlite does
+    not wrap DDL in a transaction, so when the row copy failed the CREATE had
+    already been committed; every later startup then aborted on 'table
+    user_new already exists' and the migration could never complete (#379).
+
+    The table is only ever dropped once the real one is present and holds at
+    least as many rows, so a database left mid-rebuild keeps its only copy of
+    the data and gets a warning instead.
+    """
+    if engine.name != 'sqlite':
+        return
+
+    try:
+        inspector = inspect(engine)
+        tables = inspector.get_table_names()
+        if 'user_new' not in tables:
+            return
+
+        with engine.connect() as conn:
+            orphaned_rows = conn.execute(text('SELECT COUNT(*) FROM user_new')).scalar()
+            live_rows = (
+                conn.execute(text('SELECT COUNT(*) FROM "user"')).scalar()
+                if 'user' in tables else 0
+            )
+
+            if live_rows and live_rows >= orphaned_rows:
+                conn.execute(text('DROP TABLE user_new'))
+                conn.commit()
+                app.logger.info("Removed orphaned user_new table left by an interrupted migration")
+            else:
+                app.logger.warning(
+                    "Leaving orphaned user_new table in place: it holds %d row(s) but the "
+                    "live user table holds %d. Inspect the database before removing it.",
+                    orphaned_rows, live_rows
+                )
+    except Exception as e:
+        app.logger.warning(f"Could not clean up orphaned user_new table: {e}")
+
+
+def _remove_orphaned_speaker_rows(engine, app):
+    """Delete speaker snippets and voice samples whose speaker or recording is gone.
+
+    SQLite does not enforce ON DELETE CASCADE, and before #475 "delete all
+    speakers" did not remove these rows itself.
+    """
+    with engine.begin() as conn:
+        snippets = conn.execute(text(
+            'DELETE FROM speaker_snippet WHERE speaker_id NOT IN (SELECT id FROM speaker) '
+            'OR recording_id NOT IN (SELECT id FROM recording)')).rowcount
+        samples = conn.execute(text(
+            'DELETE FROM speaker_voice_sample '
+            'WHERE speaker_id NOT IN (SELECT id FROM speaker)')).rowcount
+    if snippets or samples:
+        app.logger.info(f"Removed {snippets} orphaned speaker snippet(s) "
+                        f"and {samples} orphaned voice sample(s)")
+
+
+def _clear_stale_session_links(engine, app):
+    """Clear recording-session links to recordings that no longer exist.
+
+    Deleting a recording did not clear the link on SQLite, which does not
+    apply ON DELETE SET NULL (#505). PostgreSQL already cleared it.
+    """
+    with engine.begin() as conn:
+        cleared = conn.execute(text(
+            'UPDATE recording_session SET finalized_recording_id = NULL '
+            'WHERE finalized_recording_id IS NOT NULL '
+            'AND finalized_recording_id NOT IN (SELECT id FROM recording)')).rowcount
+    if cleared:
+        app.logger.info(f"Cleared {cleared} recording-session link(s) to deleted recordings")
+
+
+def _add_folder_group_name_index(engine, app):
+    """Make a group folder name unique within its group (#513).
+
+    The table constraint is (name, user_id), so two admins of one group could
+    each create a folder with the same name when their requests overlapped.
+    The index is added next to that constraint; the table is not rebuilt.
+    Folders that already share a name in a group keep the oldest name, and
+    the others get a " (2)", " (3)", ... suffix so the index can be created.
+    """
+    from src.models.organization import Folder
+    max_len = Folder.__table__.c.name.type.length
+    with engine.begin() as conn:
+        rows = conn.execute(text(
+            'SELECT id, name, user_id, group_id FROM folder')).fetchall()
+        group_names = {(r.name, r.group_id) for r in rows if r.group_id is not None}
+        user_names = {(r.name, r.user_id) for r in rows}
+        kept = set()
+        for row in sorted((r for r in rows if r.group_id is not None), key=lambda r: r.id):
+            if (row.name, row.group_id) not in kept:
+                kept.add((row.name, row.group_id))
+                continue
+            n = 2
+            while True:
+                suffix = f' ({n})'
+                candidate = row.name[:max_len - len(suffix)] + suffix
+                if (candidate, row.group_id) not in group_names and (candidate, row.user_id) not in user_names:
+                    break
+                n += 1
+            conn.execute(text('UPDATE folder SET name = :name WHERE id = :id'),
+                         {'name': candidate, 'id': row.id})
+            group_names.add((candidate, row.group_id))
+            user_names.add((candidate, row.user_id))
+            kept.add((candidate, row.group_id))
+            app.logger.warning(
+                f"Renamed folder {row.id} in group {row.group_id} to '{candidate}': "
+                f"another folder in that group already had its name")
+        conn.execute(text(
+            'CREATE UNIQUE INDEX IF NOT EXISTS uq_folder_group_name '
+            'ON folder (name, group_id) WHERE group_id IS NOT NULL'))
+
+
 def initialize_database(app):
     """
     Initialize database schema and run migrations.
@@ -73,8 +200,84 @@ def initialize_database(app):
                 app.logger.info("SQLite WAL mode enabled for better concurrency")
         except Exception as e:
             app.logger.warning(f"Could not enable WAL mode: {e}")
+        remove_world_access_to_sqlite_files(engine.url.database, logger=app.logger)
 
+    # Only one process at a time, so the several startup processes cannot
+    # interleave and see each other's half-applied schema. Failing to take the
+    # lock is not fatal; every migration below is independently idempotent.
+    with migration_lock(engine, logger=app.logger):
+        try:
+            ensure_migration_ledger(engine)
+        except Exception as e:
+            app.logger.warning(f"Could not create the schema_migrations ledger: {e}")
+
+        _run_migrations(app, engine)
+
+
+@contextmanager
+def _migration_section(app, failures, name):
+    """Contain a failure to one group of migrations instead of all of them.
+
+    The sections in _run_migrations used to share a single try block, so the
+    first unguarded failure silently skipped every migration after it and the
+    app then served a part-upgraded schema. Each section now fails alone: the
+    error is logged with its traceback, recorded for the summary banner, and
+    the remaining sections still run.
+
+    Later sections may assume earlier ones succeeded (a column addition, most
+    commonly), so a failure can still cascade into further section failures.
+    That is acceptable: each is reported, and every section is retried on the
+    next startup because migrations are idempotent.
+    """
     try:
+        yield
+    except Exception as e:
+        failures.append((name, e))
+        app.logger.error("Migration section '%s' failed: %s", name, e)
+        app.logger.exception("Section '%s' traceback", name)
+        # Discard whatever the failed section left pending in the ORM session.
+        # Without this its open transaction keeps SQLite's write lock, so the
+        # following sections fail with "database is locked", and its half-built
+        # rows get flushed to disk by the next section that commits.
+        try:
+            db.session.rollback()
+        except Exception as rollback_error:
+            app.logger.warning(
+                "Could not roll back the session after section '%s': %s", name, rollback_error
+            )
+
+
+def unique_upload_idempotency_key(app, engine):
+    """One recording per upload idempotency key (#476).
+
+    The first index was not unique, so overlapping retries could store a key
+    twice: older duplicates lose their key (the newest keeps replaying), then
+    the unique index replaces the old one. NULLs are distinct, so unkeyed
+    recordings never clash.
+    """
+    if 'ux_recording_user_idem' not in {i['name'] for i in inspect(engine).get_indexes('recording')}:
+        with engine.begin() as conn:
+            dupes = conn.execute(text(
+                'SELECT user_id, upload_idempotency_key, MAX(id) FROM recording '
+                'WHERE upload_idempotency_key IS NOT NULL '
+                'GROUP BY user_id, upload_idempotency_key HAVING COUNT(*) > 1')).fetchall()
+            for user_id, key, keep in dupes:
+                conn.execute(text(
+                    'UPDATE recording SET upload_idempotency_key = NULL '
+                    'WHERE user_id = :u AND upload_idempotency_key = :k AND id < :keep'),
+                    {'u': user_id, 'k': key, 'keep': keep})
+        if dupes:
+            app.logger.info(f"Cleared {len(dupes)} duplicated upload idempotency keys")
+        create_index_if_not_exists(engine, 'ux_recording_user_idem', 'recording',
+                                   'user_id, upload_idempotency_key', unique=True)
+    drop_index_if_exists(engine, 'ix_recording_user_idem', 'recording')
+
+
+def _run_migrations(app, engine):
+    """Apply every schema migration. Assumes the migration lock is held."""
+    failures = []
+
+    with _migration_section(app, failures, "core recording and user columns"):
         # Add is_inbox column with default value of 1 (True)
         if add_column_if_not_exists(engine, 'recording', 'is_inbox', 'BOOLEAN DEFAULT 1'):
             app.logger.info("Added is_inbox column to recording table")
@@ -92,6 +295,11 @@ def initialize_database(app):
             app.logger.info("Added extract_events column to user table")
         if add_column_if_not_exists(engine, 'user', 'output_language', 'VARCHAR(50)'):
             app.logger.info("Added output_language column to user table")
+        # Per-user timezone for generated text (#412)
+        if add_column_if_not_exists(engine, 'user', 'timezone', 'VARCHAR(64)'):
+            app.logger.info("Added timezone column to user table")
+        if add_column_if_not_exists(engine, 'user', 'timezone_mode', "VARCHAR(8) DEFAULT 'auto'"):
+            app.logger.info("Added timezone_mode column to user table")
         if add_column_if_not_exists(engine, 'user', 'summary_prompt', 'TEXT'):
             app.logger.info("Added summary_prompt column to user table")
         if add_column_if_not_exists(engine, 'user', 'name', 'VARCHAR(100)'):
@@ -109,82 +317,81 @@ def initialize_database(app):
         if add_column_if_not_exists(engine, 'user', 'sso_subject', 'VARCHAR(255)'):
             app.logger.info("Added sso_subject column to user table")
         
-        # Make password column nullable for SSO users
+        # SSO users authenticate against their provider and never hold a local
+        # password, so the column has to accept NULL.
         try:
-            inspector = inspect(engine)
-            if 'user' in inspector.get_table_names():
-                if engine.name == 'sqlite':
-                    # SQLite doesn't support ALTER COLUMN, so we need to check and recreate
-                    with engine.connect() as conn:
-                        result = conn.execute(text("SELECT sql FROM sqlite_master WHERE type='table' AND name='user'"))
-                        schema = result.scalar()
-
-                        if schema and 'password VARCHAR(60) NOT NULL' in schema:
-                            app.logger.info("Migrating user table to make password nullable for SSO support...")
-
-                            conn.execute(text("""
-                                CREATE TABLE user_new (
-                                    id INTEGER NOT NULL,
-                                    username VARCHAR(20) NOT NULL,
-                                    email VARCHAR(120) NOT NULL,
-                                    password VARCHAR(60),
-                                    is_admin BOOLEAN,
-                                    can_share_publicly BOOLEAN,
-                                    transcription_language VARCHAR(10),
-                                    output_language VARCHAR(50),
-                                    ui_language VARCHAR(10),
-                                    summary_prompt TEXT,
-                                    extract_events BOOLEAN,
-                                    name VARCHAR(100),
-                                    job_title VARCHAR(100),
-                                    company VARCHAR(100),
-                                    diarize BOOLEAN,
-                                    sso_provider VARCHAR(100),
-                                    sso_subject VARCHAR(255),
-                                    PRIMARY KEY (id),
-                                    UNIQUE (username),
-                                    UNIQUE (email)
-                                )
-                            """))
-                            conn.execute(text("""
-                                INSERT INTO user_new
-                                SELECT id, username, email, password, is_admin, can_share_publicly,
-                                       transcription_language, output_language, ui_language,
-                                       summary_prompt, extract_events, name, job_title, company,
-                                       diarize, sso_provider, sso_subject
-                                FROM user
-                            """))
-                            conn.execute(text("DROP TABLE user"))
-                            conn.execute(text("ALTER TABLE user_new RENAME TO user"))
-                            conn.execute(text('CREATE UNIQUE INDEX IF NOT EXISTS ix_user_sso_subject ON "user" (sso_subject)'))
-                            conn.commit()
-                            app.logger.info("Successfully made password column nullable for SSO support")
-                        else:
-                            app.logger.info("Password column is already nullable, skipping migration")
-
-                elif engine.name == 'postgresql':
-                    # PostgreSQL supports ALTER COLUMN directly
-                    with engine.connect() as conn:
-                        result = conn.execute(text("""
-                            SELECT is_nullable FROM information_schema.columns
-                            WHERE table_name = 'user' AND column_name = 'password'
-                        """))
-                        row = result.fetchone()
-                        if row and row[0] == 'NO':
-                            conn.execute(text('ALTER TABLE "user" ALTER COLUMN password DROP NOT NULL'))
-                            conn.commit()
-                            app.logger.info("Made password column nullable for SSO support (PostgreSQL)")
-                        else:
-                            app.logger.info("Password column is already nullable, skipping migration")
+            if drop_not_null(engine, 'user', 'password'):
+                app.logger.info("Made password column nullable for SSO support")
         except Exception as e:
             app.logger.warning(f"Could not migrate password column to nullable (may cause issues with SSO): {e}")
-        
+
+        _remove_orphaned_user_new(engine, app)
+
+
+    with _migration_section(app, failures, "recording, tag, speaker and processing columns"):
         if add_column_if_not_exists(engine, 'recording', 'mime_type', 'VARCHAR(100)'):
             app.logger.info("Added mime_type column to recording table")
+        # Detected transcription language (#386). Existing rows stay NULL:
+        # the audio would have to be re-transcribed to learn it, and the
+        # webhook simply omits the field when it is not known.
+        if add_column_if_not_exists(engine, 'recording', 'transcription_language', 'VARCHAR(20)'):
+            app.logger.info("Added transcription_language column to recording table")
         if add_column_if_not_exists(engine, 'recording', 'audio_duration_seconds', 'FLOAT'):
             app.logger.info("Added audio_duration_seconds column to recording table")
         if add_column_if_not_exists(engine, 'recording', 'completed_at', 'DATETIME'):
             app.logger.info("Added completed_at column to recording table")
+        # Change tracking for API clients (mailr spec G2). Filled from
+        # completed_at or created_at once; the feed reads NULL as created_at,
+        # so a failed backfill is harmless and the next start retries it.
+        if add_column_if_not_exists(engine, 'recording', 'updated_at', 'DATETIME'):
+            app.logger.info("Added updated_at column to recording table")
+        create_index_if_not_exists(engine, 'ix_recording_updated_at', 'recording', 'updated_at')
+        create_index_if_not_exists(engine, 'ix_recording_user_updated', 'recording', 'user_id, updated_at')
+        # Admin status counts filter on status alone (#507). Without an index
+        # each count scanned the table, transcripts included.
+        create_index_if_not_exists(engine, 'ix_recording_status', 'recording', 'status')
+
+        def _backfill_recording_updated_at(engine):
+            from datetime import datetime as _dt
+            from src.services.recording_changes import FEED_SINCE_KEY, iso_z
+            with engine.begin() as conn:
+                conn.execute(text(
+                    'UPDATE recording SET updated_at = COALESCE(completed_at, created_at) '
+                    'WHERE updated_at IS NULL'))
+            SystemSetting.set_setting(FEED_SINCE_KEY, iso_z(_dt.utcnow()),
+                                      'Start of change tracking (changes feed)')
+
+        run_once(engine, '0002_backfill_recording_updated_at', _backfill_recording_updated_at,
+                 logger=app.logger)
+        # Public share link expiry (mailr spec G10).
+        if add_column_if_not_exists(engine, 'share', 'expires_at', 'DATETIME'):
+            app.logger.info("Added expires_at column to share table")
+        # Speaker contact details (mailr spec G6).
+        if add_column_if_not_exists(engine, 'speaker', 'email', 'VARCHAR(320)'):
+            app.logger.info("Added email column to speaker table")
+        if add_column_if_not_exists(engine, 'speaker', 'aliases', 'TEXT'):
+            app.logger.info("Added aliases column to speaker table")
+        if add_column_if_not_exists(engine, 'speaker', 'updated_at', 'DATETIME'):
+            app.logger.info("Added updated_at column to speaker table")
+        create_index_if_not_exists(engine, 'ix_speaker_user_email', 'speaker', 'user_id, email')
+        # Idempotent API uploads (mailr spec G8).
+        if add_column_if_not_exists(engine, 'recording', 'upload_idempotency_key', 'VARCHAR(100)'):
+            app.logger.info("Added upload_idempotency_key column to recording table")
+        unique_upload_idempotency_key(app, engine)
+        # Chunks are read and deleted by recording, in order (D#441)
+        create_index_if_not_exists(engine, 'ix_transcript_chunk_recording', 'transcript_chunk',
+                                   'recording_id, chunk_index')
+        # The recording lists and the Shared Transcripts list read shares,
+        # tag links and per-user states by these columns (D#483)
+        for index_name, table_name, columns in (
+            ('ix_share_recording_id', 'share', 'recording_id'),
+            ('ix_share_user_id', 'share', 'user_id'),
+            ('ix_internal_share_shared_with_user_id', 'internal_share', 'shared_with_user_id'),
+            ('ix_internal_share_owner_id', 'internal_share', 'owner_id'),
+            ('ix_shared_recording_state_user_id', 'shared_recording_state', 'user_id'),
+            ('ix_recording_tags_tag_id', 'recording_tags', 'tag_id'),
+        ):
+            create_index_if_not_exists(engine, index_name, table_name, columns)
         if add_column_if_not_exists(engine, 'recording', 'processing_time_seconds', 'INTEGER'):
             app.logger.info("Added processing_time_seconds column to recording table")
         if add_column_if_not_exists(engine, 'recording', 'transcription_duration_seconds', 'INTEGER'):
@@ -253,6 +460,8 @@ def initialize_database(app):
         # Add is_new_upload column to processing_job table for tracking upload vs reprocessing jobs
         if add_column_if_not_exists(engine, 'processing_job', 'is_new_upload', 'BOOLEAN DEFAULT 0'):
             app.logger.info("Added is_new_upload column to processing_job table")
+        if add_column_if_not_exists(engine, 'processing_job', 'provider_task', 'TEXT'):
+            app.logger.info("Added provider_task column to processing_job table")
 
         if add_column_if_not_exists(engine, 'tag', 'group_id', 'INTEGER'):
             app.logger.info("Added group_id column to tag table")
@@ -300,6 +509,7 @@ def initialize_database(app):
         if add_column_if_not_exists(engine, 'user', 'can_share_publicly', 'BOOLEAN DEFAULT 1'):
             app.logger.info("Added can_share_publicly column to user table")
 
+    with _migration_section(app, failures, "user settings columns"):
         # Token budget for rate limiting
         if add_column_if_not_exists(engine, 'user', 'monthly_token_budget', 'INTEGER'):
             app.logger.info("Added monthly_token_budget column to user table")
@@ -308,9 +518,29 @@ def initialize_database(app):
         if add_column_if_not_exists(engine, 'user', 'monthly_transcription_budget', 'INTEGER'):
             app.logger.info("Added monthly_transcription_budget column to user table")
 
+        # Light/dark mode and color scheme saved with the account (D#419);
+        # null until the user changes them
+        if add_column_if_not_exists(engine, 'user', 'theme_dark_mode', 'BOOLEAN'):
+            app.logger.info("Added theme_dark_mode column to user table")
+        if add_column_if_not_exists(engine, 'user', 'theme_color_scheme', 'VARCHAR(16)'):
+            app.logger.info("Added theme_color_scheme column to user table")
+
+        # Raised when the password is set, to end the account's sign-ins (#437)
+        if add_column_if_not_exists(engine, 'user', 'session_version', 'INTEGER'):
+            app.logger.info("Added session_version column to user table")
+
+        # Storage quota in megabytes (#413)
+        if add_column_if_not_exists(engine, 'user', 'storage_quota_mb', 'INTEGER'):
+            app.logger.info("Added storage_quota_mb column to user table")
+
         # Naming templates feature
         if add_column_if_not_exists(engine, 'user', 'default_naming_template_id', 'INTEGER'):
             app.logger.info("Added default_naming_template_id column to user table")
+
+        # Email notification preference (#386). Defaults off, so an upgrade
+        # never starts mailing anyone who did not ask for it.
+        if add_column_if_not_exists(engine, 'user', 'notify_email_on_completion', 'BOOLEAN DEFAULT 0'):
+            app.logger.info("Added notify_email_on_completion column to user table")
 
         # Email verification fields
         email_verified_added = add_column_if_not_exists(engine, 'user', 'email_verified', 'BOOLEAN DEFAULT 0')
@@ -353,6 +583,9 @@ def initialize_database(app):
         # Per-feature transcript timestamp settings (#304)
         if add_column_if_not_exists(engine, 'user', 'summary_include_timestamps', 'BOOLEAN DEFAULT 0'):
             app.logger.info("Added summary_include_timestamps column to user table")
+        # Notes given to the summarizer (#440), off by default
+        if add_column_if_not_exists(engine, 'user', 'summary_include_notes', 'BOOLEAN DEFAULT 0'):
+            app.logger.info("Added summary_include_notes column to user table")
         if add_column_if_not_exists(engine, 'user', 'summary_timestamp_template_id', 'INTEGER'):
             app.logger.info("Added summary_timestamp_template_id column to user table")
         if add_column_if_not_exists(engine, 'user', 'chat_include_timestamps', 'BOOLEAN DEFAULT 0'):
@@ -365,8 +598,20 @@ def initialize_database(app):
             app.logger.info("Added show_timestamps_simple_view column to user table")
         if add_column_if_not_exists(engine, 'user', 'editor_autosave', 'BOOLEAN DEFAULT 0'):
             app.logger.info("Added editor_autosave column to user table")
+        if add_column_if_not_exists(engine, 'user', 'speaker_count_mode', 'VARCHAR(10)'):
+            app.logger.info("Added speaker_count_mode column to user table")
         if add_column_if_not_exists(engine, 'user', 'audio_player_position', "VARCHAR(10) DEFAULT 'bottom'"):
             app.logger.info("Added audio_player_position column to user table")
+        if add_column_if_not_exists(engine, 'user', 'default_recording_sort', 'VARCHAR(16)'):
+            app.logger.info("Added default_recording_sort column to user table")
+
+        # Filename date parsing (#342)
+        if add_column_if_not_exists(engine, 'user', 'parse_filename_dates', 'BOOLEAN DEFAULT 0'):
+            app.logger.info("Added parse_filename_dates column to user table")
+        if add_column_if_not_exists(engine, 'user', 'filename_date_pattern', "VARCHAR(50) DEFAULT 'auto'"):
+            app.logger.info("Added filename_date_pattern column to user table")
+        if add_column_if_not_exists(engine, 'user', 'filename_date_regex', 'VARCHAR(500)'):
+            app.logger.info("Added filename_date_regex column to user table")
         if add_column_if_not_exists(engine, 'tag', 'default_hotwords', 'TEXT'):
             app.logger.info("Added default_hotwords column to tag table")
         if add_column_if_not_exists(engine, 'tag', 'default_initial_prompt', 'TEXT'):
@@ -376,6 +621,28 @@ def initialize_database(app):
         if add_column_if_not_exists(engine, 'folder', 'default_initial_prompt', 'TEXT'):
             app.logger.info("Added default_initial_prompt column to folder table")
 
+        # Voice matching: embedding space of a recording's embeddings, and the
+        # label -> name map that lets renames reach the voice samples. The
+        # voice_embedding_space and speaker_voice_sample tables come from
+        # create_all().
+        if add_column_if_not_exists(engine, 'recording', 'speaker_embeddings_space_id', 'INTEGER'):
+            app.logger.info("Added speaker_embeddings_space_id column to recording table")
+        if add_column_if_not_exists(engine, 'recording', 'speaker_label_map', 'JSON'):
+            app.logger.info("Added speaker_label_map column to recording table")
+
+        # Archive hides a recording from the main list without deleting
+        # anything. Per user, like inbox and star (#394).
+        if add_column_if_not_exists(engine, 'recording', 'is_archived', 'BOOLEAN DEFAULT 0'):
+            app.logger.info("Added is_archived column to recording table")
+        if add_column_if_not_exists(engine, 'shared_recording_state', 'is_archived', 'BOOLEAN DEFAULT 0'):
+            app.logger.info("Added is_archived column to shared_recording_state table")
+
+        # Configurable AI title instructions at every level (#400)
+        for table in ('user', 'tag', 'folder'):
+            if add_column_if_not_exists(engine, table, 'title_prompt', 'TEXT'):
+                app.logger.info(f"Added title_prompt column to {table} table")
+
+    with _migration_section(app, failures, "token indexes, export templates and sharing columns"):
         # Create indexes for token lookups (for faster token verification)
         try:
             if create_index_if_not_exists(engine, 'ix_user_email_verification_token', 'user', 'email_verification_token'):
@@ -392,6 +659,19 @@ def initialize_database(app):
             app.logger.info("Added export_template_id column to tag table")
         if add_column_if_not_exists(engine, 'folder', 'export_template_id', 'INTEGER'):
             app.logger.info("Added export_template_id column to folder table")
+
+        # Configurable auto-export filenames (#348)
+        if add_column_if_not_exists(engine, 'user', 'export_filename_template', 'VARCHAR(500)'):
+            app.logger.info("Added export_filename_template column to user table")
+
+        # Inquire content availability toggles (agentic inquire). Nullable on
+        # purpose: NULL means "use the admin env default".
+        if add_column_if_not_exists(engine, 'user', 'inquire_allow_summaries', 'BOOLEAN'):
+            app.logger.info("Added inquire_allow_summaries column to user table")
+        if add_column_if_not_exists(engine, 'user', 'inquire_allow_notes', 'BOOLEAN'):
+            app.logger.info("Added inquire_allow_notes column to user table")
+        if add_column_if_not_exists(engine, 'recording', 'export_filename', 'VARCHAR(500)'):
+            app.logger.info("Added export_filename column to recording table")
 
         # Add source tracking columns to internal_share table
         if add_column_if_not_exists(engine, 'internal_share', 'source_type', "VARCHAR(20) DEFAULT 'manual'"):
@@ -489,6 +769,7 @@ def initialize_database(app):
                 if add_column_if_not_exists(engine, 'shared_recording_state', 'is_highlighted', 'BOOLEAN DEFAULT 0'):
                     app.logger.info("Added is_highlighted column to shared_recording_state table")
 
+    with _migration_section(app, failures, "meeting_date datetime migration"):
         # Migrate meeting_date from DATE to DATETIME format
         # This migration handles both:
         # 1. Converting existing DATE columns to DATETIME (for fresh pulls)
@@ -583,6 +864,48 @@ def initialize_database(app):
             app.logger.warning(f"Error during meeting_date migration: {e}")
             app.logger.warning("New recordings will work correctly, but existing dates may need manual migration")
 
+    with _migration_section(app, failures, "webhook secret rotation grace"):
+        # mailr spec W6: recipients' webhooks for shared recordings (opt-in).
+        if add_column_if_not_exists(engine, 'webhook', 'include_shared', 'BOOLEAN DEFAULT 0'):
+            app.logger.info("Added include_shared column to webhook table")
+        # mailr spec W2: the previous secret signs a second V2 value for a while.
+        if add_column_if_not_exists(engine, 'webhook', 'previous_secret', 'VARCHAR(120)'):
+            app.logger.info("Added previous_secret column to webhook table")
+        if add_column_if_not_exists(engine, 'webhook', 'previous_secret_expires_at', 'DATETIME'):
+            app.logger.info("Added previous_secret_expires_at column to webhook table")
+
+    with _migration_section(app, failures, "notifications"):
+        # The table itself comes from create_all(); these cover a database
+        # that already had an earlier version of it. Columns are added
+        # individually so a partial table is completed rather than rebuilt.
+        if create_index_if_not_exists(engine, 'ix_notification_user_id', 'notification', 'user_id'):
+            app.logger.info("Added index on notification.user_id")
+        if create_index_if_not_exists(engine, 'ix_notification_dedupe_key', 'notification', 'dedupe_key'):
+            app.logger.info("Added index on notification.dedupe_key")
+        if create_index_if_not_exists(engine, 'ix_notification_resolved_at', 'notification', 'resolved_at'):
+            app.logger.info("Added index on notification.resolved_at")
+
+    with _migration_section(app, failures, "sliced file upload sessions"):
+        # The model declares kind as NOT NULL with index=True, but both of
+        # those only reach a database that create_all() built. An upgraded
+        # database gets the column from the ALTER below, so the index has to
+        # be created explicitly here or existing installations never get one.
+        #
+        # The NOT NULL half is deliberately left alone. ADD COLUMN ... DEFAULT
+        # backfills every existing row, the ORM always supplies a value, and
+        # the default covers a direct insert, so the constraint would buy
+        # nothing that is not already true. Adding it to SQLite would mean
+        # swapping the column, which is real risk for no gain.
+        if add_column_if_not_exists(engine, 'recording_session', 'kind', "VARCHAR(20) DEFAULT 'recorder'"):
+            app.logger.info("Added kind column to recording_session table")
+        if add_column_if_not_exists(engine, 'recording_session', 'upload_filename', 'VARCHAR(255)'):
+            app.logger.info("Added upload_filename column to recording_session table")
+        if add_column_if_not_exists(engine, 'recording_session', 'upload_total_bytes', 'BIGINT'):
+            app.logger.info("Added upload_total_bytes column to recording_session table")
+        if create_index_if_not_exists(engine, 'ix_recording_session_kind', 'recording_session', 'kind'):
+            app.logger.info("Added index on recording_session.kind")
+
+    with _migration_section(app, failures, "performance and uniqueness indexes"):
         # Add index on TranscriptChunk.speaker_name for performance
         # This improves speaker rename operations which update all chunks
         try:
@@ -616,6 +939,16 @@ def initialize_database(app):
                 app.logger.info("Created unique index ix_user_sso_subject on user.sso_subject")
         except Exception as e:
             app.logger.warning(f"Could not create unique index on user.sso_subject: {e}")
+
+        # Where a recording's title came from (#412): user-typed titles are
+        # kept on reprocess, generated ones are regenerated.
+        if add_column_if_not_exists(engine, 'recording', 'title_source', 'VARCHAR(16)'):
+            app.logger.info("Added title_source column to recording table")
+
+        # Token scopes (mailr spec G1). NULL = full access, so existing tokens
+        # keep working exactly as before; no backfill.
+        if add_column_if_not_exists(engine, 'api_token', 'scopes', 'TEXT'):
+            app.logger.info("Added scopes column to api_token table")
 
         # Add file_hash column for duplicate detection
         if add_column_if_not_exists(engine, 'recording', 'file_hash', 'VARCHAR(64)'):
@@ -652,6 +985,7 @@ def initialize_database(app):
         except Exception as e:
             app.logger.warning(f"Could not create index on recording.folder_id: {e}")
 
+    with _migration_section(app, failures, "default system settings"):
         # Initialize default system settings
         if not SystemSetting.query.filter_by(key='transcript_length_limit').first():
             SystemSetting.set_setting(
@@ -662,6 +996,15 @@ def initialize_database(app):
             )
             app.logger.info("Initialized default transcript_length_limit setting")
             
+        if not SystemSetting.query.filter_by(key='default_storage_quota_mb').first():
+            SystemSetting.set_setting(
+                key='default_storage_quota_mb',
+                value='0',
+                description='Storage quota in megabytes (MB) given to new accounts. 0 means no limit. Existing accounts keep their own quota, set in Edit User.',
+                setting_type='integer'
+            )
+            app.logger.info("Initialized default default_storage_quota_mb setting")
+
         if not SystemSetting.query.filter_by(key='max_file_size_mb').first():
             SystemSetting.set_setting(
                 key='max_file_size_mb',
@@ -670,6 +1013,24 @@ def initialize_database(app):
                 setting_type='integer'
             )
             app.logger.info("Initialized default max_file_size_mb setting")
+
+        if not SystemSetting.query.filter_by(key='login_max_failed_attempts').first():
+            SystemSetting.set_setting(
+                key='login_max_failed_attempts',
+                value='5',
+                description='Wrong passwords for one account from one address before password sign-in from that address is locked. Set it to 0 to turn the lock off.',
+                setting_type='integer'
+            )
+            app.logger.info("Initialized default login_max_failed_attempts setting")
+
+        if not SystemSetting.query.filter_by(key='login_lockout_minutes').first():
+            SystemSetting.set_setting(
+                key='login_lockout_minutes',
+                value='15',
+                description='Minutes a login lock lasts.',
+                setting_type='integer'
+            )
+            app.logger.info("Initialized default login_lockout_minutes setting")
 
         if not SystemSetting.query.filter_by(key='max_audio_only_video_size_mb').first():
             # Default to 4x the regular limit so a default deployment lets
@@ -706,7 +1067,27 @@ def initialize_database(app):
                 setting_type='string'
             )
             app.logger.info("Initialized admin_default_summary_prompt setting")
-        
+
+        if not SystemSetting.query.filter_by(key='admin_default_title_prompt').first():
+            from src.config.prompts import DEFAULT_TITLE_PROMPT
+            SystemSetting.set_setting(
+                key='admin_default_title_prompt',
+                value=DEFAULT_TITLE_PROMPT,
+                description='Default instructions for AI-generated recording titles, used when no tag, folder or user title prompt is set.',
+                setting_type='string'
+            )
+            app.logger.info("Initialized admin_default_title_prompt setting")
+
+        if not SystemSetting.query.filter_by(key='admin_default_contextual_speaker_prompt').first():
+            from src.config.prompts import DEFAULT_CONTEXTUAL_SPEAKER_PROMPT
+            SystemSetting.set_setting(
+                key='admin_default_contextual_speaker_prompt',
+                value=DEFAULT_CONTEXTUAL_SPEAKER_PROMPT,
+                description='Guidance for contextual speaker labelling, used when a recording has no voice embeddings and speakers are named from the transcript, constrained to the user\'s saved profiles. Only the guidance is editable; the candidate list and JSON format are fixed in code.',
+                setting_type='string'
+            )
+            app.logger.info("Initialized admin_default_contextual_speaker_prompt setting")
+
         if not SystemSetting.query.filter_by(key='recording_disclaimer').first():
             SystemSetting.set_setting(
                 key='recording_disclaimer',
@@ -770,6 +1151,20 @@ def initialize_database(app):
             )
             app.logger.info("Initialized enable_folders setting")
 
+        if not SystemSetting.query.filter_by(key='default_timezone').first():
+            # Seeded from the legacy TIMEZONE variable (removed in v0.9.0, still in
+            # some setups, e.g. the Unraid template) so its intent carries over.
+            from src.utils.timezones import is_valid_timezone
+            legacy_tz = (os.environ.get('TIMEZONE') or '').strip()
+            SystemSetting.set_setting(
+                key='default_timezone',
+                value=legacy_tz if is_valid_timezone(legacy_tz) else 'UTC',
+                description='Timezone for dates in generated titles (naming templates, default titles) for users whose browser has not reported one and who have not chosen one in Account settings.',
+                setting_type='string'
+            )
+            app.logger.info("Initialized default_timezone setting")
+
+    with _migration_section(app, failures, "embedding identifier tracking"):
         # Track the embedding identifier (provider + model) in system_setting
         # so we can warn when either changes between restarts. Issue #262 —
         # old vectors will not match a new model's output dimensionality or
@@ -833,14 +1228,49 @@ def initialize_database(app):
             db.session.rollback()
             app.logger.warning(f"embedding_identifier compatibility check skipped: {e}")
 
+    with _migration_section(app, failures, "one-shot data cleanups"):
+        # One-time email normalization: lowercase (and trim) existing stored
+        # emails so they match the normalize-on-write behavior. Login and
+        # uniqueness are case-insensitive regardless, so this is cleanup, not a
+        # correctness requirement. Collision-aware: if two accounts differ only
+        # by case/whitespace, both are left untouched and logged, since merging
+        # them is a manual decision. DB-agnostic (operates through the ORM).
+        try:
+            from collections import defaultdict
+            from src.models import User
+            users = User.query.all()
+            by_norm = defaultdict(list)
+            for u in users:
+                by_norm[User.normalize_email(u.email)].append(u)
+            changed = 0
+            for u in users:
+                norm = User.normalize_email(u.email)
+                if norm == u.email:
+                    continue  # already normalized
+                if len(by_norm[norm]) > 1:
+                    app.logger.warning(
+                        f"Skipped email normalization for user {u.id}: multiple "
+                        f"accounts map to '{norm}' case-insensitively; resolve manually."
+                    )
+                    continue
+                u.email = norm
+                changed += 1
+            if changed:
+                db.session.commit()
+                app.logger.info(f"Normalized {changed} stored email address(es) to lowercase")
+        except Exception as e:
+            db.session.rollback()
+            app.logger.warning(f"Email normalization migration skipped: {e}")
+
         # One-shot migration: clean up legacy User.transcription_language values
         # that were stored as display names ("Français", "English") before the
         # account-settings input was a dropdown. Issue #256.
-        try:
+        #
+        # Recorded in the ledger rather than re-detected, because detecting it
+        # means loading every user on every startup for a fix that can only ever
+        # be needed once.
+        def _normalize_transcription_languages(_engine):
             from src.utils.language import normalize_language_code
-            from sqlalchemy import or_
-            # Touch only rows where the value isn't already a valid 2-letter code,
-            # to keep this idempotent across restarts.
             stale_users = User.query.filter(User.transcription_language.isnot(None)).all()
             cleaned = 0
             for u in stale_users:
@@ -854,10 +1284,49 @@ def initialize_database(app):
             if cleaned:
                 db.session.commit()
                 app.logger.info(f"Normalized transcription_language for {cleaned} user(s)")
+
+        try:
+            run_once(engine, '0001_normalize_transcription_language',
+                     _normalize_transcription_languages, logger=app.logger)
         except Exception as e:
             db.session.rollback()
             app.logger.warning(f"transcription_language normalization migration skipped: {e}")
 
+        # Link named transcript segments to saved speakers (speaker_id), once.
+        # Voice samples help where they exist; the name match covers the rest.
+        try:
+            from src.services.speaker_links import backfill_all
+            run_once(engine, '0003_link_transcript_speakers',
+                     lambda eng: backfill_all(eng, logger=app.logger), logger=app.logger)
+        except Exception as e:
+            db.session.rollback()
+            app.logger.warning(f"Transcript speaker linking skipped, retried next start: {e}")
+
+        # "Delete all speakers" used to leave the speakers' snippets behind (#475).
+        try:
+            run_once(engine, '0004_remove_orphaned_speaker_rows',
+                     lambda eng: _remove_orphaned_speaker_rows(eng, app), logger=app.logger)
+        except Exception as e:
+            db.session.rollback()
+            app.logger.warning(f"Orphaned speaker row cleanup skipped, retried next start: {e}")
+
+        # Deleting a recording left its session's link behind on SQLite (#505).
+        try:
+            run_once(engine, '0005_clear_stale_session_links',
+                     lambda eng: _clear_stale_session_links(eng, app), logger=app.logger)
+        except Exception as e:
+            db.session.rollback()
+            app.logger.warning(f"Recording-session link cleanup skipped, retried next start: {e}")
+
+        # Two admins could create the same folder name in one group (#513).
+        try:
+            run_once(engine, '0006_folder_group_name_index',
+                     lambda eng: _add_folder_group_name_index(eng, app), logger=app.logger)
+        except Exception as e:
+            db.session.rollback()
+            app.logger.warning(f"Group folder name index skipped, retried next start: {e}")
+
+    with _migration_section(app, failures, "inquire mode chunk backfill"):
         # Process existing recordings for inquire mode (chunk and embed them)
         # Only run if inquire mode is enabled
         if ENABLE_INQUIRE_MODE:
@@ -914,8 +1383,18 @@ def initialize_database(app):
                 app.logger.warning(f"Error during existing recordings migration: {e}")
                 app.logger.info("Existing recordings can be migrated later using the admin API or migration script.")
             
-    except Exception as e:
-        app.logger.error(f"Error during database migration: {e}")
+    if failures:
+        app.logger.error("=" * 72)
+        app.logger.error("DATABASE MIGRATION: %d section(s) failed: %s",
+                         len(failures), ", ".join(name for name, _ in failures))
+        app.logger.error("Sections after a failed one were still applied, but the schema "
+                         "may be partly upgraded.")
+        app.logger.error("The application will keep starting, but expect errors until this is fixed.")
+        app.logger.error("Please report this with the tracebacks above: "
+                         "https://github.com/murtaza-nasir/speakr/issues")
+        app.logger.error("=" * 72)
+        app.config['MIGRATION_FAILED'] = "; ".join(
+            f"{name}: {error}" for name, error in failures)
 
 
 if __name__ == '__main__':

@@ -30,20 +30,20 @@
                     <button v-if="!selectionMode && recordings.length > 0"
                             @click="enterSelectionMode"
                             class="w-9 h-9 flex items-center justify-center bg-[var(--bg-accent)] text-[var(--text-accent)] rounded-md hover:opacity-80 transition-opacity"
-                            title="Select multiple">
+                            :title="t('bulkActions.selectMultipleHint')">
                         <i class="fas fa-list-check"></i>
                     </button>
                     <button v-if="selectionMode"
                             @click="exitSelectionMode"
                             class="btn btn--primary"
-                            title="Exit selection mode">
-                        <i class="fas fa-times mr-1"></i>Done
+                            :title="t('bulkActions.exitSelection')">
+                        <i class="fas fa-times mr-1"></i>${ t('common.done') }
                     </button>
                     <!-- New button - compact when folders enabled -->
                     <button v-if="!selectionMode && foldersEnabled && availableFolders.length > 0"
                             @click="switchToUploadView"
                             class="btn btn--primary btn--icon"
-                            title="New Recording">
+                            :title="t('nav.newRecording')">
                         <i class="fas fa-plus"></i>
                     </button>
                     <button v-else-if="!selectionMode"
@@ -62,16 +62,16 @@
                             class="flex-1 h-7 flex items-center justify-between pl-2 pr-2 bg-[var(--bg-input)] border border-[var(--border-secondary)] rounded text-xs hover:bg-[var(--bg-tertiary)] transition-colors">
                         <span class="flex items-center">
                             <i class="fas fa-filter mr-1.5 text-[var(--text-muted)] text-[10px]"></i>
-                            <span v-if="!searchQuery && filterTags.length === 0 && filterSpeakers.length === 0 && !filterDatePreset && !filterDateRange.start && !filterDateRange.end && !filterTextQuery && !filterStarred && !filterInbox && !filterNeedsTranscription && !filterNeedsSummary && !filterNeedsSpeakers"
+                            <span v-if="!searchQuery && filterTags.length === 0 && filterSpeakers.length === 0 && !filterDatePreset && !filterDateRange.start && !filterDateRange.end && !filterTextQuery && !filterStarred && !filterInbox && !filterAudioRemoved && !filterNeedsTranscription && !filterNeedsSummary && !filterNeedsSpeakers"
                                   v-text="t('sidebar.searchRecordings')">
                             </span>
                             <span v-else class="text-[var(--text-accent)]">
-                                Active filters (${ (filterTags.length > 0 ? 1 : 0) + (filterSpeakers.length > 0 ? 1 : 0) + (filterDatePreset || filterDateRange.start || filterDateRange.end ? 1 : 0) + (filterTextQuery ? 1 : 0) + (filterStarred ? 1 : 0) + (filterInbox ? 1 : 0) + (filterNeedsTranscription ? 1 : 0) + (filterNeedsSummary ? 1 : 0) + (filterNeedsSpeakers ? 1 : 0) })
+                                Active filters (${ (filterTags.length > 0 ? 1 : 0) + (filterSpeakers.length > 0 ? 1 : 0) + (filterDatePreset || filterDateRange.start || filterDateRange.end ? 1 : 0) + (filterTextQuery ? 1 : 0) + (filterStarred ? 1 : 0) + (filterInbox ? 1 : 0) + (filterAudioRemoved ? 1 : 0) + (filterNeedsTranscription ? 1 : 0) + (filterNeedsSummary ? 1 : 0) + (filterNeedsSpeakers ? 1 : 0) })
                             </span>
                         </span>
                         <i :class="['fas fa-chevron-down transition-transform text-[var(--text-muted)] text-[10px]', showAdvancedFilters ? 'rotate-180' : '']"></i>
                     </button>
-                    <button v-if="searchQuery || filterTags.length > 0 || filterSpeakers.length > 0 || filterDatePreset || filterDateRange.start || filterDateRange.end || filterTextQuery || filterStarred || filterInbox || filterNeedsTranscription || filterNeedsSummary || filterNeedsSpeakers"
+                    <button v-if="searchQuery || filterTags.length > 0 || filterSpeakers.length > 0 || filterDatePreset || filterDateRange.start || filterDateRange.end || filterTextQuery || filterStarred || filterInbox || filterAudioRemoved || filterNeedsTranscription || filterNeedsSummary || filterNeedsSpeakers"
                             @click="clearAllFilters"
                             class="w-7 h-7 flex items-center justify-center bg-[var(--bg-input)] border border-[var(--border-secondary)] rounded text-xs hover:bg-[var(--bg-tertiary)] hover:text-[var(--text-primary)] transition-colors"
                             :title="t('buttons.clearAllFilters')">
@@ -99,8 +99,9 @@
                         </div>
                     </div>
 
-                    <!-- Quick Filters (Starred/Inbox) -->
-                    <div class="flex gap-2">
+                    <!-- Quick Filters (Starred/Inbox/Audio removed). Wraps when the
+                         sidebar is too narrow for all three labels. -->
+                    <div class="flex flex-wrap gap-2">
                         <button @click="filterStarred = !filterStarred"
                                 :class="[
                                     'flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-all border',
@@ -120,6 +121,18 @@
                                 ]">
                             <i class="fas fa-inbox" style="font-size: 10px;"></i>
                             <span v-text="t('sidebar.inbox')"></span>
+                        </button>
+                        <button v-if="enableAudioRemovedFilter" @click="filterAudioRemoved = !filterAudioRemoved"
+                                :aria-pressed="filterAudioRemoved"
+                                :title="t('audioRemoved.filterHint')"
+                                :class="[
+                                    'flex-1 min-w-fit flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-all border',
+                                    filterAudioRemoved
+                                        ? 'bg-slate-500/20 border-slate-500/50 text-slate-300'
+                                        : 'bg-[var(--bg-input)] border-[var(--border-secondary)] text-[var(--text-muted)] hover:border-slate-500/30 hover:text-slate-300'
+                                ]">
+                            <i class="fas fa-volume-xmark" style="font-size: 10px;"></i>
+                            <span class="whitespace-nowrap" v-text="t('audioRemoved.label')"></span>
                         </button>
                     </div>
 
@@ -276,22 +289,23 @@
                         <i class="fas fa-exchange-alt text-[var(--text-muted)] text-[10px]"></i>
                     </button>
 
-                    <!-- Archived Toggle (only show when audio-only deletion mode is active) -->
-                    <button v-if="enableArchiveToggle" @click="showArchivedRecordings = !showArchivedRecordings"
+                    <!-- Archived view (#394): the user's archive, always available -->
+                    <button @click="showArchivedRecordings = !showArchivedRecordings"
+                            :aria-pressed="showArchivedRecordings"
                             :class="[
                                 'flex-1 min-w-0 flex items-center justify-center gap-1 px-2 py-1.5 border rounded-md text-xs transition-colors',
                                 showArchivedRecordings
                                     ? 'bg-[var(--bg-accent)] border-[var(--border-accent)] text-[var(--text-accent)]'
                                     : 'bg-[var(--bg-input)] border-[var(--border-secondary)] hover:bg-[var(--bg-tertiary)]'
                             ]"
-                            :title="t('sidebar.archivedRecordings')">
-                        <i class="fas fa-archive"></i>
-                        <span class="hidden sm:inline truncate min-w-0" v-text="t('sidebar.archived')"></span>
-                        <i :class="['fas text-[10px]', showArchivedRecordings ? 'fa-toggle-on' : 'fa-toggle-off']"></i>
+                            :title="t('archive.showArchived')">
+                        <i class="fas fa-box-archive"></i>
+                        <span class="hidden sm:inline truncate min-w-0" v-text="t('archive.archived')"></span>
                     </button>
-
-                    <!-- Shared Toggle -->
+                    <!-- Shared Toggle. The highlighted background shows the state;
+                         the on/off icon was dropped so the labels fit (#394). -->
                     <button v-if="enableInternalSharing" @click="showSharedWithMe = !showSharedWithMe"
+                            :aria-pressed="showSharedWithMe"
                             :class="[
                                 'flex-1 min-w-0 flex items-center justify-center gap-1 px-2 py-1.5 border rounded-md text-xs transition-colors',
                                 showSharedWithMe
@@ -301,7 +315,6 @@
                             :title="t('sidebar.sharedWithMe')">
                         <i class="fas fa-users"></i>
                         <span class="hidden sm:inline truncate min-w-0" v-text="t('sidebar.shared')"></span>
-                        <i :class="['fas text-[10px]', showSharedWithMe ? 'fa-toggle-on' : 'fa-toggle-off']"></i>
                     </button>
                 </div>
             </div>
@@ -335,14 +348,14 @@
                     <div class="flex-1 min-w-0">
                         <div class="flex items-center gap-2 mb-1">
                             <span class="font-medium text-sm text-[var(--text-primary)] truncate">
-                                ${ incognitoRecording.title || 'Incognito Recording' }
+                                ${ incognitoRecording.title || t('incognito.recordingTitle') }
                             </span>
                         </div>
                         <div class="flex items-center gap-2 flex-wrap">
                             <!-- Incognito pill badge (matches tag style with contrasting border) -->
                             <span class="inline-flex items-center px-1.5 py-0.5 rounded-md text-xs font-medium bg-violet-500/15 dark:bg-violet-500/25 text-violet-700 dark:text-violet-300 ring-1 ring-violet-400/50 dark:ring-violet-500/50">
                                 <i class="fas fa-user-secret mr-1" style="font-size: 9px;"></i>
-                                Incognito
+                                ${ t('incognito.badge') }
                             </span>
                             <!-- Duration pill -->
                             <span v-if="incognitoRecording.audio_duration_seconds" class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] text-[var(--text-muted)] bg-[var(--bg-tertiary)]">
@@ -352,12 +365,12 @@
                         </div>
                         <p class="text-[10px] text-[var(--text-muted)] mt-1.5 opacity-70">
                             <i class="fas fa-eye-slash mr-1"></i>
-                            Session only
+                            ${ t('incognito.sessionOnly') }
                         </p>
                     </div>
                     <button @click.stop="clearIncognitoRecordingWithConfirm"
                             class="opacity-0 group-hover:opacity-100 p-1.5 text-[var(--text-muted)] hover:text-red-500 hover:bg-red-500/10 rounded transition-all"
-                            title="Discard">
+                            :title="t('help.discard')">
                         <i class="fas fa-times text-xs"></i>
                     </button>
                 </div>
@@ -382,11 +395,9 @@
                     <div class="flex items-center gap-3">
                         <button @click="allVisibleSelected ? clearSelection() : selectAll()"
                                 class="text-xs text-[var(--text-accent)] hover:underline">
-                            ${ allVisibleSelected ? 'Clear all' : 'Select all' }
+                            ${ allVisibleSelected ? t('common.clearAll') : t('common.selectAll') }
                         </button>
-                        <span class="text-xs text-[var(--text-muted)]">
-                            ${ selectedCount } selected
-                        </span>
+                        <span class="text-xs text-[var(--text-muted)]" v-text="t('bulkActions.selectedCount', {count: selectedCount})"></span>
                     </div>
                 </div>
 
@@ -405,7 +416,8 @@
                     <div class="recording-group">
                         <div v-for="recording in group.items"
                              :key="recording.id"
-                             @click="selectionMode ? toggleSelection(recording.id) : selectRecording(recording)"
+                             @mousedown="$event.shiftKey && $event.preventDefault()"
+                             @click="handleRecordingClick(recording, $event, visibleRecordingIds) || selectRecording(recording)"
                              :class="[
                                  'recording-row relative px-3 py-2.5 cursor-pointer transition-colors',
                                  selectionMode && isSelected(recording.id)
@@ -419,17 +431,17 @@
                                  the title or change card heights when the
                                  user toggles selection mode. -->
                             <div v-if="selectionMode"
-                                 @click.stop="toggleSelection(recording.id)"
+                                 @click.stop="handleRecordingClick(recording, $event, visibleRecordingIds)"
                                  class="absolute top-2 right-2 z-10">
                                 <input type="checkbox"
                                        :checked="isSelected(recording.id)"
                                        class="selection-checkbox"
-                                       @click.stop="toggleSelection(recording.id)">
+                                       @click.stop="handleRecordingClick(recording, $event, visibleRecordingIds)">
                             </div>
                             <!-- Title and Status Row -->
                             <div class="flex items-center justify-between mb-1"
                                  :class="{ 'pr-7': selectionMode }">
-                                <h4 class="font-medium text-sm truncate flex-1 mr-2" :class="selectedRecording?.id === recording.id && !selectionMode ? 'text-[var(--text-accent)]' : 'text-[var(--text-primary)]'">
+                                <h4 dir="auto" class="font-medium text-sm truncate flex-1 mr-2" :class="selectedRecording?.id === recording.id && !selectionMode ? 'text-[var(--text-accent)]' : 'text-[var(--text-primary)]'">
                                     ${ recording.title || t('common.untitled') }
                                 </h4>
                                 <div class="flex items-center gap-0.5 flex-shrink-0">
@@ -448,11 +460,18 @@
                                         <i v-if="!recording.is_shared && recording.public_share_count > 0" class="fas fa-globe text-teal-600 dark:text-teal-400"></i>
                                     </span>
 
-                                    <!-- Show Audio Deleted badge -->
+                                    <!-- Audio removed badge -->
                                     <span v-if="recording.audio_deleted_at"
                                           class="inline-flex items-center justify-center h-5 px-1.5 rounded-full text-[9px] leading-none bg-gray-200 dark:bg-gray-700 border border-gray-300 dark:border-gray-600"
-                                          :title="t('sidebar.archived')">
-                                        <i class="fas fa-file-audio text-gray-600 dark:text-gray-400"></i>
+                                          :title="t('audioRemoved.label')">
+                                        <i class="fas fa-volume-xmark text-gray-600 dark:text-gray-400"></i>
+                                    </span>
+
+                                    <!-- Archived badge, seen in search results and the archive view -->
+                                    <span v-if="recording.is_archived"
+                                          class="inline-flex items-center justify-center h-5 px-1.5 rounded-full text-[9px] leading-none bg-gray-200 dark:bg-gray-700 border border-gray-300 dark:border-gray-600"
+                                          :title="t('archive.archived')">
+                                        <i class="fas fa-box-archive text-gray-600 dark:text-gray-400"></i>
                                     </span>
 
                                     <!-- Show Failed status for failed recordings -->
@@ -526,7 +545,7 @@
                                         @click.stop="filterFolder = recording.folder_id"
                                         class="chip chip--clickable"
                                         :style="{ backgroundColor: getFolderColor(recording.folder_id), color: getContrastTextColor(getFolderColor(recording.folder_id)) }"
-                                        :title="'Folder: ' + getFolderName(recording.folder_id)">
+                                        :title="t('tooltips.folderLabel', { name: getFolderName(recording.folder_id) })">
                                     <i class="fas fa-folder"></i>
                                     <span class="chip__label" v-text="getFolderName(recording.folder_id)"></span>
                                 </button>
@@ -543,14 +562,14 @@
                                             @click.stop="filterByTag(tag)"
                                             class="chip chip--clickable"
                                             :style="{ backgroundColor: tag.color, color: getContrastTextColor(tag.color) }"
-                                            :title="tag.group_id ? ('Group: ' + tag.group_name) : ('Filter by ' + tag.name)">
+                                            :title="tag.group_id ? t('tooltips.groupLabel', { name: tag.group_name }) : t('tooltips.filterByName', { name: tag.name })">
                                         <i v-if="tag.group_id" class="fas fa-users"></i>
                                         <span class="chip__label" v-text="tag.name"></span>
                                     </button>
                                 </template>
                                 <span v-if="getRecordingTags(recording).length > 4"
                                       class="inline-flex items-center px-1.5 py-0.5 rounded-md text-xs text-[var(--text-muted)]"
-                                      :title="'More tags...'">
+                                      :title="t('tooltips.moreTags')">
                                     +${getRecordingTags(recording).length - 4}
                                 </span>
                                 <button v-if="recording.duplicate_info"
@@ -600,32 +619,38 @@
 
         <button @click="openBulkTagModal('add')"
                 class="w-10 h-10 flex items-center justify-center bg-[var(--bg-tertiary)] hover:bg-[var(--bg-input)] rounded-lg transition-colors border border-[var(--border-secondary)]"
-                title="Add or remove tags">
+                :title="t('bulkActions.addOrRemoveTags')">
             <i class="fas fa-tags text-[var(--text-muted)]"></i>
         </button>
 
         <button v-if="foldersEnabled"
                 @click="showBulkFolderModal = true"
                 class="w-10 h-10 flex items-center justify-center bg-[var(--bg-tertiary)] hover:bg-[var(--bg-input)] rounded-lg transition-colors border border-[var(--border-secondary)]"
-                title="Move to folder">
+                :title="t('folderManagement.moveToFolder')">
             <i class="fas fa-folder text-emerald-500"></i>
         </button>
 
         <button @click="bulkToggleInbox()"
                 class="w-10 h-10 flex items-center justify-center bg-[var(--bg-tertiary)] hover:bg-[var(--bg-input)] rounded-lg transition-colors border border-[var(--border-secondary)]"
-                title="Toggle inbox status">
+                :title="t('bulkActions.toggleInbox')">
             <i class="fas fa-inbox text-blue-500"></i>
         </button>
 
         <button @click="bulkToggleHighlight()"
                 class="w-10 h-10 flex items-center justify-center bg-[var(--bg-tertiary)] hover:bg-[var(--bg-input)] rounded-lg transition-colors border border-[var(--border-secondary)]"
-                title="Toggle highlight">
+                :title="t('bulkActions.toggleHighlight')">
             <i class="fas fa-star text-amber-500"></i>
+        </button>
+
+        <button @click="bulkToggleArchive()"
+                class="w-10 h-10 flex items-center justify-center bg-[var(--bg-tertiary)] hover:bg-[var(--bg-input)] rounded-lg transition-colors border border-[var(--border-secondary)]"
+                :title="t('archive.toggleSelected')">
+            <i class="fas fa-box-archive text-[var(--text-muted)]"></i>
         </button>
 
         <button @click="openBulkReprocessModal"
                 class="w-10 h-10 flex items-center justify-center bg-[var(--bg-tertiary)] hover:bg-[var(--bg-input)] rounded-lg transition-colors border border-[var(--border-secondary)]"
-                title="Reprocess">
+                :title="t('bulkActions.reprocess')">
             <i class="fas fa-redo text-[var(--text-muted)]"></i>
         </button>
 
@@ -640,13 +665,13 @@
 
         <button @click="openBulkDeleteModal"
                 class="w-10 h-10 flex items-center justify-center bg-red-600 hover:bg-red-700 text-white rounded-lg transition-colors"
-                title="Delete selected">
+                :title="t('bulkActions.deleteSelected')">
             <i class="fas fa-trash"></i>
         </button>
 
         <button @click="exitSelectionMode"
                 class="w-10 h-10 flex items-center justify-center text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-tertiary)] rounded-lg transition-colors"
-                title="Exit selection mode">
+                :title="t('bulkActions.exitSelection')">
             <i class="fas fa-times"></i>
         </button>
     </div>
@@ -659,22 +684,20 @@
             <div class="flex items-center justify-between">
                 <h3 class="text-lg font-semibold text-[var(--text-primary)]">
                     <i class="fas fa-folder mr-2 text-emerald-500"></i>
-                    Move to Folder
+                    ${ t('folderManagement.moveToFolder') }
                 </h3>
                 <button @click="showBulkFolderModal = false" class="text-[var(--text-muted)] hover:text-[var(--text-primary)]">
                     <i class="fas fa-times"></i>
                 </button>
             </div>
-            <p class="text-sm text-[var(--text-muted)] mt-1">
-                ${ selectedCount } recording(s) selected
-            </p>
+            <p class="text-sm text-[var(--text-muted)] mt-1" v-text="selectedCount !== 1 ? t('bulkReprocessModal.recordingsSelectedPlural', {count: selectedCount}) : t('bulkReprocessModal.recordingsSelected', {count: selectedCount})"></p>
         </div>
         <div class="p-4 max-h-64 overflow-y-auto">
             <!-- No Folder Option -->
             <button @click="bulkAssignFolder(null)"
                     class="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-left hover:bg-[var(--bg-tertiary)] transition-colors mb-2 border border-[var(--border-secondary)]">
                 <i class="fas fa-folder-minus text-[var(--text-muted)]"></i>
-                <span class="text-sm text-[var(--text-secondary)]">Remove from folder</span>
+                <span class="text-sm text-[var(--text-secondary)]" v-text="t('folderManagement.removeFromFolder')"></span>
             </button>
 
             <!-- Divider -->
@@ -698,13 +721,13 @@
 
             <!-- Empty State -->
             <p v-if="availableFolders.length === 0" class="text-sm text-[var(--text-muted)] text-center py-4">
-                No folders created. Create folders in your account settings.
+                ${ t('folderManagement.noFoldersCreateInSettings') }
             </p>
         </div>
         <div class="p-4 border-t border-[var(--border-primary)] bg-[var(--bg-tertiary)]">
             <button @click="showBulkFolderModal = false"
                     class="w-full px-4 py-2 text-sm text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors">
-                Cancel
+                ${ t('buttons.cancel') }
             </button>
         </div>
     </div>
