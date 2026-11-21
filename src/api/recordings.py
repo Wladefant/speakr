@@ -609,7 +609,8 @@ def download_notes_word(recording_id):
         if not has_recording_access(recording, current_user):
             return jsonify({'error': 'You do not have permission to access this recording'}), 403
 
-        if not recording.notes:
+        user_notes = recording.get_user_notes(current_user)
+        if not user_notes:
             return jsonify({'error': 'No notes available for this recording'}), 400
 
         # Create Word document
@@ -654,7 +655,7 @@ def download_notes_word(recording_id):
         doc.add_paragraph('')  # Empty line
 
         # Process markdown content using the helper function
-        process_markdown_to_docx(doc, recording.notes)
+        process_markdown_to_docx(doc, user_notes)
 
         # Save to BytesIO
         doc_stream = BytesIO()
@@ -1706,16 +1707,36 @@ def get_recordings_paginated():
                 )
             )
 
-        # Apply folder filter (AND with other filters)
+        # Apply folder filter (AND with other filters) without leaking hidden owner folders on shared recordings
         if folder_filter:
             if folder_filter.lower() == 'none':
-                # Filter recordings with no folder
-                stmt = stmt.where(Recording.folder_id.is_(None))
+                shared_with_folder_subq = db.select(InternalShare.recording_id).where(
+                    InternalShare.shared_with_user_id == current_user.id,
+                    InternalShare.source_folder_id.isnot(None),
+                )
+                stmt = stmt.where(
+                    db.or_(
+                        db.and_(Recording.user_id == current_user.id, Recording.folder_id.is_(None)),
+                        db.and_(Recording.user_id != current_user.id, ~Recording.id.in_(shared_with_folder_subq)),
+                    )
+                )
             else:
-                # Filter by specific folder_id
                 try:
                     folder_id = int(folder_filter)
-                    stmt = stmt.where(Recording.folder_id == folder_id)
+                    shared_folder_subq = db.select(InternalShare.recording_id).where(
+                        InternalShare.shared_with_user_id == current_user.id,
+                        InternalShare.source_folder_id == folder_id,
+                    )
+                    stmt = stmt.where(
+                        db.or_(
+                            db.and_(Recording.user_id == current_user.id, Recording.folder_id == folder_id),
+                            db.and_(
+                                Recording.user_id != current_user.id,
+                                Recording.folder_id == folder_id,
+                                Recording.id.in_(shared_folder_subq),
+                            ),
+                        )
+                    )
                 except ValueError:
                     pass  # Invalid folder_id, ignore filter
 
@@ -1899,16 +1920,39 @@ def get_recordings_paginated():
                 except ValueError:
                     pass  # Invalid date format, ignore
 
-            # Apply tag filters
+            # Apply tag filters scoped to tags visible to current_user on each recording
             if tag_filters:
-                # Join with tags table and filter by tag names
                 tag_conditions = []
                 for tag_filter in tag_filters:
-                    # Replace underscores back to spaces for matching
                     tag_name = tag_filter.replace('_', ' ')
                     tag_conditions.append(Tag.name.ilike(f'%{tag_name}%'))
 
-                stmt = stmt.join(RecordingTag).join(Tag).where(db.or_(*tag_conditions))
+                user_group_ids = [
+                    m.group_id for m in GroupMembership.query.filter_by(user_id=current_user.id).all()
+                ]
+                shared_tag_pairs = {
+                    (row[0], row[1])
+                    for row in db.session.query(
+                        InternalShare.recording_id, InternalShare.source_tag_id
+                    ).filter(
+                        InternalShare.shared_with_user_id == current_user.id,
+                        InternalShare.source_tag_id.isnot(None),
+                    ).all()
+                }
+                visibility_clauses = [Recording.user_id == current_user.id]
+                if user_group_ids:
+                    visibility_clauses.append(Tag.group_id.in_(user_group_ids))
+                if shared_tag_pairs:
+                    visibility_clauses.append(
+                        db.or_(*[
+                            db.and_(Recording.id == r_id, RecordingTag.tag_id == t_id)
+                            for r_id, t_id in shared_tag_pairs
+                        ])
+                    )
+
+                stmt = stmt.join(RecordingTag).join(Tag).where(
+                    db.and_(db.or_(*tag_conditions), db.or_(*visibility_clauses))
+                )
 
             # Apply speaker filters
             if speaker_filters:
@@ -3866,7 +3910,7 @@ Following is the meeting transcript:
 <<end transcript>>
 
 Additional context and notes about the meeting:
-{recording.notes or "none"}
+{recording.get_user_notes(current_user) or "none"}
 """
 
         # Prepare messages array with system prompt and conversation history
@@ -4272,6 +4316,12 @@ def bulk_delete_recordings():
                 errors.append(f"Error with recording {recording_id}")
 
         db.session.commit()
+
+        for deleted_id in deleted_ids:
+            try:
+                mark_export_as_deleted(deleted_id)
+            except Exception as exp_err:
+                current_app.logger.warning(f"Failed to delete auto-export for recording {deleted_id}: {exp_err}")
 
         return jsonify({
             'success': True,

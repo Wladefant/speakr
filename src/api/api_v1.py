@@ -938,15 +938,20 @@ def get_recording(recording_id):
         'processing_time_seconds': recording.processing_time_seconds,
         'transcription_duration_seconds': recording.transcription_duration_seconds,
         'summarization_duration_seconds': recording.summarization_duration_seconds,
-        'folder_id': recording.folder_id,
-        'folder': {'id': recording.folder.id, 'name': recording.folder.name} if recording.folder else None,
+        'folder_id': None,
+        'folder': None,
         'deletion_exempt': recording.deletion_exempt,
         'events': [e.to_dict() for e in recording.events] if hasattr(recording, 'events') else [],
         'error_message': recording.error_message if recording.status == 'FAILED' else None,
-        'tags': [{'id': t.id, 'name': t.name, 'color': t.color} for t in recording.tags],
-        'duplicate_info': recording.get_duplicate_info(),
+        'tags': [],
+        'duplicate_info': recording.get_duplicate_info() if recording.user_id == current_user.id else None,
         'keep_audio_only': recording.keep_audio_only,
     }
+
+    tags_ser, folder_ser, folder_id_ser = recording._serialize_tags_and_folder(current_user)
+    response['folder_id'] = folder_id_ser
+    response['folder'] = {'id': folder_ser['id'], 'name': folder_ser['name']} if folder_ser else None
+    response['tags'] = [{'id': t['id'], 'name': t['name'], 'color': t.get('color')} for t in tags_ser]
 
     # Include large text fields based on params
     if format_type != 'minimal':
@@ -958,7 +963,7 @@ def get_recording(recording_id):
         if 'summary' in include_fields:
             response['summary'] = recording.summary
         if 'notes' in include_fields:
-            response['notes'] = recording.notes
+            response['notes'] = recording.get_user_notes(current_user)
 
     return jsonify(response)
 
@@ -1084,9 +1089,10 @@ def get_notes(recording_id):
     if not has_recording_access(recording, current_user):
         return jsonify({'error': 'Permission denied'}), 403
 
+    user_notes = recording.get_user_notes(current_user)
     return jsonify({
-        'notes': recording.notes,
-        'has_notes': bool(recording.notes)
+        'notes': user_notes,
+        'has_notes': bool(user_notes)
     })
 
 
@@ -1303,6 +1309,12 @@ def delete_recording(recording_id):
     # Delete from database
     db.session.delete(recording)
     db.session.commit()
+
+    try:
+        from src.file_exporter import mark_export_as_deleted
+        mark_export_as_deleted(recording_id)
+    except Exception as exp_err:
+        current_app.logger.warning(f"Failed to delete auto-export for recording {recording_id}: {exp_err}")
 
     return jsonify({'success': True, 'message': 'Recording deleted'})
 
@@ -2404,7 +2416,7 @@ Participants: {recording.participants or 'Not specified'}
 Transcript:
 {formatted_transcription}
 
-Notes: {recording.notes or 'None'}
+Notes: {recording.get_user_notes(current_user) or 'None'}
 """
 
     # Build messages
@@ -2728,6 +2740,14 @@ def batch_delete_recordings():
             results.append({'id': recording_id, 'success': False, 'error': str(e)})
 
     db.session.commit()
+
+    from src.file_exporter import mark_export_as_deleted
+    for r in results:
+        if r.get('success'):
+            try:
+                mark_export_as_deleted(r['id'])
+            except Exception as exp_err:
+                current_app.logger.warning(f"Failed to delete auto-export for recording {r['id']}: {exp_err}")
 
     success_count = sum(1 for r in results if r['success'])
     return jsonify({

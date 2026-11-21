@@ -161,17 +161,22 @@ def mark_export_as_deleted(recording_id):
             if not base_dir.exists():
                 return None
 
-            # Look for the file in all user subdirectories
+            # Look for and permanently unlink exported files across user subdirectories
+            removed_path = None
             for user_dir in base_dir.iterdir():
                 if user_dir.is_dir():
-                    old_filepath = user_dir / f"recording_{recording_id}.md"
-                    if old_filepath.exists():
-                        new_filepath = user_dir / f"[deleted]_recording_{recording_id}.md"
-                        old_filepath.rename(new_filepath)
-                        logger.info(f"Marked export as deleted: {new_filepath}")
-                        return str(new_filepath)
+                    for candidate_name in (
+                        f"recording_{recording_id}.md",
+                        f"[deleted]_recording_{recording_id}.md",
+                    ):
+                        candidate = user_dir / candidate_name
+                        if candidate.exists():
+                            candidate.unlink(missing_ok=True)
+                            logger.info(f"Deleted auto-export file: {candidate}")
+                            if removed_path is None:
+                                removed_path = str(candidate)
 
-            return None
+            return removed_path
 
         except Exception as e:
             logger.error(f"Failed to mark export as deleted for recording {recording_id}: {e}")

@@ -185,8 +185,14 @@ def process_auto_deletion():
                     ProcessingJob.query.filter_by(recording_id=recording.id).delete()
 
                     # Delete the database record (cascades to chunks, shares, etc.)
+                    rec_id = recording.id
                     db.session.delete(recording)
                     db.session.commit()
+                    try:
+                        from src.file_exporter import mark_export_as_deleted
+                        mark_export_as_deleted(rec_id)
+                    except Exception as exp_err:
+                        current_app.logger.warning(f"Failed to delete auto-export for recording {rec_id}: {exp_err}")
                     stats['deleted_full'] += 1
                     current_app.logger.info(f"Auto-deleted full recording ID: {recording.id}")
 

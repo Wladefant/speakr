@@ -378,12 +378,18 @@ def run_merge_job(recording, params):
 
 
 def _delete_recording(recording, storage):
-    """Delete a source recording's audio and row. Best-effort on the file."""
+    """Delete a source recording's audio, auto-export, and row. Best-effort on files."""
+    rec_id = recording.id
     if recording.audio_path:
         try:
             storage.delete(recording.audio_path, missing_ok=True)
         except Exception as e:
-            current_app.logger.warning(f"Could not delete audio for recording {recording.id}: {e}")
+            current_app.logger.warning(f"Could not delete audio for recording {rec_id}: {e}")
+    try:
+        from src.file_exporter import mark_export_as_deleted
+        mark_export_as_deleted(rec_id)
+    except Exception as e:
+        current_app.logger.warning(f"Could not delete auto-export for recording {rec_id}: {e}")
     db.session.delete(recording)
 
 
