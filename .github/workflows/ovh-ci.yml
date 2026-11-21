@@ -62,36 +62,57 @@ jobs:
           node --version || true
           npm --version || true
           command -v uv || true
-          command -v ffmpeg || true
-          command -v ffprobe || true
-          command -v docker || true
+          ls -d /usr/lib/postgresql/*/bin 2>/dev/null || true
 
-      - name: Start ephemeral PostgreSQL 16
+      - name: Start user-space PostgreSQL 16
         id: pg
         shell: bash
         run: |
           set -euo pipefail
-          if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-            CID="speakr-ci-pg-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-            docker rm -f "$CID" >/dev/null 2>&1 || true
-            docker run --rm -d --name "$CID"               -e POSTGRES_USER=speakr               -e POSTGRES_PASSWORD=speakr               -e POSTGRES_DB=speakr_test               -p 127.0.0.1::5432               postgres:16 >/dev/null
-            PG_PORT="$(docker port "$CID" 5432/tcp | head -n1 | awk -F: '{print $NF}')"
-            echo "cid=$CID" >> "$GITHUB_OUTPUT"
-            echo "port=$PG_PORT" >> "$GITHUB_OUTPUT"
-            for i in $(seq 1 40); do
-              if docker exec "$CID" pg_isready -U speakr -d speakr_test >/dev/null 2>&1; then
-                echo "PostgreSQL 16 ready on 127.0.0.1:${PG_PORT}"
-                exit 0
-              fi
-              sleep 1
-            done
-            echo "::error::PostgreSQL 16 container failed to become ready"
-            docker logs "$CID" || true
-            exit 1
-          else
-            echo "::error::Docker is unavailable on self-hosted runner for PostgreSQL 16"
-            exit 1
+          PG_BIN=""
+          for candidate in /usr/lib/postgresql/16/bin /usr/lib/postgresql/17/bin /usr/lib/postgresql/*/bin "${HOME}/.cache/speakr-pg16/env/bin"; do
+            if [ -x "${candidate}/initdb" ] && [ -x "${candidate}/pg_ctl" ]; then
+              PG_BIN="$candidate"
+              break
+            fi
+          done
+          if [ -z "$PG_BIN" ] && command -v initdb >/dev/null 2>&1 && command -v pg_ctl >/dev/null 2>&1; then
+            PG_BIN="$(dirname "$(command -v initdb)")"
           fi
+          if [ -z "$PG_BIN" ]; then
+            PG_CACHE="${HOME}/.cache/speakr-pg16"
+            mkdir -p "$PG_CACHE"
+            if [ ! -x "${PG_CACHE}/micromamba" ]; then
+              curl --fail --location --silent --show-error https://micro.mamba.pm/api/micromamba/linux-64/latest                 | tar -xj -C "$PG_CACHE" --strip-components=1 bin/micromamba
+            fi
+            export MAMBA_ROOT_PREFIX="${PG_CACHE}/mamba-root"
+            "${PG_CACHE}/micromamba" create --yes --prefix "${PG_CACHE}/env" --channel conda-forge "postgresql=16"
+            PG_BIN="${PG_CACHE}/env/bin"
+          fi
+
+          PG_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+          PG_RUN_DIR="${RUNNER_TEMP:-/tmp}/speakr-pg-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          PG_DATA="${PG_RUN_DIR}/data"
+          PG_SOCK="${PG_RUN_DIR}/sock"
+          mkdir -p "$PG_DATA" "$PG_SOCK"
+
+          "${PG_BIN}/initdb" -D "$PG_DATA" -U speakr --auth-local=trust --auth-host=trust >/dev/null
+          "${PG_BIN}/pg_ctl" -D "$PG_DATA" -l "${PG_RUN_DIR}/postgres.log"             -o "-h 127.0.0.1 -p ${PG_PORT} -k ${PG_SOCK}" -w start
+          "${PG_BIN}/createdb" -h 127.0.0.1 -p "${PG_PORT}" -U speakr speakr_test
+          for attempt in $(seq 1 40); do
+            if "${PG_BIN}/pg_isready" -h 127.0.0.1 -p "${PG_PORT}" -U speakr -d speakr_test >/dev/null 2>&1; then
+              echo "PostgreSQL ready on 127.0.0.1:${PG_PORT} (bin=${PG_BIN})"
+              echo "pg_bin=${PG_BIN}" >> "$GITHUB_OUTPUT"
+              echo "pg_data=${PG_DATA}" >> "$GITHUB_OUTPUT"
+              echo "pg_run_dir=${PG_RUN_DIR}" >> "$GITHUB_OUTPUT"
+              echo "port=${PG_PORT}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::PostgreSQL failed to become ready"
+          cat "${PG_RUN_DIR}/postgres.log" || true
+          exit 1
 
       - name: Install Python and Node dependencies and run test suites
         shell: bash
@@ -103,13 +124,8 @@ jobs:
           export TEST_DATABASE_URI="postgresql+psycopg2://speakr:speakr@127.0.0.1:${PG_PORT}/speakr_test"
 
           VENV_DIR="${RUNNER_TEMP:-/tmp}/speakr-venv-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          if command -v uv >/dev/null 2>&1; then
-            uv venv --python 3.11 "$VENV_DIR" || uv venv "$VENV_DIR"
-            uv pip install --python "${VENV_DIR}/bin/python" -r requirements.txt pytest pytest-cov
-          else
-            python3 -m venv "$VENV_DIR"
-            "${VENV_DIR}/bin/pip" install --quiet -r requirements.txt pytest pytest-cov
-          fi
+          uv venv --python 3.11 "$VENV_DIR"
+          uv pip install --python "${VENV_DIR}/bin/python" -r requirements.txt pytest pytest-cov
 
           npm install --no-audit --no-fund
           if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
@@ -134,10 +150,13 @@ jobs:
 
           rm -rf "$VENV_DIR"
 
-      - name: Stop ephemeral PostgreSQL 16
-        if: always() && steps.pg.outputs.cid != ''
+      - name: Stop user-space PostgreSQL 16
+        if: always() && steps.pg.outputs.pg_data != ''
         shell: bash
         env:
-          PG_CID: ${{ steps.pg.outputs.cid }}
+          PG_BIN: ${{ steps.pg.outputs.pg_bin }}
+          PG_DATA: ${{ steps.pg.outputs.pg_data }}
+          PG_RUN_DIR: ${{ steps.pg.outputs.pg_run_dir }}
         run: |
-          docker rm -f "$PG_CID" >/dev/null 2>&1 || true
+          "${PG_BIN}/pg_ctl" -D "$PG_DATA" -m immediate stop >/dev/null 2>&1 || true
+          rm -rf "$PG_RUN_DIR"
