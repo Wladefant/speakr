@@ -69,6 +69,8 @@ def test_transcription_and_token_trackers_reserve_and_prevent_overrun():
 def test_background_title_summary_and_events_bill_acting_user_not_owner():
     with app.app_context():
         owner = _mk_user("bill_own")
+        owner.extract_events = True
+        db.session.commit()
         editor = _mk_user("bill_ed")
         rec = Recording(
             user_id=owner.id,
@@ -179,7 +181,7 @@ def test_merge_job_deletes_uploaded_object_when_recording_deleted_mid_upload(tmp
             with open(out_path, "wb") as fp:
                 fp.write(b"merged-bytes")
 
-        with patch("src.services.recording_merge.get_storage_service", return_value=fake_storage),              patch("src.services.recording_merge._concat_to_m4a", side_effect=_fake_concat):
+        with patch("src.services.recording_merge.get_storage_service", return_value=fake_storage),              patch("src.services.recording_merge._concat_audio", side_effect=_fake_concat):
             with pytest.raises(MergeError):
                 run_merge_job(tgt_id, [s1_id, s2_id], delete_originals=False)
 

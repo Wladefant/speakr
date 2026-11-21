@@ -57,7 +57,7 @@ def get_transcription_cost_per_minute(connector_type: str, model_name: str = Non
 
 class TranscriptionTracker:
     def __init__(self):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._inflight_seconds: Dict[int, float] = {}
 
     """Service for recording and checking transcription usage."""
@@ -199,7 +199,7 @@ class TranscriptionTracker:
         requested = max(0.0, float(additional_seconds or 0.0))
         try:
             with self._lock:
-                allowed, pct, msg = self._check_budget_unlocked(user_id, additional_seconds=requested)
+                allowed, pct, msg = (self.check_budget(user_id, additional_seconds=requested) if requested > 0 else self.check_budget(user_id))
                 if allowed and requested > 0:
                     self._inflight_seconds[user_id] = self._inflight_seconds.get(user_id, 0.0) + requested
                 return (allowed, pct, msg)

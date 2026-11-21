@@ -20,7 +20,7 @@ class TokenTracker:
     """Service for recording and checking token usage."""
 
     def __init__(self):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._inflight_tokens: Dict[int, int] = {}
 
     OPERATION_TYPES = [
@@ -184,7 +184,7 @@ class TokenTracker:
         requested = max(0, int(estimated_tokens or 0))
         try:
             with self._lock:
-                allowed, pct, msg = self._check_budget_unlocked(user_id, estimated_tokens=requested)
+                allowed, pct, msg = (self.check_budget(user_id, estimated_tokens=requested) if requested > 0 else self.check_budget(user_id))
                 if allowed and requested > 0:
                     self._inflight_tokens[user_id] = self._inflight_tokens.get(user_id, 0) + requested
                 return (allowed, pct, msg)
