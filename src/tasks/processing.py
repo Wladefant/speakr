@@ -2417,6 +2417,16 @@ def transcribe_incognito(filepath, original_filename, language=None, min_speaker
     _incognito_derived_files = []
 
     try:
+        # Enforce monthly transcription budget before invoking any external ASR provider
+        if user is not None:
+            can_proceed, usage_pct, budget_msg = transcription_tracker.check_budget(user.id)
+            if not can_proceed:
+                current_app.logger.warning(f"[Incognito] User {user.id} exceeded transcription budget: {budget_msg}")
+                result['error'] = budget_msg or "Monthly transcription budget exceeded"
+                result['budget_exceeded'] = True
+                result['processing_time_seconds'] = int(time.time() - start_time)
+                return result
+
         # Get the active connector
         registry = get_registry()
         connector = registry.get_active_connector()
@@ -2557,6 +2567,21 @@ def transcribe_incognito(filepath, original_filename, language=None, min_speaker
         result['processing_time_seconds'] = int(time.time() - start_time)
         current_app.logger.info(f"[Incognito] Transcription completed in {result['processing_time_seconds']}s")
 
+        # Record aggregate transcription duration only (never persist recording or transcript content)
+        if user is not None:
+            audio_duration = result.get('audio_duration_seconds')
+            if audio_duration and audio_duration > 0:
+                try:
+                    model_name = getattr(connector, 'model', None) or connector_name
+                    transcription_tracker.record_usage(
+                        user_id=user.id,
+                        connector_type=connector_name,
+                        audio_duration_seconds=int(audio_duration),
+                        model_name=model_name,
+                    )
+                except Exception as usage_err:
+                    current_app.logger.warning(f"[Incognito] Failed to record transcription usage: {usage_err}")
+
         # Generate a title if we have transcription
         if result['transcription'] and len(result['transcription']) > 10:
             result['title'] = _generate_incognito_title(result['transcription'], user)
@@ -2615,9 +2640,8 @@ Title:"""
         if user_output_language:
             system_message_content += f" Ensure your response is in {user_output_language}."
 
-        # Use call_llm_completion without user_id tracking for incognito
-        completion = client.chat.completions.create(
-            model=TEXT_MODEL_NAME,
+        # Route through call_llm_completion to enforce token budgets and record aggregate counts
+        completion = call_llm_completion(
             messages=[
                 {"role": "system", "content": system_message_content},
                 {"role": "user", "content": prompt_text}
@@ -2625,7 +2649,9 @@ Title:"""
             temperature=0.7,
             # Match the main title-generation path so reasoning-model users
             # have a single knob (TITLE_MAX_TOKENS) that covers both flows.
-            max_tokens=int(os.environ.get("TITLE_MAX_TOKENS", "5000"))
+            max_tokens=int(os.environ.get("TITLE_MAX_TOKENS", "5000")),
+            user_id=user.id if user else None,
+            operation_type='title',
         )
 
         raw_response = completion.choices[0].message.content
@@ -2634,6 +2660,8 @@ Title:"""
         if title and len(title.strip()) > 0:
             return title.strip()
 
+    except TokenBudgetExceeded as e:
+        current_app.logger.warning(f"[Incognito] Title generation skipped due to token budget: {e}")
     except Exception as e:
         current_app.logger.warning(f"[Incognito] Title generation failed: {e}")
 
@@ -2690,15 +2718,16 @@ Summarization Instructions:
 
         current_app.logger.info(f"[Incognito] Generating summary...")
 
-        # Use client directly without user tracking for incognito
-        completion = client.chat.completions.create(
-            model=TEXT_MODEL_NAME,
+        # Route through call_llm_completion to enforce token budgets and record aggregate counts
+        completion = call_llm_completion(
             messages=[
                 {"role": "system", "content": system_message_content},
                 {"role": "user", "content": prompt_text}
             ],
             temperature=0.5,
-            max_tokens=int(os.environ.get("SUMMARY_MAX_TOKENS", "3000"))
+            max_tokens=int(os.environ.get("SUMMARY_MAX_TOKENS", "3000")),
+            user_id=user.id if user else None,
+            operation_type='summary',
         )
 
         raw_response = completion.choices[0].message.content
@@ -2708,6 +2737,8 @@ Summarization Instructions:
             current_app.logger.info(f"[Incognito] Summary generated: {len(summary)} characters")
             return summary
 
+    except TokenBudgetExceeded:
+        raise
     except Exception as e:
         current_app.logger.warning(f"[Incognito] Summary generation failed: {e}")
 
