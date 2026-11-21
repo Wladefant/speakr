@@ -5,6 +5,7 @@ This module provides email functionality using Python's built-in smtplib.
 All email features are opt-in via environment variables.
 """
 
+import hmac
 import os
 import smtplib
 import logging
@@ -94,20 +95,34 @@ def verify_email_token(token: str) -> Optional[int]:
 
 def verify_reset_token(token: str) -> Optional[int]:
     """
-    Verify a password reset token.
+    Verify a single-use password reset token against both its signature/expiry
+    and the currently stored DB token for the user.
 
     Returns the user_id if valid, None otherwise.
     """
+    if not token:
+        return None
     serializer = get_serializer('password-reset')
     try:
         user_id = serializer.loads(token, max_age=PASSWORD_RESET_EXPIRY)
-        return user_id
     except SignatureExpired:
         logger.warning("Password reset token expired")
         return None
     except BadSignature:
         logger.warning("Invalid password reset token")
         return None
+
+    from src.database import db
+    from src.models.user import User
+
+    user = db.session.get(User, user_id)
+    if not user or not user.password_reset_token:
+        logger.warning("Password reset token already used or revoked")
+        return None
+    if not hmac.compare_digest(user.password_reset_token, token):
+        logger.warning("Password reset token does not match active stored token")
+        return None
+    return user_id
 
 
 def _send_email(to_email: str, subject: str, html_body: str, text_body: str = None) -> bool:

@@ -128,8 +128,11 @@ def test_login_success_sets_session_and_redirects(cleanup_users):
     resp = client.post('/login', data={'email': user.email, 'password': GOOD_PW})
     assert resp.status_code == 302
     assert '/login' not in resp.headers['Location']
+    with app.app_context():
+        refreshed = db.session.get(User, user.id)
+        expected_id = refreshed.get_id()
     with client.session_transaction() as s:
-        assert s.get('_user_id') == str(user.id)
+        assert s.get('_user_id') == expected_id
 
 
 def test_login_wrong_password_no_session(cleanup_users):

@@ -396,6 +396,9 @@ app.config['SESSION_COOKIE_SECURE'] = (
 )
 app.config['SESSION_COOKIE_HTTPONLY'] = True  # Still protect against XSS
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'  # CSRF protection
+app.config['REMEMBER_COOKIE_SECURE'] = app.config['SESSION_COOKIE_SECURE']
+app.config['REMEMBER_COOKIE_HTTPONLY'] = True
+app.config['REMEMBER_COOKIE_SAMESITE'] = 'Lax'
 if app.config['SESSION_COOKIE_SECURE']:
     app.logger.info("Session cookies marked Secure (HTTPS-only)")
 else:
@@ -591,7 +594,33 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 # --- User loader for Flask-Login ---
 @login_manager.user_loader
 def load_user(user_id):
-    return db.session.get(User, int(user_id))
+    import hmac
+    if not user_id:
+        return None
+    raw = str(user_id)
+    if ':' in raw:
+        uid_str, token = raw.split(':', 1)
+        try:
+            uid = int(uid_str)
+        except (TypeError, ValueError):
+            return None
+        user = db.session.get(User, uid)
+        if user is None or not user.session_token:
+            return None
+        if not hmac.compare_digest(user.session_token, token):
+            return None
+        return user
+    try:
+        uid = int(raw)
+    except (TypeError, ValueError):
+        return None
+    user = db.session.get(User, uid)
+    if user is None:
+        return None
+    # Once a user has an active session_token, legacy bare-ID cookies are rejected.
+    if user.session_token:
+        return None
+    return user
 
 
 @login_manager.request_loader
