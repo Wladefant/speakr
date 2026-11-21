@@ -756,18 +756,19 @@ def _msgs():
 
 # --- line 192: budget check only when BOTH user_id and operation_type set ---
 
-def test_call_llm_budget_skipped_with_only_user_id(monkeypatch):
-    # user_id set but operation_type None -> budget check AND usage record must
-    # both be skipped. Kills line 192 `and operation_type`->`or operation_type`
-    # and line 261 `and operation_type`->`or operation_type`.
+def test_call_llm_budget_enforced_with_only_user_id(monkeypatch):
+    # user_id set even when operation_type is None -> budget check AND usage
+    # recording must still execute with fallback operation_type='unspecified'.
     install_client(monkeypatch, return_value=make_completion("ok", usage=make_usage()))
     monkeypatch.setattr(llm, "TEXT_MODEL_API_KEY", "test-key")
     monkeypatch.setattr(llm, "TEXT_MODEL_NAME", "gpt-4o")
     fake_tracker = MagicMock()
+    fake_tracker.check_budget.return_value = (True, 10.0, None)
     with patch("src.services.token_tracking.token_tracker", fake_tracker):
         call_llm_completion(_msgs(), user_id=42)  # no operation_type
-    fake_tracker.check_budget.assert_not_called()
-    fake_tracker.record_usage.assert_not_called()
+    fake_tracker.check_budget.assert_called_once_with(42)
+    fake_tracker.record_usage.assert_called_once()
+    assert fake_tracker.record_usage.call_args.kwargs["operation_type"] == "unspecified" 
 
 
 def test_call_llm_budget_skipped_with_only_operation_type(monkeypatch):
@@ -909,7 +910,7 @@ def test_call_chat_no_stream_options_when_flag_disabled(monkeypatch):
 
 # --- lines 335/341/395: budget/usage gating mirrored in call_chat_completion ---
 
-def test_call_chat_budget_skipped_with_only_user_id(monkeypatch):
+def test_call_chat_budget_enforced_with_only_user_id(monkeypatch):
     fake = FakeClient(return_value=make_completion("ok", usage=make_usage()))
     monkeypatch.setattr(llm, "chat_client", fake)
     monkeypatch.setattr(llm, "CHAT_MODEL_API_KEY", None)
@@ -918,10 +919,12 @@ def test_call_chat_budget_skipped_with_only_user_id(monkeypatch):
     monkeypatch.setattr(llm, "TEXT_MODEL_NAME", "gpt-4o")
     monkeypatch.setattr(llm, "TEXT_MODEL_BASE_URL", "https://openrouter.ai/api/v1")
     fake_tracker = MagicMock()
+    fake_tracker.check_budget.return_value = (True, 10.0, None)
     with patch("src.services.token_tracking.token_tracker", fake_tracker):
         call_chat_completion(_msgs(), user_id=42)  # no operation_type
-    fake_tracker.check_budget.assert_not_called()
-    fake_tracker.record_usage.assert_not_called()
+    fake_tracker.check_budget.assert_called_once_with(42)
+    fake_tracker.record_usage.assert_called_once()
+    assert fake_tracker.record_usage.call_args.kwargs["operation_type"] == "unspecified" 
 
 
 def test_call_chat_budget_warning_logged_at_80(monkeypatch):
