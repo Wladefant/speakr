@@ -59,7 +59,10 @@
                     </button>
                 </div>
             </div>
-            <div v-else class="prose-flush h-full" v-html="selectedRecording.summary_html || selectedRecording.summary"></div>
+            <div v-else class="prose-flush h-full">
+                <div v-if="selectedRecording.summary_html" v-html="selectedRecording.summary_html"></div>
+                <div v-else-if="selectedRecording.summary" class="whitespace-pre-wrap">${selectedRecording.summary}</div>
+            </div>
         </div>
     </div>
 </div>

@@ -450,10 +450,15 @@
                          :class="['flex', message.role === 'user' ? 'justify-end' : 'justify-start']">
                         <div class="max-w-3xl chat-message"
                              :class="message.role === 'user' ? 'message user-message' : 'message ai-message'">
-                            <div v-if="message.html || message.content"
+                            <div v-if="message.html"
                                  class="prose prose-sm max-w-none"
                                  :class="message.role === 'user' ? 'prose-invert' : ''"
-                                 v-html="message.html || message.content">
+                                 v-html="message.html">
+                            </div>
+                            <div v-else-if="message.content"
+                                 class="prose prose-sm max-w-none whitespace-pre-wrap"
+                                 :class="message.role === 'user' ? 'prose-invert' : ''">
+                                ${message.content}
                             </div>
                         </div>
                     </div>

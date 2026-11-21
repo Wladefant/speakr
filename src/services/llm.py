@@ -231,8 +231,8 @@ def call_llm_completion(messages, temperature=0.7, response_format=None, stream=
     if not TEXT_MODEL_API_KEY:
         raise ValueError("TEXT_MODEL_API_KEY not configured")
 
-    # Check budget before making the call
-    if user_id and operation_type:
+    # Check budget before making the call whenever a user_id is provided
+    if user_id:
         try:
             from src.services.token_tracking import token_tracker
             can_proceed, usage_pct, msg = token_tracker.check_budget(user_id)
@@ -301,13 +301,13 @@ def call_llm_completion(messages, temperature=0.7, response_format=None, stream=
         response = client.chat.completions.create(**completion_args)
 
         # Track usage for non-streaming calls
-        if user_id and operation_type and not stream and response.usage:
+        if user_id and not stream and response.usage:
             try:
                 from src.services.token_tracking import token_tracker
                 cached_tokens, cache_write_tokens = extract_cache_tokens(response.usage)
                 token_tracker.record_usage(
                     user_id=user_id,
-                    operation_type=operation_type,
+                    operation_type=operation_type or 'unspecified',
                     prompt_tokens=response.usage.prompt_tokens,
                     completion_tokens=response.usage.completion_tokens,
                     total_tokens=response.usage.total_tokens,
@@ -377,8 +377,8 @@ def call_chat_completion(messages, temperature=0.7, response_format=None, stream
     if not chat_config['api_key']:
         raise ValueError("Chat model API key not configured")
 
-    # Check budget before making the call
-    if user_id and operation_type:
+    # Check budget before making the call whenever a user_id is provided
+    if user_id:
         try:
             from src.services.token_tracking import token_tracker
             can_proceed, usage_pct, msg = token_tracker.check_budget(user_id)
@@ -438,13 +438,13 @@ def call_chat_completion(messages, temperature=0.7, response_format=None, stream
         response = effective_client.chat.completions.create(**completion_args)
 
         # Track usage for non-streaming calls
-        if user_id and operation_type and not stream and response.usage:
+        if user_id and not stream and response.usage:
             try:
                 from src.services.token_tracking import token_tracker
                 cached_tokens, cache_write_tokens = extract_cache_tokens(response.usage)
                 token_tracker.record_usage(
                     user_id=user_id,
-                    operation_type=operation_type,
+                    operation_type=operation_type or 'unspecified',
                     prompt_tokens=response.usage.prompt_tokens,
                     completion_tokens=response.usage.completion_tokens,
                     total_tokens=response.usage.total_tokens,

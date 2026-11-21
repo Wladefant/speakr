@@ -32,7 +32,8 @@ from src.models.token_usage import TokenUsage
 from src.models.transcription_usage import TranscriptionUsage
 from src.services.token_tracking import TokenTracker
 from src.services.transcription_tracking import transcription_tracker
-from src.file_exporter import format_transcription_with_template
+from src.file_exporter import format_transcription_with_template, mark_export_as_deleted
+from src.utils import sanitize_html
 from src.api.recordings import upload_file as _upload_file_ui
 from src.services.storage import get_storage_service
 
@@ -1147,10 +1148,10 @@ def update_recording(recording_id):
         recording.participants = data['participants']
         changed_fields.append('participants')
     if 'notes' in data:
-        recording.notes = data['notes']
+        recording.notes = sanitize_html(data['notes']) if data['notes'] else data['notes']
         changed_fields.append('notes')
     if 'summary' in data:
-        recording.summary = data['summary']
+        recording.summary = sanitize_html(data['summary']) if data['summary'] else data['summary']
         changed_fields.append('summary')
     if 'meeting_date' in data:
         try:
@@ -1243,7 +1244,7 @@ def replace_notes(recording_id):
     if not data or 'notes' not in data:
         return jsonify({'error': 'notes field required'}), 400
 
-    recording.notes = data['notes']
+    recording.notes = sanitize_html(data['notes']) if data['notes'] else data['notes']
     db.session.commit()
 
     return jsonify({'success': True, 'notes': recording.notes})
@@ -1264,7 +1265,7 @@ def replace_summary(recording_id):
     if not data or 'summary' not in data:
         return jsonify({'error': 'summary field required'}), 400
 
-    recording.summary = data['summary']
+    recording.summary = sanitize_html(data['summary']) if data['summary'] else data['summary']
     db.session.commit()
 
     return jsonify({'success': True, 'summary': recording.summary})
@@ -1291,18 +1292,34 @@ def delete_recording(recording_id):
     if not USERS_CAN_DELETE and not current_user.is_admin:
         return jsonify({'error': 'Deletion not allowed'}), 403
 
-    # Delete associated files
+    # Delete associated media via configured storage backend (local:// and s3://)
     if recording.audio_path:
         try:
-            audio_path = os.path.join(current_app.config.get('UPLOAD_FOLDER', 'uploads'), recording.audio_path)
-            if os.path.exists(audio_path):
-                os.remove(audio_path)
-        except Exception:
-            pass  # Continue with DB deletion even if file deletion fails
+            storage = get_storage_service()
+            storage.delete(recording.audio_path, missing_ok=True)
+        except Exception as e:
+            current_app.logger.error(f"Error deleting audio file {recording.audio_path}: {e}")
+
+    # Delete associated records with NOT NULL recording_id constraints
+    from src.models.speaker_snippet import SpeakerSnippet
+    SpeakerSnippet.query.filter_by(recording_id=recording_id).delete()
+    ProcessingJob.query.filter_by(recording_id=recording_id).delete()
 
     # Delete from database
     db.session.delete(recording)
     db.session.commit()
+
+    # Mark auto-export as deleted and clean up orphaned speakers (best-effort)
+    try:
+        mark_export_as_deleted(recording_id)
+    except Exception as e:
+        current_app.logger.warning(f"Export cleanup after recording deletion failed: {e}")
+
+    try:
+        from src.services.speaker_cleanup import cleanup_orphaned_speakers
+        cleanup_orphaned_speakers()
+    except Exception as e:
+        current_app.logger.warning(f"Speaker cleanup after recording deletion failed: {e}")
 
     return jsonify({'success': True, 'message': 'Recording deleted'})
 
@@ -1575,7 +1592,7 @@ def add_tags_to_recording(recording_id):
     if not recording:
         return jsonify({'error': 'Recording not found'}), 404
 
-    if not has_recording_access(recording, current_user):
+    if not has_recording_access(recording, current_user, require_edit=True):
         return jsonify({'error': 'Permission denied'}), 403
 
     data = request.get_json()
@@ -1605,6 +1622,9 @@ def add_tags_to_recording(recording_id):
             ).first()
             if not membership:
                 errors.append(f'No access to tag {tag_id}')
+                continue
+            if recording.user_id != current_user.id and membership.role != 'admin':
+                errors.append(f'Only recording owner or group admin can apply group tag {tag_id}')
                 continue
         else:
             if tag.user_id != current_user.id:
@@ -2356,7 +2376,7 @@ def start_summarization(recording_id):
 @login_required
 def chat_with_recording(recording_id):
     """Chat about a recording's content."""
-    from src.services.llm import chat_client, call_chat_completion
+    from src.services.llm import chat_client, call_chat_completion, TokenBudgetExceeded
     from src.tasks.processing import format_transcription_for_llm, _resolve_timestamp_template_format
     from src.models import SystemSetting
 
@@ -2413,13 +2433,15 @@ Notes: {recording.notes or 'None'}
     messages.append({"role": "user", "content": user_message})
 
     try:
-        completion = call_chat_completion(messages, user_id=current_user.id)
+        completion = call_chat_completion(messages, user_id=current_user.id, operation_type='chat')
         reply = completion.choices[0].message.content
 
         return jsonify({
             'response': reply,
             'sources': []  # Could be enhanced to extract relevant segments
         })
+    except TokenBudgetExceeded as e:
+        return jsonify({'error': str(e), 'budget_exceeded': True}), 429
     except Exception as e:
         current_app.logger.error(f"Chat error: {e}")
         return jsonify({'error': 'Chat failed'}), 500
@@ -2704,7 +2726,10 @@ def batch_delete_recordings():
     if not USERS_CAN_DELETE and not current_user.is_admin:
         return jsonify({'error': 'Deletion not allowed'}), 403
 
+    from src.models.speaker_snippet import SpeakerSnippet
+    storage = get_storage_service()
     results = []
+    deleted_ids = []
     for recording_id in recording_ids:
         recording = db.session.get(Recording, recording_id)
         if not recording:
@@ -2716,18 +2741,35 @@ def batch_delete_recordings():
             continue
 
         try:
-            # Delete audio file
+            # Delete associated media via configured storage backend (local:// and s3://)
             if recording.audio_path:
-                audio_path = os.path.join(current_app.config.get('UPLOAD_FOLDER', 'uploads'), recording.audio_path)
-                if os.path.exists(audio_path):
-                    os.remove(audio_path)
+                try:
+                    storage.delete(recording.audio_path, missing_ok=True)
+                except Exception as storage_err:
+                    current_app.logger.error(f"Error deleting audio file {recording.audio_path}: {storage_err}")
 
+            SpeakerSnippet.query.filter_by(recording_id=recording_id).delete()
+            ProcessingJob.query.filter_by(recording_id=recording_id).delete()
             db.session.delete(recording)
+            deleted_ids.append(recording_id)
             results.append({'id': recording_id, 'success': True})
         except Exception as e:
             results.append({'id': recording_id, 'success': False, 'error': str(e)})
 
     db.session.commit()
+
+    for rid in deleted_ids:
+        try:
+            mark_export_as_deleted(rid)
+        except Exception as e:
+            current_app.logger.warning(f"Export cleanup after batch deletion failed for {rid}: {e}")
+
+    if deleted_ids:
+        try:
+            from src.services.speaker_cleanup import cleanup_orphaned_speakers
+            cleanup_orphaned_speakers()
+        except Exception as e:
+            current_app.logger.warning(f"Speaker cleanup after batch deletion failed: {e}")
 
     success_count = sum(1 for r in results if r['success'])
     return jsonify({
