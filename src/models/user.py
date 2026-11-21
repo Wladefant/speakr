@@ -5,6 +5,7 @@ This module defines the User model for authentication and user profiles,
 and the Speaker model for tracking speaker profiles used in diarization.
 """
 
+import secrets
 from datetime import datetime
 from flask_login import UserMixin
 from src.database import db
@@ -51,6 +52,9 @@ class User(db.Model, UserMixin):
     password_reset_token = db.Column(db.String(200), nullable=True, index=True)
     password_reset_sent_at = db.Column(db.DateTime, nullable=True)
 
+    # Revocable session token rotated on logout and password updates
+    session_token = db.Column(db.String(64), nullable=True)
+
     # Auto speaker labelling settings
     auto_speaker_labelling = db.Column(db.Boolean, default=False)  # Enable auto-labelling when voice confidence exceeds threshold
     auto_speaker_labelling_threshold = db.Column(db.String(10), nullable=True, default='medium')  # 'low', 'medium', 'high'
@@ -78,6 +82,20 @@ class User(db.Model, UserMixin):
     # 'top' renders it above the columns so it sits closer to the
     # title bar. User-configurable from the Display tab in settings.
     audio_player_position = db.Column(db.String(10), default='bottom')
+
+    def ensure_session_token(self) -> str:
+        if not self.session_token:
+            self.session_token = secrets.token_hex(16)
+        return self.session_token
+
+    def rotate_session_token(self) -> str:
+        self.session_token = secrets.token_hex(16)
+        return self.session_token
+
+    def get_id(self):
+        if self.session_token:
+            return f"{self.id}:{self.session_token}"
+        return str(self.id)
 
     def __repr__(self):
         return f"User('{self.username}', '{self.email}')"

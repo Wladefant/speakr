@@ -5,6 +5,7 @@ This blueprint handles user registration, login, logout, account management,
 and password changes.
 """
 
+import hmac
 import os
 import re
 import mimetypes
@@ -225,6 +226,8 @@ def login():
                                          action='verification_required',
                                          show_resend=True)
 
+                user.ensure_session_token()
+                db.session.commit()
                 login_user(user, remember=form.remember.data)
                 next_page = request.args.get('next')
                 if not is_safe_url(next_page):
@@ -328,6 +331,8 @@ def sso_callback():
         flash('Could not complete SSO login. Please try again.', 'danger')
         return redirect(url_for('auth.login'))
 
+    user.ensure_session_token()
+    db.session.commit()
     login_user(user, remember=True)
 
     if next_url and is_safe_url(next_url):
@@ -378,6 +383,11 @@ def logout():
     # needed. A future hardening pass should move logout to POST so a
     # CSRF-redirected GET can't log a victim out, but that is a behaviour
     # change deferred from this security release.
+    if current_user.is_authenticated:
+        current_user.rotate_session_token()
+        db.session.commit()
+    session.pop('sso_link_user_id', None)
+    session.pop('sso_link_state', None)
     logout_user()
     return redirect(url_for('auth.login'))
 
@@ -522,8 +532,8 @@ def reset_password(token):
         return redirect(url_for('auth.forgot_password'))
 
     user = db.session.get(User, user_id)
-    if not user:
-        flash('User not found.', 'danger')
+    if not user or not user.password_reset_token or not hmac.compare_digest(user.password_reset_token, token):
+        flash('The password reset link is invalid or has expired.', 'danger')
         return redirect(url_for('auth.forgot_password'))
 
     if request.method == 'POST':
@@ -550,6 +560,7 @@ def reset_password(token):
         user.password = hashed_password
         user.password_reset_token = None  # Clear the token
         user.password_reset_sent_at = None
+        user.rotate_session_token()
 
         # Also verify email if not already verified
         if not user.email_verified:
@@ -867,10 +878,12 @@ def change_password():
             flash('Current password is incorrect.', 'danger')
             return redirect(url_for('auth.account'))
 
-    # Update password
+    # Update password and invalidate other sessions/remember tokens
     hashed_password = bcrypt.generate_password_hash(new_password).decode('utf-8')
     current_user.password = hashed_password
+    current_user.rotate_session_token()
     db.session.commit()
+    login_user(current_user)
 
     flash('Your password has been updated!', 'success')
     return redirect(url_for('auth.account'))

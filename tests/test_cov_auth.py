@@ -128,8 +128,11 @@ def test_login_success_sets_session_and_redirects(cleanup_users):
     resp = client.post('/login', data={'email': user.email, 'password': GOOD_PW})
     assert resp.status_code == 302
     assert '/login' not in resp.headers['Location']
+    with app.app_context():
+        refreshed = db.session.get(User, user.id)
+        expected_id = refreshed.get_id()
     with client.session_transaction() as s:
-        assert s.get('_user_id') == str(user.id)
+        assert s.get('_user_id') == expected_id
 
 
 def test_login_wrong_password_no_session(cleanup_users):
@@ -204,7 +207,7 @@ def test_login_succeeds_when_email_verified(cleanup_users):
         resp = client.post('/login', data={'email': user.email, 'password': GOOD_PW})
         assert resp.status_code == 302
         with client.session_transaction() as s:
-            assert s.get('_user_id') == str(user.id)
+            assert s.get('_user_id') and s.get('_user_id').split(':', 1)[0] == str(user.id)
 
 
 def test_login_sso_only_user_prompted_to_use_sso(cleanup_users):
@@ -516,7 +519,7 @@ def test_sso_callback_success_logs_in_user(cleanup_users):
         assert resp.status_code == 302
         assert '/login' not in resp.headers['Location']
         with client.session_transaction() as s:
-            assert s.get('_user_id') == str(user.id)
+            assert s.get('_user_id') and s.get('_user_id').split(':', 1)[0] == str(user.id)
 
 
 def test_sso_callback_token_error_redirects_to_login():

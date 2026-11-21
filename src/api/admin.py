@@ -258,6 +258,7 @@ def admin_update_user(user_id):
     
     if 'password' in data and data['password']:
         user.password = bcrypt.generate_password_hash(data['password']).decode('utf-8')
+        user.rotate_session_token()
     
     if 'is_admin' in data:
         new_is_admin = bool(data['is_admin'])
