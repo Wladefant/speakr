@@ -5,7 +5,7 @@ import uuid
 from src.app import app, bcrypt, load_user
 from src.database import db
 from src.models.user import User
-from src.services.email import generate_reset_token, verify_reset_token
+from src.services.email import generate_password_reset_token, verify_reset_token
 
 
 def _make_user(is_admin=False):
@@ -46,12 +46,12 @@ def test_password_reset_token_is_single_use_and_revokes_sessions():
 
         with app.app_context():
             u = db.session.get(User, user_id)
-            token1 = generate_reset_token(u)
+            token1 = generate_password_reset_token(u.id)
             u.password_reset_token = token1
             db.session.commit()
             assert verify_reset_token(token1) == user_id
 
-            token2 = generate_reset_token(u)
+            token2 = generate_password_reset_token(u.id)
             if token2 == token1:
                 token2 = token1 + "x"
             u.password_reset_token = token2
