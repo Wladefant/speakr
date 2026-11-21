@@ -21,7 +21,7 @@ class User(db.Model, UserMixin):
     sso_subject = db.Column(db.String(255), unique=True, nullable=True)
     is_admin = db.Column(db.Boolean, default=False)
     can_share_publicly = db.Column(db.Boolean, default=True)  # Permission to create public share links
-    recordings = db.relationship('Recording', backref='owner', lazy=True)
+    recordings = db.relationship('Recording', backref='owner', lazy=True, cascade='all, delete-orphan')
     transcription_language = db.Column(db.String(10), nullable=True)  # For ISO 639-1 codes
     output_language = db.Column(db.String(50), nullable=True)  # For full language names like "Spanish"
     ui_language = db.Column(db.String(10), nullable=True, default='en')  # For UI language preference (en, es, fr, zh)
