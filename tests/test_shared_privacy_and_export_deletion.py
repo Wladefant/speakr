@@ -102,7 +102,7 @@ def test_shared_recipient_cannot_read_owner_private_notes_tags_folder_or_duplica
             assert r_fold.status_code == 200
             assert all(r["id"] != rec_id for r in r_fold.get_json().get("recordings", []))
 
-            r_tag = client.get("/api/recordings?search=tag:PRIVATE_BOARD_TAG")
+            r_tag = client.get("/api/recordings?q=tag:PRIVATE_BOARD_TAG")
             assert r_tag.status_code == 200
             assert all(r["id"] != rec_id for r in r_tag.get_json().get("recordings", []))
 
