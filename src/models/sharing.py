@@ -156,6 +156,216 @@ class InternalShare(db.Model):
         return True, None
 
     @staticmethod
+    def is_share_valid_for_user(share, recording=None):
+        """Validate that an InternalShare is still backed by active group membership
+        and source attachment when derived from a group tag or group folder.
+
+        Returns:
+            Tuple of (is_valid: bool, effective_can_edit: bool)
+        """
+        if not share:
+            return False, False
+
+        if share.source_type == 'group_tag':
+            if not share.source_tag_id:
+                return False, False
+            from src.models.organization import GroupMembership, RecordingTag, Tag
+            tag = db.session.get(Tag, share.source_tag_id)
+            if not tag or not tag.group_id:
+                return False, False
+            attached = RecordingTag.query.filter_by(
+                recording_id=share.recording_id,
+                tag_id=share.source_tag_id
+            ).first()
+            if not attached:
+                return False, False
+            membership = GroupMembership.query.filter_by(
+                group_id=tag.group_id,
+                user_id=share.shared_with_user_id
+            ).first()
+            if not membership:
+                return False, False
+            if not tag.auto_share_on_apply:
+                if not (tag.share_with_group_lead and membership.role == 'admin'):
+                    return False, False
+            return True, bool(share.can_edit and membership.role == 'admin')
+
+        if share.source_type == 'group_folder':
+            if not share.source_folder_id:
+                return False, False
+            from src.models.organization import Folder, GroupMembership
+            from src.models.recording import Recording
+            folder = db.session.get(Folder, share.source_folder_id)
+            if not folder or not folder.group_id:
+                return False, False
+            rec = recording if recording is not None else db.session.get(Recording, share.recording_id)
+            if not rec or rec.folder_id != share.source_folder_id:
+                return False, False
+            membership = GroupMembership.query.filter_by(
+                group_id=folder.group_id,
+                user_id=share.shared_with_user_id
+            ).first()
+            if not membership:
+                return False, False
+            if not folder.auto_share_on_apply:
+                if not (folder.share_with_group_lead and membership.role == 'admin'):
+                    return False, False
+            return True, bool(share.can_edit and membership.role == 'admin')
+
+        return True, bool(share.can_edit)
+
+    @staticmethod
+    def get_valid_shared_recording_ids(user_id):
+        """Return recording IDs shared with user_id via currently valid InternalShare rows."""
+        shares = InternalShare.query.filter_by(shared_with_user_id=user_id).all()
+        valid_ids = set()
+        for share in shares:
+            is_valid, _ = InternalShare.is_share_valid_for_user(share)
+            if is_valid:
+                valid_ids.add(share.recording_id)
+        return valid_ids
+
+    @staticmethod
+    def revoke_for_group_member(group_id, user_id):
+        """Delete all group-derived shares held by user_id from group_id."""
+        from src.models.organization import Folder, Tag
+        tag_ids = [t.id for t in Tag.query.filter_by(group_id=group_id).all()]
+        folder_ids = [f.id for f in Folder.query.filter_by(group_id=group_id).all()]
+        deleted = 0
+        if tag_ids:
+            deleted += InternalShare.query.filter(
+                InternalShare.shared_with_user_id == user_id,
+                InternalShare.source_type == 'group_tag',
+                InternalShare.source_tag_id.in_(tag_ids),
+            ).delete(synchronize_session=False)
+        if folder_ids:
+            deleted += InternalShare.query.filter(
+                InternalShare.shared_with_user_id == user_id,
+                InternalShare.source_type == 'group_folder',
+                InternalShare.source_folder_id.in_(folder_ids),
+            ).delete(synchronize_session=False)
+        return deleted
+
+    @staticmethod
+    def sync_for_group_member_role(group_id, user_id, new_role):
+        """Downgrade or revoke group-derived shares when a member's role changes."""
+        if new_role == 'admin':
+            return 0
+        from src.models.organization import Folder, Tag
+        updated = 0
+        for tag in Tag.query.filter_by(group_id=group_id).all():
+            q = InternalShare.query.filter_by(
+                shared_with_user_id=user_id,
+                source_type='group_tag',
+                source_tag_id=tag.id,
+            )
+            if tag.auto_share_on_apply:
+                updated += q.update({'can_edit': False}, synchronize_session=False)
+            else:
+                updated += q.delete(synchronize_session=False)
+        for folder in Folder.query.filter_by(group_id=group_id).all():
+            q = InternalShare.query.filter_by(
+                shared_with_user_id=user_id,
+                source_type='group_folder',
+                source_folder_id=folder.id,
+            )
+            if folder.auto_share_on_apply:
+                updated += q.update({'can_edit': False}, synchronize_session=False)
+            else:
+                updated += q.delete(synchronize_session=False)
+        return updated
+
+    @staticmethod
+    def revoke_for_group(group_id):
+        """Delete all group-derived shares originating from tags or folders in group_id."""
+        from src.models.organization import Folder, Tag
+        tag_ids = [t.id for t in Tag.query.filter_by(group_id=group_id).all()]
+        folder_ids = [f.id for f in Folder.query.filter_by(group_id=group_id).all()]
+        deleted = 0
+        if tag_ids:
+            deleted += InternalShare.query.filter(
+                InternalShare.source_type == 'group_tag',
+                InternalShare.source_tag_id.in_(tag_ids),
+            ).delete(synchronize_session=False)
+        if folder_ids:
+            deleted += InternalShare.query.filter(
+                InternalShare.source_type == 'group_folder',
+                InternalShare.source_folder_id.in_(folder_ids),
+            ).delete(synchronize_session=False)
+        return deleted
+
+    @staticmethod
+    def revoke_for_tag(tag_id):
+        """Delete all group_tag shares derived from tag_id."""
+        return InternalShare.query.filter_by(
+            source_type='group_tag',
+            source_tag_id=tag_id,
+        ).delete(synchronize_session=False)
+
+    @staticmethod
+    def revoke_for_folder(folder_id, recording_id=None):
+        """Delete group_folder shares derived from folder_id (optionally for one recording)."""
+        q = InternalShare.query.filter_by(
+            source_type='group_folder',
+            source_folder_id=folder_id,
+        )
+        if recording_id is not None:
+            q = q.filter_by(recording_id=recording_id)
+        return q.delete(synchronize_session=False)
+
+    @staticmethod
+    def find_cascade_revocation_targets(recording, primary_share):
+        """Find all transitive downstream InternalShare records to cascade-revoke
+        when primary_share is removed, preserving shares whose grantor retains an
+        alternate valid access path from the recording owner or unaffected roots.
+        """
+        from collections import deque
+
+        all_shares = InternalShare.query.filter_by(
+            recording_id=primary_share.recording_id
+        ).all()
+        remaining = [s for s in all_shares if s.id != primary_share.id]
+
+        out_edges = {}
+        for s in remaining:
+            out_edges.setdefault(s.owner_id, []).append(s)
+
+        # 1. Collect all users in the downstream subgraph rooted at the revoked recipient.
+        downstream_users = {primary_share.shared_with_user_id}
+        q = deque([primary_share.shared_with_user_id])
+        while q:
+            uid = q.popleft()
+            for edge in out_edges.get(uid, ()):
+                nxt = edge.shared_with_user_id
+                if nxt not in downstream_users:
+                    downstream_users.add(nxt)
+                    q.append(nxt)
+
+        # 2. Compute reachability from valid unaffected roots over the remaining graph.
+        roots = set()
+        if recording is not None and recording.user_id is not None:
+            roots.add(recording.user_id)
+        for s in remaining:
+            if s.owner_id not in downstream_users:
+                roots.add(s.owner_id)
+
+        reachable = set(roots)
+        rq = deque(roots)
+        while rq:
+            uid = rq.popleft()
+            for edge in out_edges.get(uid, ()):
+                nxt = edge.shared_with_user_id
+                if nxt not in reachable:
+                    reachable.add(nxt)
+                    rq.append(nxt)
+
+        # 3. Revoke every downstream share whose grantor no longer has valid access.
+        return [
+            s for s in remaining
+            if s.owner_id in downstream_users and s.owner_id not in reachable
+        ]
+
+    @staticmethod
     def find_downstream_shares(recording_id, user_id):
         """
         Find all shares created by a specific user for a recording.
