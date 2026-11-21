@@ -47,8 +47,13 @@
     <!-- Reading mode — single flex-1 scroll surface, content padding
          is inside so the scrollbar runs the full edge. -->
     <div v-else-if="!editingSummary"
-         class="flex-1 overflow-y-auto px-4 py-4 prose-flush"
-         v-html="selectedRecording.summary_html || selectedRecording.summary">
+         class="flex-1 overflow-y-auto px-4 py-4 prose-flush">
+        <div v-if="selectedRecording.summary_html"
+             v-html="selectedRecording.summary_html">
+        </div>
+        <div v-else-if="selectedRecording.summary" class="whitespace-pre-wrap">
+            ${selectedRecording.summary}
+        </div>
     </div>
 
     <!-- Editing mode — EasyMDE is mounted onto the textarea below.

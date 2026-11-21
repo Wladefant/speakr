@@ -27,6 +27,9 @@
             <div class="empty__title" v-text="t('help.clickToAddNotes')"></div>
             <div class="empty__body">Markdown supported.</div>
         </div>
-        <div v-else class="prose-flush h-full" v-html="selectedRecording.notes_html || selectedRecording.notes"></div>
+        <div v-else class="prose-flush h-full">
+            <div v-if="selectedRecording.notes_html" v-html="selectedRecording.notes_html"></div>
+            <div v-else-if="selectedRecording.notes" class="whitespace-pre-wrap">${selectedRecording.notes}</div>
+        </div>
     </div>
 </div>
