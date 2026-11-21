@@ -4556,7 +4556,12 @@ def process_recording_chunks_endpoint(recording_id):
         if recording.user_id != current_user.id:
             return jsonify({'error': 'Permission denied'}), 403
 
-        success = process_recording_chunks(recording_id)
+        from src.services.llm import TokenBudgetExceeded
+        try:
+            success = process_recording_chunks(recording_id, raise_on_budget=True)
+        except TokenBudgetExceeded as e:
+            current_app.logger.warning(f"Token budget exceeded in process_chunks for user {current_user.id}: {e}")
+            return jsonify({'error': str(e), 'budget_exceeded': True}), 429
         if success:
             return jsonify({'message': 'Chunks processed successfully'})
         else:
