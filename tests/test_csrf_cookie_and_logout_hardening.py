@@ -23,7 +23,7 @@ def test_api_v1_and_webhooks_require_csrf_for_ambient_cookies_but_allow_api_toke
         with app.app_context():
             user = _mk_user("csrf_v1")
             uid = user.id
-            from src.models.api_token import hash_token
+            from src.utils.token_auth import hash_token
             plaintext = uuid.uuid4().hex
             tok_obj = APIToken(user_id=uid, token_hash=hash_token(plaintext), name="ci-test-tok")
             db.session.add(tok_obj)
