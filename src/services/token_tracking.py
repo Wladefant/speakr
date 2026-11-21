@@ -3,6 +3,7 @@ Token usage tracking service for monitoring LLM API consumption and budget enfor
 """
 
 import logging
+import threading
 from datetime import date, datetime, timedelta
 from typing import Tuple, Optional, Dict, List
 
@@ -17,6 +18,10 @@ logger = logging.getLogger(__name__)
 
 class TokenTracker:
     """Service for recording and checking token usage."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._inflight_tokens: Dict[int, int] = {}
 
     OPERATION_TYPES = [
         'summarization',
@@ -142,38 +147,61 @@ class TokenTracker:
 
         return result or 0.0
 
-    def check_budget(self, user_id: int) -> Tuple[bool, float, Optional[str]]:
-        """
-        Check if user is within budget.
+    def _check_budget_unlocked(self, user_id: int, estimated_tokens: int = 0) -> Tuple[bool, float, Optional[str]]:
+        user = db.session.get(User, user_id)
+        if not user or not user.monthly_token_budget:
+            return (True, 0, None)  # No budget = unlimited
 
-        Returns:
-            (can_proceed, usage_percentage, message)
-            - can_proceed: False if hard cap (100%) reached
-            - usage_percentage: 0-100+
-            - message: Warning/error message if applicable
-        """
+        current_usage = self.get_monthly_usage(user_id)
+        inflight = self._inflight_tokens.get(user_id, 0)
+        requested = max(0, int(estimated_tokens or 0))
+        effective_usage = current_usage + inflight + requested
+        budget = user.monthly_token_budget
+        percentage = (effective_usage / budget) * 100
+
+        if current_usage + inflight >= budget or (requested > 0 and effective_usage > budget):
+            return (False, percentage,
+                    f"Monthly token budget exceeded ({percentage:.1f}%). Contact admin for more tokens.")
+        elif percentage >= 80:
+            return (True, percentage,
+                    f"Warning: {percentage:.1f}% of monthly token budget used.")
+        else:
+            return (True, percentage, None)
+
+    def check_budget(self, user_id: int, estimated_tokens: int = 0) -> Tuple[bool, float, Optional[str]]:
+        """Check if user is within token budget (including in-flight reservations and optional estimate)."""
         try:
-            user = db.session.get(User, user_id)
-            if not user or not user.monthly_token_budget:
-                return (True, 0, None)  # No budget = unlimited
-
-            current_usage = self.get_monthly_usage(user_id)
-            budget = user.monthly_token_budget
-            percentage = (current_usage / budget) * 100
-
-            if percentage >= 100:
-                return (False, percentage,
-                        f"Monthly token budget exceeded ({percentage:.1f}%). Contact admin for more tokens.")
-            elif percentage >= 80:
-                return (True, percentage,
-                        f"Warning: {percentage:.1f}% of monthly token budget used.")
-            else:
-                return (True, percentage, None)
-
+            with self._lock:
+                return self._check_budget_unlocked(user_id, estimated_tokens=estimated_tokens)
         except Exception as e:
             logger.error(f"Failed to check budget for user {user_id}: {e}")
-            # Fail open - allow the request if we can't check
             return (True, 0, None)
+
+    def reserve_budget(self, user_id: Optional[int], estimated_tokens: int = 0) -> Tuple[bool, float, Optional[str]]:
+        """Atomically check budget and reserve in-flight tokens for a user."""
+        if user_id is None:
+            return (True, 0, None)
+        requested = max(0, int(estimated_tokens or 0))
+        try:
+            with self._lock:
+                allowed, pct, msg = self._check_budget_unlocked(user_id, estimated_tokens=requested)
+                if allowed and requested > 0:
+                    self._inflight_tokens[user_id] = self._inflight_tokens.get(user_id, 0) + requested
+                return (allowed, pct, msg)
+        except Exception as e:
+            logger.error(f"Failed to reserve token budget for user {user_id}: {e}")
+            return (True, 0, None)
+
+    def release_reservation(self, user_id: Optional[int], reserved_tokens: int = 0) -> None:
+        """Release previously reserved in-flight tokens."""
+        if user_id is None or not reserved_tokens or reserved_tokens <= 0:
+            return
+        with self._lock:
+            remaining = self._inflight_tokens.get(user_id, 0) - int(reserved_tokens)
+            if remaining <= 0:
+                self._inflight_tokens.pop(user_id, None)
+            else:
+                self._inflight_tokens[user_id] = remaining
 
     def get_daily_stats(self, days: int = 30, user_id: int = None) -> List[Dict]:
         """Get daily token usage for charts.

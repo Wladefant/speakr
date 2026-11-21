@@ -373,6 +373,21 @@ def stitch_recording_session(session_id: str) -> Tuple[int, str, dict]:
     # title — instead of a fabricated default being mistaken for a user
     # choice and AI titling getting skipped (the same class of bug fixed for
     # the share target in 482614c).
+    # Fence against mid-stitch recording deletion so we never leave an orphaned
+    # stitched file on disk if the user deleted the recording while ffmpeg ran.
+    if db.session.query(Recording.id).filter_by(id=recording.id).first() is None:
+        try:
+            if os.path.exists(final_path):
+                os.remove(final_path)
+        except OSError:
+            pass
+        try:
+            if os.path.isdir(sess_dir):
+                shutil.rmtree(sess_dir, ignore_errors=True)
+        except Exception:
+            pass
+        raise StitchError(f'Recording {recording.id} was deleted while stitching session {session_id}')
+
     from src.utils.titles import resolve_upload_title
     user_title = (metadata.get('title') or '').strip()
     recording.title = resolve_upload_title(user_title, final_filename)
@@ -401,7 +416,16 @@ def stitch_recording_session(session_id: str) -> Tuple[int, str, dict]:
     session.status = 'finalized'
     session.finalized_at = datetime.utcnow()
     session.last_seen_at = datetime.utcnow()
-    db.session.commit()
+    try:
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        try:
+            if os.path.exists(final_path):
+                os.remove(final_path)
+        except OSError:
+            pass
+        raise
 
     # Remove the session directory now that we have the stitched output.
     try:

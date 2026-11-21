@@ -457,6 +457,7 @@ class FairJobQueue:
                 hotwords=params.get('hotwords'),
                 initial_prompt=params.get('initial_prompt'),
                 transcription_model=params.get('transcription_model'),
+                acting_user_id=params.get('acting_user_id') or params.get('user_id') or job.user_id,
             )
 
     def _run_summarization(self, job, recording, params):
@@ -469,7 +470,7 @@ class FairJobQueue:
             recording.id,
             custom_prompt_override=params.get('custom_prompt'),
             custom_prompt_append=params.get('custom_prompt_append', False),
-            user_id=params.get('user_id')
+            user_id=params.get('acting_user_id') or params.get('user_id') or job.user_id
         )
 
     def _run_reprocess_transcription(self, job, recording, params):
@@ -508,6 +509,7 @@ class FairJobQueue:
                 hotwords=params.get('hotwords'),
                 initial_prompt=params.get('initial_prompt'),
                 transcription_model=params.get('transcription_model'),
+                acting_user_id=params.get('acting_user_id') or params.get('user_id') or job.user_id,
             )
 
     def _run_reprocess_summary(self, job, recording, params):
@@ -520,7 +522,7 @@ class FairJobQueue:
             recording.id,
             custom_prompt_override=params.get('custom_prompt'),
             custom_prompt_append=params.get('custom_prompt_append', False),
-            user_id=params.get('user_id')
+            user_id=params.get('acting_user_id') or params.get('user_id') or job.user_id
         )
 
     def _run_stitch(self, job, recording, params):
