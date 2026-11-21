@@ -441,6 +441,7 @@ def delete_tag(tag_id):
         if user:
             _remove_auto_process_folder(tag, user)
 
+    InternalShare.revoke_for_tag(tag_id)
     db.session.delete(tag)
     db.session.commit()
     return jsonify({'success': True})

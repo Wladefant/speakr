@@ -343,12 +343,9 @@ def get_accessible_recording_ids(user_id):
     own_recordings = db.session.query(Recording.id).filter_by(user_id=user_id).all()
     accessible_ids.update([r.id for r in own_recordings])
 
-    # 2. Internally shared recordings
+    # 2. Internally shared recordings (filtering out stale group-derived shares)
     if ENABLE_INTERNAL_SHARING:
-        shared_recordings = db.session.query(InternalShare.recording_id).filter_by(
-            shared_with_user_id=user_id
-        ).all()
-        accessible_ids.update([r.recording_id for r in shared_recordings])
+        accessible_ids.update(InternalShare.get_valid_shared_recording_ids(user_id))
 
     return list(accessible_ids)
 

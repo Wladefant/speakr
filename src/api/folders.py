@@ -323,6 +323,8 @@ def delete_folder(folder_id):
         if folder.user_id != current_user.id:
             return jsonify({'error': 'You do not have permission to delete this folder'}), 403
 
+    # Revoke group-folder shares before folder deletion sets source_folder_id=NULL
+    InternalShare.revoke_for_folder(folder_id)
     # Recordings in this folder will have folder_id set to NULL via ondelete='SET NULL'
     db.session.delete(folder)
     db.session.commit()
@@ -493,6 +495,8 @@ def assign_recording_folder(recording_id):
 
         # Handle auto-sharing for group folders
         old_folder_id = recording.folder_id
+        if old_folder_id and old_folder_id != folder_id:
+            InternalShare.revoke_for_folder(old_folder_id, recording_id=recording.id)
         recording.folder_id = folder_id
 
         # Apply auto-shares if moving to a group folder
@@ -502,7 +506,9 @@ def assign_recording_folder(recording_id):
         db.session.commit()
         current_app.logger.info(f"Recording {recording_id} moved to folder {folder_id} by user {current_user.id}")
     else:
-        # Remove from folder
+        # Remove from folder and revoke any group-folder shares from the previous folder
+        if recording.folder_id:
+            InternalShare.revoke_for_folder(recording.folder_id, recording_id=recording.id)
         recording.folder_id = None
         db.session.commit()
         current_app.logger.info(f"Recording {recording_id} removed from folder by user {current_user.id}")
@@ -532,6 +538,8 @@ def remove_recording_folder(recording_id):
         if recording.user_id != current_user.id:
             return jsonify({'error': 'You do not have permission to modify this recording'}), 403
 
+    if recording.folder_id:
+        InternalShare.revoke_for_folder(recording.folder_id, recording_id=recording.id)
     recording.folder_id = None
     db.session.commit()
     current_app.logger.info(f"Recording {recording_id} removed from folder by user {current_user.id}")
@@ -588,6 +596,9 @@ def bulk_assign_folder():
             if recording.user_id != current_user.id:
                 continue
 
+        old_folder_id = recording.folder_id
+        if old_folder_id and old_folder_id != folder_id:
+            InternalShare.revoke_for_folder(old_folder_id, recording_id=recording.id)
         recording.folder_id = folder_id
 
         # Apply auto-shares if moving to a group folder

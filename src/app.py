@@ -220,10 +220,15 @@ def has_recording_access(recording, user, require_edit=False, require_reshare=Fa
     if not share:
         return False
 
+    # Verify group-derived shares still have active membership and source attachment
+    is_valid, effective_can_edit = InternalShare.is_share_valid_for_user(share, recording=recording)
+    if not is_valid:
+        return False
+
     # If edit permission is required, check for it
     if require_edit:
         # First check if share directly grants edit permission
-        if share.can_edit:
+        if effective_can_edit:
             pass  # Has direct edit permission
         else:
             # Check if user is a group admin for any group tag on this recording

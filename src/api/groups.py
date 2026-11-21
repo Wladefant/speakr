@@ -275,6 +275,7 @@ def delete_team(group_id):
         return jsonify({'error': 'Group not found'}), 404
 
     group_name = group.name
+    InternalShare.revoke_for_group(group_id)
     db.session.delete(group)
     db.session.commit()
 
@@ -357,6 +358,7 @@ def update_team_member(group_id, user_id):
         return jsonify({'error': 'Role must be "admin" or "member"'}), 400
 
     membership.role = role
+    InternalShare.sync_for_group_member_role(group_id, user_id, role)
     db.session.commit()
 
     current_app.logger.info(f"Admin {current_user.username} updated {membership.user.username} role to {role} in group {membership.group.name}")
@@ -384,6 +386,7 @@ def remove_team_member(group_id, user_id):
 
     username = membership.user.username
     group_name = membership.group.name
+    InternalShare.revoke_for_group_member(group_id, user_id)
     db.session.delete(membership)
     db.session.commit()
 

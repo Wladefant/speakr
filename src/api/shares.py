@@ -516,8 +516,11 @@ def revoke_internal_share(share_id):
     if not share:
         return jsonify({'error': 'Share not found'}), 404
 
-    # Only owner can revoke
-    if share.owner_id != current_user.id:
+    recording = db.session.get(Recording, share.recording_id)
+    is_recording_owner = recording is not None and recording.user_id == current_user.id
+
+    # Allow both the share grantor and the recording owner to revoke
+    if share.owner_id != current_user.id and not is_recording_owner:
         return jsonify({'error': 'You do not have permission to revoke this share'}), 403
 
     recording_id = share.recording_id
@@ -525,36 +528,27 @@ def revoke_internal_share(share_id):
     revoked_count = 0
 
     try:
-        # CASCADE REVOCATION: Find downstream shares created by the user losing access
-        downstream_shares = InternalShare.find_downstream_shares(recording_id, revoked_user_id)
+        # CASCADE REVOCATION: Transitively revoke all downstream shares whose
+        # grantor loses access without an alternate valid path from the owner.
+        downstream_shares = InternalShare.find_cascade_revocation_targets(recording, share)
 
-        # Recursively revoke downstream shares that don't have alternate paths
         for downstream in downstream_shares:
-            # Check for alternate access paths (diamond pattern protection)
-            has_alternate = InternalShare.has_alternate_access_path(
-                recording_id,
-                downstream.shared_with_user_id,
-                excluding_grantor_id=revoked_user_id
-            )
+            # Audit log cascade revocation
+            try:
+                ShareAuditLog.log_share_revoked(
+                    share_id=downstream.id,
+                    recording_id=recording_id,
+                    actor_id=current_user.id,
+                    target_user_id=downstream.shared_with_user_id,
+                    was_cascade=True,
+                    notes=f"Cascaded from revoking user {revoked_user_id}",
+                    ip_address=request.remote_addr
+                )
+            except Exception as audit_error:
+                current_app.logger.error(f"Failed to log cascade revocation: {audit_error}")
 
-            if not has_alternate:
-                # No alternate path - cascade revoke
-                # Audit log cascade revocation
-                try:
-                    ShareAuditLog.log_share_revoked(
-                        share_id=downstream.id,
-                        recording_id=recording_id,
-                        actor_id=current_user.id,
-                        target_user_id=downstream.shared_with_user_id,
-                        was_cascade=True,
-                        notes=f"Cascaded from revoking user {revoked_user_id}",
-                        ip_address=request.remote_addr
-                    )
-                except Exception as audit_error:
-                    current_app.logger.error(f"Failed to log cascade revocation: {audit_error}")
-
-                db.session.delete(downstream)
-                revoked_count += 1
+            db.session.delete(downstream)
+            revoked_count += 1
 
         # Audit log the primary revocation
         try:
@@ -601,6 +595,11 @@ def get_shared_with_me():
         for share in shares:
             recording = share.recording
             if recording and recording.status == 'COMPLETED':
+                is_valid, effective_can_edit = InternalShare.is_share_valid_for_user(
+                    share, recording=recording
+                )
+                if not is_valid:
+                    continue
                 rec_data = recording.to_list_dict(viewer_user=current_user)
                 # Mark as shared recording with owner info
                 rec_data['is_shared'] = True
@@ -614,7 +613,7 @@ def get_shared_with_me():
                 rec_data['share_info'] = {
                     'share_id': share.id,
                     'owner_username': share.owner.username if SHOW_USERNAMES_IN_UI else None,
-                    'can_edit': share.can_edit,
+                    'can_edit': effective_can_edit,
                     'can_reshare': share.can_reshare,
                     'shared_at': share.created_at.isoformat()
                 }
