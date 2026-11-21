@@ -343,8 +343,18 @@ def admin_delete_user(user_id):
         total_chunks = TranscriptChunk.query.filter_by(user_id=user_id).count()
         if total_chunks > 0:
             current_app.logger.info(f"Deleting {total_chunks} transcript chunks with embeddings for user {user_id}")
+    import shutil
+    from pathlib import Path
+    from src.api.recording_sessions import _remove_session_dir
+    from src.file_exporter import AUTO_EXPORT_DIR
+    from src.models.speaker_snippet import SpeakerSnippet
     from src.services.storage import get_storage_service
+
     storage = get_storage_service()
+    username = user.username
+    recording_ids = [r.id for r in user.recordings]
+    session_ids = [s.id for s in user.recording_sessions]
+
     for recording in user.recordings:
         try:
             if recording.audio_path:
@@ -352,15 +362,38 @@ def admin_delete_user(user_id):
         except Exception as e:
             current_app.logger.error(f"Error deleting audio file {recording.audio_path}: {e}")
 
-    # Explicitly delete related records that might not cascade properly
-    ProcessingJob.query.filter_by(user_id=user_id).delete()
+    # Explicitly delete related records with NOT NULL constraints or shared-editor references
+    if recording_ids:
+        SpeakerSnippet.query.filter(SpeakerSnippet.recording_id.in_(recording_ids)).delete(synchronize_session=False)
+        ProcessingJob.query.filter(ProcessingJob.recording_id.in_(recording_ids)).delete(synchronize_session=False)
+        InternalShare.query.filter(InternalShare.recording_id.in_(recording_ids)).delete(synchronize_session=False)
+
+    ProcessingJob.query.filter_by(user_id=user_id).delete(synchronize_session=False)
     InternalShare.query.filter(
         (InternalShare.owner_id == user_id) | (InternalShare.shared_with_user_id == user_id)
-    ).delete()
+    ).delete(synchronize_session=False)
 
-    # Delete user (cascade will handle remaining related data including chunks/embeddings)
+    # Delete user (cascade deletes recordings, events, chunks/embeddings, shares, and sessions)
     db.session.delete(user)
     db.session.commit()
+
+    # Remove per-session chunk directories after DB rows are deleted
+    for sid in session_ids:
+        try:
+            _remove_session_dir(sid)
+        except Exception as e:
+            current_app.logger.warning(f"Error removing recording session directory {sid}: {e}")
+
+    # Remove the user's auto-export directory if present
+    try:
+        safe_user = secure_filename(username or '')
+        if safe_user:
+            export_root = Path(AUTO_EXPORT_DIR).resolve()
+            user_export_dir = (export_root / safe_user).resolve()
+            if user_export_dir.parent == export_root and user_export_dir.exists():
+                shutil.rmtree(user_export_dir, ignore_errors=True)
+    except Exception as e:
+        current_app.logger.warning(f"Error removing auto-export directory for user {user_id}: {e}")
     
     if ENABLE_INQUIRE_MODE and total_chunks > 0:
         current_app.logger.info(f"Successfully deleted {total_chunks} embeddings and chunks for user {user_id}")
