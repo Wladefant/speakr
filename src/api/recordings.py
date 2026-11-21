@@ -2296,6 +2296,27 @@ def share_target():
         # Some platforms pre-flight with GET. Just land the user on the SPA.
         return redirect(url_for('recordings.index'))
 
+    # Defense against cross-site form POSTs using ambient session cookies:
+    # Native PWA share sheets send Sec-Fetch-Site: none (or same-origin) and
+    # omit or match Origin; reject any explicitly cross-site Origin/Referer/Sec-Fetch-Site.
+    from urllib.parse import urlparse
+    sec_fetch_site = (request.headers.get('Sec-Fetch-Site') or '').strip().lower()
+    if sec_fetch_site == 'cross-site':
+        return jsonify({'error': 'Cross-site request forbidden'}), 403
+
+    expected_host = (request.host or '').strip().lower()
+    origin = (request.headers.get('Origin') or '').strip()
+    if origin and origin.lower() != 'null':
+        origin_host = (urlparse(origin).netloc or '').strip().lower()
+        if origin_host and expected_host and origin_host != expected_host:
+            return jsonify({'error': 'Cross-origin request forbidden'}), 403
+    else:
+        referer = (request.headers.get('Referer') or '').strip()
+        if referer:
+            referer_host = (urlparse(referer).netloc or '').strip().lower()
+            if referer_host and expected_host and referer_host != expected_host:
+                return jsonify({'error': 'Cross-origin request forbidden'}), 403
+
     shared = request.files.get('shared_audio') or request.files.get('file')
     if not shared or not getattr(shared, 'filename', ''):
         return redirect(url_for('recordings.index') + '?share_target_error=missing_file')

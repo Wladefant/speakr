@@ -176,7 +176,7 @@ def test_login_when_already_authenticated_redirects(cleanup_users):
 def test_logout_clears_session(cleanup_users):
     user = _mk_user(cleanup_users)
     with _client_logged_in_as(user) as client:
-        resp = client.get('/logout')
+        resp = client.post('/logout')
         assert resp.status_code == 302
         with client.session_transaction() as s:
             assert '_user_id' not in s
