@@ -113,7 +113,7 @@ def test_shared_recipient_cannot_read_owner_private_notes_tags_folder_or_duplica
                 resp.choices = [MagicMock(message=MagicMock(content="ok"))]
                 return resp
 
-            with patch("src.api.api_v1.call_chat_completion", side_effect=_fake_chat):
+            with patch("src.services.llm.call_chat_completion", side_effect=_fake_chat):
                 r_chat = client.post(f"/api/v1/recordings/{rec_id}/chat", json={"message": "summarize notes"})
                 assert r_chat.status_code == 200
             assert "OWNER_SECRET_COMPENSATION_NOTE" not in str(captured_v1)
