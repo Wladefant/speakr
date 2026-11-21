@@ -3,6 +3,7 @@ Transcription usage tracking service for monitoring audio transcription consumpt
 """
 
 import logging
+import threading
 from datetime import date, datetime, timedelta
 from typing import Tuple, Optional, Dict, List
 
@@ -55,6 +56,10 @@ def get_transcription_cost_per_minute(connector_type: str, model_name: str = Non
 
 
 class TranscriptionTracker:
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._inflight_seconds: Dict[int, float] = {}
+
     """Service for recording and checking transcription usage."""
 
     CONNECTOR_TYPES = [
@@ -155,40 +160,63 @@ class TranscriptionTracker:
 
         return result or 0.0
 
-    def check_budget(self, user_id: int) -> Tuple[bool, float, Optional[str]]:
-        """
-        Check if user is within transcription budget.
+    def _check_budget_unlocked(self, user_id: int, additional_seconds: float = 0.0) -> Tuple[bool, float, Optional[str]]:
+        user = db.session.get(User, user_id)
+        if not user or not user.monthly_transcription_budget:
+            return (True, 0, None)  # No budget = unlimited
 
-        Returns:
-            (can_proceed, usage_percentage, message)
-            - can_proceed: False if hard cap (100%) reached
-            - usage_percentage: 0-100+
-            - message: Warning/error message if applicable
-        """
+        current_usage = self.get_monthly_usage(user_id)
+        inflight = self._inflight_seconds.get(user_id, 0.0)
+        requested = max(0.0, float(additional_seconds or 0.0))
+        effective_usage = current_usage + inflight + requested
+        budget = user.monthly_transcription_budget
+        percentage = (effective_usage / budget) * 100
+
+        if current_usage + inflight >= budget or (requested > 0 and effective_usage > budget):
+            minutes_used = int((current_usage + inflight) // 60)
+            minutes_budget = budget // 60
+            return (False, percentage,
+                    f"Monthly transcription budget exceeded ({minutes_used}/{minutes_budget} minutes). Contact admin for more time.")
+        elif percentage >= 80:
+            return (True, percentage,
+                    f"Warning: {percentage:.1f}% of monthly transcription budget used.")
+        else:
+            return (True, percentage, None)
+
+    def check_budget(self, user_id: int, additional_seconds: float = 0.0) -> Tuple[bool, float, Optional[str]]:
+        """Check if user is within transcription budget (including in-flight reservations and optional requested duration)."""
         try:
-            user = db.session.get(User, user_id)
-            if not user or not user.monthly_transcription_budget:
-                return (True, 0, None)  # No budget = unlimited
-
-            current_usage = self.get_monthly_usage(user_id)
-            budget = user.monthly_transcription_budget
-            percentage = (current_usage / budget) * 100
-
-            if percentage >= 100:
-                minutes_used = current_usage // 60
-                minutes_budget = budget // 60
-                return (False, percentage,
-                        f"Monthly transcription budget exceeded ({minutes_used}/{minutes_budget} minutes). Contact admin for more time.")
-            elif percentage >= 80:
-                return (True, percentage,
-                        f"Warning: {percentage:.1f}% of monthly transcription budget used.")
-            else:
-                return (True, percentage, None)
-
+            with self._lock:
+                return self._check_budget_unlocked(user_id, additional_seconds=additional_seconds)
         except Exception as e:
             logger.error(f"Failed to check transcription budget for user {user_id}: {e}")
-            # Fail open - allow the request if we can't check
             return (True, 0, None)
+
+    def reserve_budget(self, user_id: Optional[int], additional_seconds: float = 0.0) -> Tuple[bool, float, Optional[str]]:
+        """Atomically verify budget and reserve in-flight seconds for a user."""
+        if user_id is None:
+            return (True, 0, None)
+        requested = max(0.0, float(additional_seconds or 0.0))
+        try:
+            with self._lock:
+                allowed, pct, msg = (self.check_budget(user_id, additional_seconds=requested) if requested > 0 else self.check_budget(user_id))
+                if allowed and requested > 0:
+                    self._inflight_seconds[user_id] = self._inflight_seconds.get(user_id, 0.0) + requested
+                return (allowed, pct, msg)
+        except Exception as e:
+            logger.error(f"Failed to reserve transcription budget for user {user_id}: {e}")
+            return (True, 0, None)
+
+    def release_reservation(self, user_id: Optional[int], reserved_seconds: float = 0.0) -> None:
+        """Release previously reserved in-flight transcription seconds."""
+        if user_id is None or not reserved_seconds or reserved_seconds <= 0:
+            return
+        with self._lock:
+            remaining = self._inflight_seconds.get(user_id, 0.0) - float(reserved_seconds)
+            if remaining <= 0:
+                self._inflight_seconds.pop(user_id, None)
+            else:
+                self._inflight_seconds[user_id] = remaining
 
     def get_daily_stats(self, days: int = 30, user_id: int = None) -> List[Dict]:
         """Get daily transcription usage for charts."""

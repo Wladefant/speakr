@@ -1411,8 +1411,12 @@ def regenerate_title(recording_id):
             return jsonify({'error': 'Title generation service is not available (OpenRouter client not configured)'}), 503
 
         from src.tasks.processing import _generate_ai_title
+        from src.services.llm import TokenBudgetExceeded
 
-        new_title = _generate_ai_title(recording)
+        try:
+            new_title = _generate_ai_title(recording, acting_user_id=current_user.id)
+        except TokenBudgetExceeded as budget_err:
+            return jsonify({'error': str(budget_err), 'budget_exceeded': True}), 429
         if not new_title:
             return jsonify({'error': 'Failed to generate a title'}), 500
 

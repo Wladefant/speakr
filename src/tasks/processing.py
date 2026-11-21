@@ -299,7 +299,7 @@ ENABLE_INQUIRE_MODE = os.environ.get('ENABLE_INQUIRE_MODE', 'false').lower() == 
 # not at module level (matching original pre-refactor behavior)
 
 
-def generate_title_task(app_context, recording_id, will_auto_summarize=False):
+def generate_title_task(app_context, recording_id, will_auto_summarize=False, acting_user_id=None):
     """Generates only a title for a recording based on transcription.
 
     Args:
@@ -358,7 +358,7 @@ def generate_title_task(app_context, recording_id, will_auto_summarize=False):
             # by the user but must not fail the whole recording here — skip
             # titling and continue (the interactive endpoint surfaces it).
             try:
-                ai_title = _generate_ai_title(recording)
+                ai_title = _generate_ai_title(recording, acting_user_id=acting_user_id)
             except TokenBudgetExceeded as e:
                 current_app.logger.warning(f"Skipping AI title for recording {recording_id}: {e}")
                 ai_title = None
@@ -410,7 +410,7 @@ def generate_title_task(app_context, recording_id, will_auto_summarize=False):
             current_app.logger.info(f"Title generation complete, leaving status unchanged (auto-summarization will follow) for recording {recording_id}")
 
 
-def _generate_ai_title(recording):
+def _generate_ai_title(recording, acting_user_id=None):
     """Generate an AI title for a recording using LLM.
 
     Args:
@@ -498,7 +498,7 @@ Title:"""
             # the budget so the model has room for hidden thinking tokens
             # before producing the title itself.
             max_tokens=int(os.environ.get("TITLE_MAX_TOKENS", "5000")),
-            user_id=recording.user_id,
+            user_id=acting_user_id if acting_user_id is not None else recording.user_id,
             operation_type='title_generation'
         )
 
@@ -822,7 +822,7 @@ Summarization Instructions:
                 ],
                 temperature=0.5,
                 max_tokens=int(os.environ.get("SUMMARY_MAX_TOKENS", "3000")),
-                user_id=recording.user_id,
+                user_id=user_id if user_id is not None else recording.user_id,
                 operation_type='summarization'
             )
 
@@ -839,7 +839,7 @@ Summarization Instructions:
 
                 # Extract events if enabled for this user BEFORE marking as completed
                 if recording.owner and recording.owner.extract_events:
-                    extract_events_from_transcript(recording_id, formatted_transcription, summary)
+                    extract_events_from_transcript(recording_id, formatted_transcription, summary, acting_user_id=user_id if user_id is not None else recording.user_id)
 
                 # Mark as completed AFTER event extraction
                 recording.status = 'COMPLETED'
@@ -897,7 +897,7 @@ Summarization Instructions:
             db.session.commit()
 
 
-def extract_events_from_transcript(recording_id, transcript_text, summary_text):
+def extract_events_from_transcript(recording_id, transcript_text, summary_text, acting_user_id=None):
     """Extract calendar events from transcript using LLM.
 
     Args:
@@ -1094,7 +1094,7 @@ You must respond with valid JSON format only."""
             # EVENT_MAX_TOKENS gives reasoning-model users a knob to raise
             # the budget when hidden thinking tokens crowd out the JSON output.
             max_tokens=int(os.environ.get("EVENT_MAX_TOKENS", "3000")),
-            user_id=recording.user_id,
+            user_id=acting_user_id if acting_user_id is not None else recording.user_id,
             operation_type='event_extraction'
         )
 
@@ -1711,7 +1711,7 @@ def transcribe_chunks_with_connector(connector, filepath, filename, mime_type, l
             raise ChunkProcessingError(f"Chunked transcription failed: {str(e)}")
 
 
-def transcribe_with_connector(app_context, recording_id, filepath, original_filename, start_time, mime_type=None, language=None, diarize=None, min_speakers=None, max_speakers=None, tag_id=None, hotwords=None, initial_prompt=None, transcription_model=None):
+def transcribe_with_connector(app_context, recording_id, filepath, original_filename, start_time, mime_type=None, language=None, diarize=None, min_speakers=None, max_speakers=None, tag_id=None, hotwords=None, initial_prompt=None, transcription_model=None, acting_user_id=None):
     """
     Transcribe audio using the new connector-based architecture.
 
@@ -1794,10 +1794,31 @@ def transcribe_with_connector(app_context, recording_id, filepath, original_file
             recording.resolved_initial_prompt = initial_prompt or None
             db.session.commit()
 
-            # Check transcription budget before processing
-            can_proceed, usage_pct, budget_msg = transcription_tracker.check_budget(recording.user_id)
+            billing_user_id = acting_user_id if acting_user_id is not None else recording.user_id
+            reserved_duration = 0.0
+            try:
+                est_duration = float(recording.audio_duration_seconds or 0.0)
+                if est_duration <= 0 and chunking_service and filepath and os.path.exists(filepath):
+                    probed = chunking_service.get_audio_duration(filepath)
+                    if probed and probed > 0:
+                        est_duration = float(probed)
+            except Exception:
+                est_duration = 0.0
+
+            # Check and reserve transcription budget before processing
+            if billing_user_id is not None:
+                if hasattr(transcription_tracker, 'reserve_budget'):
+                    can_proceed, usage_pct, budget_msg = transcription_tracker.reserve_budget(
+                        billing_user_id, additional_seconds=est_duration
+                    )
+                    if can_proceed and est_duration > 0:
+                        reserved_duration = est_duration
+                else:
+                    can_proceed, usage_pct, budget_msg = transcription_tracker.check_budget(billing_user_id)
+            else:
+                can_proceed, usage_pct, budget_msg = (True, 0, None)
             if not can_proceed:
-                current_app.logger.warning(f"User {recording.user_id} exceeded transcription budget: {budget_msg}")
+                current_app.logger.warning(f"User {billing_user_id} exceeded transcription budget: {budget_msg}")
                 recording.status = 'FAILED'
                 recording.error_message = _sanitize_error_message(budget_msg)
                 db.session.commit()
@@ -1885,9 +1906,13 @@ def transcribe_with_connector(app_context, recording_id, filepath, original_file
                         actual_content_type = audio_mime_type
                         actual_filename = os.path.basename(audio_filepath)
 
+                        stored_audio = None
+                        storage = None
                         try:
                             from src.services.storage import get_storage_service
                             storage = get_storage_service()
+                            if db.session.query(Recording.id).filter_by(id=recording.id).first() is None:
+                                raise RuntimeError(f"Recording {recording.id} was deleted during audio extraction")
                             old_audio_locator = recording.audio_path
                             extracted_key = storage.build_recording_key(actual_filename, recording.id)
                             stored_audio = storage.upload_local_file(
@@ -1896,6 +1921,8 @@ def transcribe_with_connector(app_context, recording_id, filepath, original_file
                                 content_type=audio_mime_type,
                                 delete_source=False,
                             )
+                            if db.session.query(Recording.id).filter_by(id=recording.id).first() is None:
+                                raise RuntimeError(f"Recording {recording.id} was deleted during extracted audio upload")
                             recording.audio_path = stored_audio.locator
                             recording.mime_type = audio_mime_type
                             try:
@@ -1914,10 +1941,15 @@ def transcribe_with_connector(app_context, recording_id, filepath, original_file
                                 except Exception as cleanup_err:
                                     current_app.logger.warning(f"Failed to delete original source after audio extraction: {cleanup_err}")
                         except Exception:
-                            # Do NOT persist temporary extracted path in DB. Keep previous locator and continue
-                            # processing with the local extracted file for this job only.
-                            recording.mime_type = audio_mime_type
-                            db.session.commit()
+                            db.session.rollback()
+                            if stored_audio is not None and storage is not None:
+                                try:
+                                    storage.delete(stored_audio.locator, missing_ok=True)
+                                except Exception:
+                                    pass
+                            if db.session.query(Recording.id).filter_by(id=recording.id).first() is not None:
+                                recording.mime_type = audio_mime_type
+                                db.session.commit()
                             current_app.logger.warning(
                                 "Failed to persist extracted audio via storage layer; keeping previous recording.audio_path and continuing with temporary local file",
                                 exc_info=True,
@@ -2197,12 +2229,13 @@ def transcribe_with_connector(app_context, recording_id, filepath, original_file
                 if audio_duration and audio_duration > 0:
                     # Get model name from connector if available
                     model_name = getattr(connector, 'model', None) or connector_name
-                    transcription_tracker.record_usage(
-                        user_id=recording.user_id,
-                        connector_type=connector_name,
-                        audio_duration_seconds=int(audio_duration),
-                        model_name=model_name
-                    )
+                    if billing_user_id is not None:
+                        transcription_tracker.record_usage(
+                            user_id=billing_user_id,
+                            connector_type=connector_name,
+                            audio_duration_seconds=int(audio_duration),
+                            model_name=model_name
+                        )
                     # Cache duration on the recording so list/detail
                     # serializers don't have to ffprobe per request.
                     recording.audio_duration_seconds = float(audio_duration)
@@ -2253,7 +2286,7 @@ def transcribe_with_connector(app_context, recording_id, filepath, original_file
             will_auto_summarize = not admin_disabled and not user_disabled
 
             # Generate title immediately
-            generate_title_task(app_context, recording_id, will_auto_summarize=will_auto_summarize)
+            generate_title_task(app_context, recording_id, will_auto_summarize=will_auto_summarize, acting_user_id=billing_user_id)
 
             if not will_auto_summarize:
                 reason = "admin setting" if admin_disabled else "user preference"
@@ -2273,7 +2306,7 @@ def transcribe_with_connector(app_context, recording_id, filepath, original_file
             else:
                 # Auto-generate summary for all recordings
                 current_app.logger.info(f"Auto-generating summary for recording {recording_id}")
-                generate_summary_only_task(app_context, recording_id)
+                generate_summary_only_task(app_context, recording_id, user_id=billing_user_id)
 
         except Exception as e:
             db.session.rollback()
@@ -2317,9 +2350,13 @@ def transcribe_with_connector(app_context, recording_id, filepath, original_file
 
             # Re-raise so job queue marks the job as failed (and potentially retries)
             raise
+        finally:
+            if locals().get('reserved_duration', 0) > 0 and locals().get('billing_user_id') is not None:
+                if hasattr(transcription_tracker, 'release_reservation'):
+                    transcription_tracker.release_reservation(billing_user_id, reserved_duration)
 
 
-def transcribe_audio_task(app_context, recording_id, filepath, filename_for_asr, start_time, language=None, min_speakers=None, max_speakers=None, tag_id=None, hotwords=None, initial_prompt=None, transcription_model=None):
+def transcribe_audio_task(app_context, recording_id, filepath, filename_for_asr, start_time, language=None, min_speakers=None, max_speakers=None, tag_id=None, hotwords=None, initial_prompt=None, transcription_model=None, acting_user_id=None):
     """Runs the transcription and summarization in a background thread.
 
     Uses the connector-based architecture which supports:
@@ -2369,6 +2406,7 @@ def transcribe_audio_task(app_context, recording_id, filepath, filename_for_asr,
         hotwords=hotwords,
         initial_prompt=initial_prompt,
         transcription_model=transcription_model,
+        acting_user_id=acting_user_id,
     )
 
     # After transcription completes, calculate processing time

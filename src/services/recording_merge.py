@@ -336,6 +336,12 @@ def run_merge_job(recording, params):
         _safe_unlink(staging_path)
         raise MergeError("Failed to combine the audio files.")
 
+    # Fence against mid-merge recording deletion before uploading new media.
+    if db.session.query(Recording.id).filter_by(id=recording.id).first() is None:
+        _safe_unlink(staging_path)
+        raise MergeError(f"Recording {recording.id} was deleted while merging.")
+
+    stored_object = None
     try:
         storage_key = storage.build_recording_key(recording.original_filename, recording.id, now=now)
         stored_object = storage.upload_local_file(
@@ -344,12 +350,20 @@ def run_merge_job(recording, params):
             content_type='audio/mp4',
             delete_source=True,
         )
+        # Re-check existence right before committing so a concurrent delete does not orphan the object.
+        if db.session.query(Recording.id).filter_by(id=recording.id).first() is None:
+            raise MergeError(f"Recording {recording.id} was deleted during merge upload.")
         recording.audio_path = stored_object.locator
         recording.file_size = merged_size
         db.session.commit()
     except Exception as e:
         current_app.logger.error(f"Merge storage upload failed for recording {recording.id}: {e}")
         db.session.rollback()
+        if stored_object is not None:
+            try:
+                storage.delete(stored_object.locator, missing_ok=True)
+            except Exception:
+                pass
         _safe_unlink(staging_path)
         raise MergeError("Failed to store the merged recording.")
 
