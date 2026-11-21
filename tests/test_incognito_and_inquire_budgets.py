@@ -254,3 +254,49 @@ def test_inquire_rag_stream_records_final_usage_chunk_with_empty_choices():
             assert tracker.record_usage.call_args.kwargs["total_tokens"] == 140
     finally:
         _cleanup_user(uid)
+
+
+def test_incognito_transcription_records_canonical_provider_and_positive_fallback_duration(tmp_path):
+    audio_file = tmp_path / "short.mp3"
+    audio_file.write_bytes(b"\x00" * 32000)
+
+    class _FakeWhisperConnector:
+        PROVIDER_NAME = "openai_whisper"
+        model = "whisper-1"
+        specifications = MagicMock()
+        supports_diarization = False
+
+        def transcribe(self, req):
+            resp = MagicMock()
+            resp.text = "Short incognito transcript."
+            resp.segments = []
+            resp.duration = None
+            resp.has_diarization.return_value = False
+            return resp
+
+    fake_registry = MagicMock()
+    fake_registry.get_active_connector.return_value = _FakeWhisperConnector()
+    fake_user = MagicMock(id=999, transcription_language=None)
+
+    for probe_return, expected_min in [(0.4, 1), (None, 1)]:
+        fake_tracker = MagicMock()
+        fake_tracker.check_budget.return_value = (True, 10.0, None)
+        fake_chunking = MagicMock()
+        fake_chunking.get_audio_duration.return_value = probe_return
+        fake_chunking.needs_chunking.return_value = False
+
+        with app.app_context(), \
+             patch("src.tasks.processing.transcription_tracker", fake_tracker), \
+             patch("src.tasks.processing.chunking_service", fake_chunking), \
+             patch("src.services.transcription.get_registry", return_value=fake_registry), \
+             patch("src.tasks.processing.is_video_file", return_value=False), \
+             patch("src.tasks.processing.needs_conversion_for_connector", return_value=(False, None)), \
+             patch("src.tasks.processing._generate_incognito_title", return_value="Test"):
+            out = processing_module.transcribe_incognito(str(audio_file), "short.mp3", user=fake_user)
+
+        assert out["transcription"] == "Short incognito transcript."
+        fake_tracker.record_usage.assert_called_once()
+        kw = fake_tracker.record_usage.call_args.kwargs
+        assert kw["connector_type"] == "openai_whisper"
+        assert kw["model_name"] == "whisper-1"
+        assert kw["audio_duration_seconds"] >= expected_min

@@ -8,6 +8,7 @@ These functions handle asynchronous processing tasks:
 - Audio/video format conversion
 """
 
+import math
 import os
 import re
 import json
@@ -2435,7 +2436,8 @@ def transcribe_incognito(filepath, original_filename, language=None, min_speaker
             raise Exception("No transcription connector available")
 
         connector_specs = connector.specifications
-        connector_name = type(connector).__name__
+        provider_name = getattr(connector, 'PROVIDER_NAME', None)
+        connector_name = provider_name if isinstance(provider_name, str) and provider_name else type(connector).__name__
         current_app.logger.info(f"[Incognito] Using transcription connector: {connector_name}")
 
         # Determine mime type
@@ -2504,10 +2506,12 @@ def transcribe_incognito(filepath, original_filename, language=None, min_speaker
             except Exception as e:
                 current_app.logger.warning(f"[Incognito] Audio conversion check failed: {e}, proceeding with original")
 
-        # Get audio duration if chunking service is available
+        # Get audio duration if chunking service is available (ceil so subsecond clips are >= 1s)
         if chunking_service:
             try:
-                result['audio_duration_seconds'] = int(chunking_service.get_audio_duration(actual_filepath))
+                probed_duration = chunking_service.get_audio_duration(actual_filepath)
+                if probed_duration is not None and probed_duration > 0:
+                    result['audio_duration_seconds'] = max(1, int(math.ceil(float(probed_duration))))
             except Exception as e:
                 current_app.logger.warning(f"[Incognito] Could not get audio duration: {e}")
 
@@ -2533,12 +2537,14 @@ def transcribe_incognito(filepath, original_filename, language=None, min_speaker
 
         current_app.logger.info(f"[Incognito] Starting transcription: diarize={should_diarize}, language={language}, chunking={should_chunk}")
 
+        asr_response = None
         if should_chunk:
             # Use chunking for large files
             chunk_result = transcribe_chunks_with_connector(
                 connector, actual_filepath, actual_filename, actual_content_type, language,
                 diarize=should_diarize
             )
+            asr_response = chunk_result
 
             if hasattr(chunk_result, 'segments') and chunk_result.segments and chunk_result.has_diarization():
                 result['transcription'] = chunk_result.to_storage_format()
@@ -2558,6 +2564,7 @@ def transcribe_incognito(filepath, original_filename, language=None, min_speaker
                 )
 
                 response = connector.transcribe(request)
+                asr_response = response
 
             if response.segments and response.has_diarization():
                 result['transcription'] = response.to_storage_format()
@@ -2567,20 +2574,48 @@ def transcribe_incognito(filepath, original_filename, language=None, min_speaker
         result['processing_time_seconds'] = int(time.time() - start_time)
         current_app.logger.info(f"[Incognito] Transcription completed in {result['processing_time_seconds']}s")
 
-        # Record aggregate transcription duration only (never persist recording or transcript content)
+        # Record aggregate transcription duration only (never persist recording or transcript content).
+        # Always fall back to a positive billable duration (>= 1s) so successful ASR calls cannot
+        # bypass monthly quota accounting when ffprobe fails or clips are subsecond.
         if user is not None:
             audio_duration = result.get('audio_duration_seconds')
-            if audio_duration and audio_duration > 0:
-                try:
-                    model_name = getattr(connector, 'model', None) or connector_name
-                    transcription_tracker.record_usage(
-                        user_id=user.id,
-                        connector_type=connector_name,
-                        audio_duration_seconds=int(audio_duration),
-                        model_name=model_name,
-                    )
-                except Exception as usage_err:
-                    current_app.logger.warning(f"[Incognito] Failed to record transcription usage: {usage_err}")
+            if not audio_duration or audio_duration <= 0:
+                fallback_dur = None
+                if asr_response is not None:
+                    resp_dur = getattr(asr_response, 'duration', None)
+                    if isinstance(resp_dur, (int, float)) and resp_dur > 0:
+                        fallback_dur = float(resp_dur)
+                    else:
+                        segs = getattr(asr_response, 'segments', None) or []
+                        max_end = 0.0
+                        for seg in segs:
+                            end_val = seg.get('end') if isinstance(seg, dict) else getattr(seg, 'end', None)
+                            if isinstance(end_val, (int, float)) and end_val > max_end:
+                                max_end = float(end_val)
+                        if max_end > 0:
+                            fallback_dur = max_end
+                if not fallback_dur or fallback_dur <= 0:
+                    try:
+                        if actual_filepath and os.path.exists(actual_filepath):
+                            file_bytes = os.path.getsize(actual_filepath)
+                            if file_bytes > 0:
+                                fallback_dur = max(1.0, file_bytes / 16000.0)
+                    except OSError:
+                        pass
+                audio_duration = max(1, int(math.ceil(fallback_dur))) if fallback_dur and fallback_dur > 0 else 1
+                result['audio_duration_seconds'] = audio_duration
+
+            try:
+                raw_model = getattr(connector, 'model', None)
+                model_name = raw_model if isinstance(raw_model, str) and raw_model else connector_name
+                transcription_tracker.record_usage(
+                    user_id=user.id,
+                    connector_type=connector_name,
+                    audio_duration_seconds=int(audio_duration),
+                    model_name=model_name,
+                )
+            except Exception as usage_err:
+                current_app.logger.warning(f"[Incognito] Failed to record transcription usage: {usage_err}")
 
         # Generate a title if we have transcription
         if result['transcription'] and len(result['transcription']) > 10:
