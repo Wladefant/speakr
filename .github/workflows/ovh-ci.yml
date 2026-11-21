@@ -1,0 +1,143 @@
+name: OVH Speakr CI
+
+on:
+  push:
+    branches:
+      - master
+      - 'fix/**'
+      - 'ci/**'
+      - 'ovh-ci/**'
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: Optional 40-hex commit SHA to verify
+        required: false
+        default: ''
+        type: string
+      test_files:
+        description: Optional space-separated pytest test paths (default runs full suite)
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ovh-speakr-ci-${{ github.event_name }}-${{ inputs.target_sha || github.ref_name }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || '' }}
+  cancel-in-progress: true
+
+env:
+  CI: 'true'
+
+jobs:
+  test:
+    runs-on: [self-hosted, Linux, X64, ovh, speakr]
+    timeout-minutes: 15
+
+    steps:
+      - name: Validate dispatch inputs
+        shell: bash
+        env:
+          TARGET_SHA: ${{ inputs.target_sha }}
+        run: |
+          set -euo pipefail
+          if [ -n "$TARGET_SHA" ] && ! [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::target_sha must be a 40-character lowercase hex SHA"
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_sha || github.sha }}
+          fetch-depth: 1
+
+      - name: Record exact head and runner diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "CHECKED_OUT_SHA=$(git rev-parse HEAD)"
+          python3 --version || true
+          node --version || true
+          npm --version || true
+          command -v uv || true
+          command -v ffmpeg || true
+          command -v ffprobe || true
+          command -v docker || true
+
+      - name: Start ephemeral PostgreSQL 16
+        id: pg
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+            CID="speakr-ci-pg-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            docker rm -f "$CID" >/dev/null 2>&1 || true
+            docker run --rm -d --name "$CID"               -e POSTGRES_USER=speakr               -e POSTGRES_PASSWORD=speakr               -e POSTGRES_DB=speakr_test               -p 127.0.0.1::5432               postgres:16 >/dev/null
+            PG_PORT="$(docker port "$CID" 5432/tcp | head -n1 | awk -F: '{print $NF}')"
+            echo "cid=$CID" >> "$GITHUB_OUTPUT"
+            echo "port=$PG_PORT" >> "$GITHUB_OUTPUT"
+            for i in $(seq 1 40); do
+              if docker exec "$CID" pg_isready -U speakr -d speakr_test >/dev/null 2>&1; then
+                echo "PostgreSQL 16 ready on 127.0.0.1:${PG_PORT}"
+                exit 0
+              fi
+              sleep 1
+            done
+            echo "::error::PostgreSQL 16 container failed to become ready"
+            docker logs "$CID" || true
+            exit 1
+          else
+            echo "::error::Docker is unavailable on self-hosted runner for PostgreSQL 16"
+            exit 1
+          fi
+
+      - name: Install Python and Node dependencies and run test suites
+        shell: bash
+        env:
+          PG_PORT: ${{ steps.pg.outputs.port }}
+          TEST_FILES: ${{ inputs.test_files }}
+        run: |
+          set -euo pipefail
+          export TEST_DATABASE_URI="postgresql+psycopg2://speakr:speakr@127.0.0.1:${PG_PORT}/speakr_test"
+
+          VENV_DIR="${RUNNER_TEMP:-/tmp}/speakr-venv-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          if command -v uv >/dev/null 2>&1; then
+            uv venv --python 3.11 "$VENV_DIR" || uv venv "$VENV_DIR"
+            uv pip install --python "${VENV_DIR}/bin/python" -r requirements.txt pytest pytest-cov
+          else
+            python3 -m venv "$VENV_DIR"
+            "${VENV_DIR}/bin/pip" install --quiet -r requirements.txt pytest pytest-cov
+          fi
+
+          npm install --no-audit --no-fund
+          if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+            npm install --no-save --no-package-lock ffmpeg-static@5.2.0 ffprobe-static@3.1.0
+            FFMPEG_BIN="$(node -p "require('ffmpeg-static')")"
+            FFPROBE_BIN="$(node -p "require('ffprobe-static').path")"
+            export PATH="$(dirname "$FFMPEG_BIN"):$(dirname "$FFPROBE_BIN"):$PATH"
+          fi
+          command -v ffmpeg
+          command -v ffprobe
+
+          echo "=== Running pytest ==="
+          if [ -n "$TEST_FILES" ]; then
+            read -r -a PYTEST_TARGETS <<< "$TEST_FILES"
+            "${VENV_DIR}/bin/python" -m pytest "${PYTEST_TARGETS[@]}" -v
+          else
+            "${VENV_DIR}/bin/python" -m pytest tests/ -q --cov=src --cov-report=term-missing --cov-fail-under=54
+          fi
+
+          echo "=== Running npm test (Vitest) ==="
+          npm test
+
+          rm -rf "$VENV_DIR"
+
+      - name: Stop ephemeral PostgreSQL 16
+        if: always() && steps.pg.outputs.cid != ''
+        shell: bash
+        env:
+          PG_CID: ${{ steps.pg.outputs.cid }}
+        run: |
+          docker rm -f "$PG_CID" >/dev/null 2>&1 || true
