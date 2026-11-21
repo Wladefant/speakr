@@ -183,7 +183,7 @@ def test_merge_job_deletes_uploaded_object_when_recording_deleted_mid_upload(tmp
 
         with patch("src.services.recording_merge.get_storage_service", return_value=fake_storage),              patch("src.services.recording_merge._concat_audio", side_effect=_fake_concat):
             with pytest.raises(MergeError):
-                run_merge_job(tgt_id, [s1_id, s2_id], delete_originals=False)
+                run_merge_job(target, {"source_ids": [s1_id, s2_id], "delete_originals": False})
 
         assert "s3:recordings/merged.m4a" in deleted_locators
 
