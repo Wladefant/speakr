@@ -17,7 +17,8 @@ from src.database import db
 from src.models import *
 from src.utils import *
 from src.services.embeddings import get_accessible_recording_ids, semantic_search_chunks, EMBEDDINGS_AVAILABLE
-from src.services.llm import call_llm_completion, call_chat_completion, process_streaming_with_thinking, client, chat_client, TokenBudgetExceeded
+from src.services.llm import call_llm_completion, call_chat_completion, process_streaming_with_thinking, extract_cache_tokens, get_chat_config, client, chat_client, TokenBudgetExceeded
+from src.services.token_tracking import token_tracker
 
 # Create blueprint
 inquire_bp = Blueprint('inquire', __name__)
@@ -208,6 +209,17 @@ def inquire_chat():
         user_company = current_user.company if current_user.company else "their organization"
         user_output_language = current_user.output_language if current_user.output_language else None
         app = current_app._get_current_object()  # Capture app for use in generator
+
+        # Enforce token budget up front before starting the SSE stream or running embeddings
+        try:
+            can_proceed, _usage_pct, budget_msg = token_tracker.check_budget(user_id)
+            if not can_proceed:
+                return jsonify({
+                    'error': budget_msg or 'Monthly token budget exceeded',
+                    'budget_exceeded': True,
+                }), 429
+        except Exception as budget_err:
+            current_app.logger.warning(f"Inquire budget check failed for user {user_id}: {budget_err}")
         
         # Enhanced query processing with enrichment and debugging
         def create_status_response(status, message):
@@ -291,6 +303,8 @@ Use proper markdown formatting including headings (##), bold (**text**), bullet 
                             yield response
                         return
                         
+                except TokenBudgetExceeded:
+                    raise
                 except Exception as e:
                     app.logger.warning(f"Router failed, defaulting to RAG: {e}")
                 
@@ -379,6 +393,8 @@ Respond with only a JSON array of strings: ["term1", "term2", ...]"""
                     # Combine original query with enriched terms for search
                     search_queries = [user_message] + enriched_terms[:3]  # Use original + top 3 enriched terms
                     
+                except TokenBudgetExceeded:
+                    raise
                 except Exception as e:
                     app.logger.warning(f"Query enrichment failed, using original query: {e}")
                     search_queries = [user_message]
@@ -677,7 +693,25 @@ Order your response with notes from the most recent meetings first. Always use p
                 in_thinking = False
                 thinking_buffer = ""
                 
+                rag_model_name = get_chat_config().get('model_name') or os.environ.get('CHAT_MODEL')
                 for chunk in stream:
+                    if hasattr(chunk, 'usage') and chunk.usage:
+                        try:
+                            cached_tokens, cache_write_tokens = extract_cache_tokens(chunk.usage)
+                            token_tracker.record_usage(
+                                user_id=user_id,
+                                operation_type='chat',
+                                prompt_tokens=chunk.usage.prompt_tokens,
+                                completion_tokens=chunk.usage.completion_tokens,
+                                total_tokens=chunk.usage.total_tokens,
+                                model_name=rag_model_name,
+                                cost=getattr(chunk.usage, 'cost', None),
+                                cached_tokens=cached_tokens,
+                                cache_write_tokens=cache_write_tokens,
+                            )
+                        except Exception as usage_err:
+                            app.logger.warning(f"Failed to record RAG streaming token usage: {usage_err}")
+
                     if not chunk.choices:
                         continue
                     content = chunk.choices[0].delta.content

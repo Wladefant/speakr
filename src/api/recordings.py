@@ -2997,6 +2997,14 @@ def upload_incognito():
             user=current_user
         )
 
+        if result.get('budget_exceeded'):
+            current_app.logger.warning(f"[Incognito] Budget exceeded for user {current_user.id}: {result['error']}")
+            return jsonify({
+                'incognito': True,
+                'error': result['error'],
+                'budget_exceeded': True,
+            }), 429
+
         if result.get('error'):
             current_app.logger.error(f"[Incognito] Transcription failed: {result['error']}")
             return jsonify({
@@ -3006,9 +3014,15 @@ def upload_incognito():
 
         # Optionally generate summary
         summary = None
+        summary_budget_exceeded = False
         if auto_summarize and result.get('transcription'):
+            from src.services.llm import TokenBudgetExceeded
             current_app.logger.info(f"[Incognito] Auto-summarize requested, generating summary...")
-            summary = generate_incognito_summary(result['transcription'], current_user)
+            try:
+                summary = generate_incognito_summary(result['transcription'], current_user)
+            except TokenBudgetExceeded as budget_err:
+                current_app.logger.warning(f"[Incognito] Auto-summary skipped due to token budget: {budget_err}")
+                summary_budget_exceeded = True
 
         # Build response
         # Render markdown to HTML for summary display
@@ -3026,7 +3040,8 @@ def upload_incognito():
             'processing_time_seconds': result.get('processing_time_seconds'),
             'created_at': datetime.utcnow().isoformat() + 'Z',
             'original_filename': original_filename,
-            'file_size': file_size
+            'file_size': file_size,
+            'summary_budget_exceeded': summary_budget_exceeded,
         }
 
         current_app.logger.info(f"[Incognito] Request completed successfully for user {current_user.id}")
@@ -3141,38 +3156,82 @@ Note: This is an incognito recording - no data is stored on the server.
             messages.extend(message_history)
         messages.append({"role": "user", "content": user_message})
 
-        # Get model info
-        chat_model = os.environ.get('TEXT_MODEL_NAME', os.environ.get('OPENAI_CHAT_MODEL', 'gpt-4o-mini'))
+        from src.services.llm import (
+            TokenBudgetExceeded,
+            call_chat_completion,
+            extract_cache_tokens,
+            get_chat_config,
+        )
+        from src.services.token_tracking import token_tracker
+
         user_id = current_user.id
+
+        # Enforce token budget up front before opening the SSE stream
+        try:
+            can_proceed, _usage_pct, budget_msg = token_tracker.check_budget(user_id)
+            if not can_proceed:
+                return jsonify({
+                    'error': budget_msg or 'Monthly token budget exceeded',
+                    'budget_exceeded': True,
+                }), 429
+        except Exception as budget_err:
+            current_app.logger.warning(f"[Incognito Chat] Budget check failed for user {user_id}: {budget_err}")
+
+        app_obj = current_app._get_current_object()
+        chat_max_tokens = int(os.environ.get("CHAT_MAX_TOKENS", "2000"))
+        chat_model = get_chat_config().get('model_name') or os.environ.get('TEXT_MODEL_NAME', 'gpt-4o-mini')
 
         current_app.logger.info(f"[Incognito Chat] User {user_id} sending message")
 
         def generate():
-            """Stream the chat response."""
-            try:
-                response = chat_client.chat.completions.create(
-                    model=chat_model,
-                    messages=messages,
-                    temperature=0.7,
-                    stream=True
-                )
+            """Stream the chat response while enforcing budgets and recording aggregate usage."""
+            with app_obj.app_context():
+                try:
+                    response = call_chat_completion(
+                        messages=messages,
+                        temperature=0.7,
+                        max_tokens=chat_max_tokens,
+                        stream=True,
+                        user_id=user_id,
+                        operation_type='chat',
+                    )
 
-                for chunk in response:
-                    if chunk.choices and len(chunk.choices) > 0:
-                        delta = chunk.choices[0].delta
-                        if hasattr(delta, 'content') and delta.content:
-                            yield f"data: {json.dumps({'content': delta.content})}\n\n"
+                    for chunk in response:
+                        if hasattr(chunk, 'usage') and chunk.usage:
+                            try:
+                                cached_tokens, cache_write_tokens = extract_cache_tokens(chunk.usage)
+                                token_tracker.record_usage(
+                                    user_id=user_id,
+                                    operation_type='chat',
+                                    prompt_tokens=chunk.usage.prompt_tokens,
+                                    completion_tokens=chunk.usage.completion_tokens,
+                                    total_tokens=chunk.usage.total_tokens,
+                                    model_name=chat_model,
+                                    cost=getattr(chunk.usage, 'cost', None),
+                                    cached_tokens=cached_tokens,
+                                    cache_write_tokens=cache_write_tokens,
+                                )
+                            except Exception as usage_err:
+                                app_obj.logger.warning(f"[Incognito Chat] Failed to record token usage: {usage_err}")
 
-                yield "data: [DONE]\n\n"
+                        if chunk.choices and len(chunk.choices) > 0:
+                            delta = chunk.choices[0].delta
+                            if hasattr(delta, 'content') and delta.content:
+                                yield f"data: {json.dumps({'content': delta.content})}\n\n"
 
-            except Exception as e:
-                current_app.logger.error(f"[Incognito Chat] Error during streaming: {e}")
-                # Provide more helpful error message for connection issues
-                error_msg = str(e).lower()
-                if 'connection' in error_msg or 'connect' in error_msg or 'refused' in error_msg:
-                    yield f"data: {json.dumps({'error': 'Could not connect to LLM server. Please check that your LLM service is running.'})}\n\n"
-                else:
-                    yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                    yield "data: [DONE]\n\n"
+
+                except TokenBudgetExceeded as e:
+                    app_obj.logger.warning(f"[Incognito Chat] Token budget exceeded for user {user_id}: {e}")
+                    yield f"data: {json.dumps({'error': str(e), 'budget_exceeded': True})}\n\n"
+                except Exception as e:
+                    app_obj.logger.error(f"[Incognito Chat] Error during streaming: {e}")
+                    # Provide more helpful error message for connection issues
+                    error_msg = str(e).lower()
+                    if 'connection' in error_msg or 'connect' in error_msg or 'refused' in error_msg:
+                        yield f"data: {json.dumps({'error': 'Could not connect to LLM server. Please check that your LLM service is running.'})}\n\n"
+                    else:
+                        yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
         return Response(generate(), mimetype='text/event-stream')
 
@@ -3197,6 +3256,7 @@ def generate_incognito_summary_endpoint():
     if not ENABLE_INCOGNITO_MODE:
         return jsonify({'error': 'Incognito mode is not enabled on this server'}), 403
 
+    from src.services.llm import TokenBudgetExceeded
     from src.tasks.processing import generate_incognito_summary
     from src.utils import md_to_html
 
@@ -3227,6 +3287,9 @@ def generate_incognito_summary_endpoint():
         else:
             return jsonify({'error': 'Failed to generate summary. Please check that your LLM service is running.'}), 503
 
+    except TokenBudgetExceeded as e:
+        current_app.logger.warning(f"[Incognito Summary] Token budget exceeded for user {current_user.id}: {e}")
+        return jsonify({'error': str(e), 'budget_exceeded': True}), 429
     except Exception as e:
         current_app.logger.error(f"[Incognito Summary] Error: {e}", exc_info=True)
         # Provide more helpful error message for connection issues
