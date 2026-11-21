@@ -371,13 +371,11 @@ def sso_unlink():
     return redirect(url_for('auth.account'))
 
 
-@auth_bp.route('/logout')
+@auth_bp.route('/logout', methods=['POST'])
 def logout():
-    # /logout is GET-only, so Flask-WTF's CSRF check (which runs only on
-    # state-changing methods) does not apply. No explicit exemption is
-    # needed. A future hardening pass should move logout to POST so a
-    # CSRF-redirected GET can't log a victim out, but that is a behaviour
-    # change deferred from this security release.
+    # POST-only so Flask-WTF CSRF protection prevents cross-site logout CSRF.
+    session.pop('sso_link_user_id', None)
+    session.pop('sso_link_state', None)
     logout_user()
     return redirect(url_for('auth.login'))
 

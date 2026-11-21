@@ -396,6 +396,9 @@ app.config['SESSION_COOKIE_SECURE'] = (
 )
 app.config['SESSION_COOKIE_HTTPONLY'] = True  # Still protect against XSS
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'  # CSRF protection
+app.config['REMEMBER_COOKIE_SECURE'] = app.config['SESSION_COOKIE_SECURE']
+app.config['REMEMBER_COOKIE_HTTPONLY'] = True
+app.config['REMEMBER_COOKIE_SAMESITE'] = 'Lax'
 if app.config['SESSION_COOKIE_SECURE']:
     app.logger.info("Session cookies marked Secure (HTTPS-only)")
 else:
@@ -534,6 +537,14 @@ def csrf_token_aware_check():
     # resolve the request's blueprint name through app.blueprints, the
     # same way Flask-WTF's own protect() hook does.
     if app.blueprints.get(request.blueprint) in csrf._exempt_blueprints:
+        # Blueprint-level CSRF exemptions (api_v1, webhooks) apply ONLY when the
+        # request authenticates with a valid API token. Browser/ambient session or
+        # remember_token cookies must still pass CSRF protection on state-changing
+        # requests.
+        from src.utils.token_auth import load_user_from_token
+        if load_user_from_token() is not None:
+            return
+        csrf.protect()
         return
 
     # View-level registration-time exemptions (e.g. share_target).
