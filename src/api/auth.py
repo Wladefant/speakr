@@ -7,6 +7,7 @@ and password changes.
 
 import os
 import re
+import secrets
 import mimetypes
 from flask import Blueprint, render_template, request, redirect, url_for, flash, jsonify, session, current_app
 from flask_login import login_user, logout_user, login_required, current_user
@@ -225,6 +226,8 @@ def login():
                                          action='verification_required',
                                          show_resend=True)
 
+                session.pop('sso_link_user_id', None)
+                session.pop('sso_link_state', None)
                 login_user(user, remember=form.remember.data)
                 next_page = request.args.get('next')
                 if not is_safe_url(next_page):
@@ -250,6 +253,10 @@ def login():
 @auth_bp.route('/auth/sso/login')
 @rate_limit("10 per minute")
 def sso_login():
+    # Direct SSO login must never inherit a stale account-linking session state.
+    session.pop('sso_link_user_id', None)
+    session.pop('sso_link_state', None)
+
     if not is_sso_enabled():
         flash('SSO is not configured. Please contact the administrator.', 'danger')
         return redirect(url_for('auth.login'))
@@ -271,6 +278,11 @@ def sso_login():
 @auth_bp.route('/auth/sso/callback')
 @rate_limit("20 per minute")
 def sso_callback():
+    # Always consume pending link state up front so failed callbacks never leave stale state behind.
+    link_user_id = session.pop('sso_link_user_id', None)
+    expected_link_state = session.pop('sso_link_state', None)
+    next_url = session.pop('sso_next', None)
+
     if not is_sso_enabled():
         flash('SSO is not configured. Please contact the administrator.', 'danger')
         return redirect(url_for('auth.login'))
@@ -293,12 +305,27 @@ def sso_callback():
         flash('SSO response did not include a subject identifier.', 'danger')
         return redirect(url_for('auth.login'))
 
-    link_user_id = session.pop('sso_link_user_id', None)
-    next_url = session.pop('sso_next', None)
     cfg = get_sso_config()
 
-    if link_user_id:
-        target_user = db.session.get(User, int(link_user_id))
+    if link_user_id is not None:
+        callback_state = request.args.get('state') or ''
+        try:
+            expected_uid = int(link_user_id)
+        except (TypeError, ValueError):
+            expected_uid = None
+
+        if (
+            not current_user.is_authenticated
+            or expected_uid is None
+            or current_user.id != expected_uid
+            or not expected_link_state
+            or not callback_state
+            or not secrets.compare_digest(str(expected_link_state), str(callback_state))
+        ):
+            flash('SSO account linking session is invalid or expired. Please try again.', 'danger')
+            return redirect(url_for('auth.login'))
+
+        target_user = db.session.get(User, expected_uid)
         if not target_user:
             flash('Could not link account: user not found.', 'danger')
             return redirect(url_for('auth.account'))
@@ -308,9 +335,13 @@ def sso_callback():
             flash('This SSO account is already linked to another user.', 'danger')
             return redirect(url_for('auth.account'))
 
+        try:
+            link_sso_to_existing_user(target_user, cfg.get('provider_name', 'SSO'), subject)
+        except ValueError as e:
+            flash(str(e), 'danger')
+            return redirect(url_for('auth.account'))
+
         update_user_profile_from_claims(target_user, userinfo)
-        target_user.sso_provider = cfg.get('provider_name', 'SSO')
-        target_user.sso_subject = subject
         db.session.commit()
         flash('SSO account linked successfully.', 'success')
         return redirect(url_for('auth.account'))
@@ -342,10 +373,24 @@ def sso_link():
         flash('SSO is not configured. Please contact the administrator.', 'danger')
         return redirect(url_for('auth.account'))
 
+    if current_user.sso_subject:
+        flash('Your account is already linked to an SSO identity.', 'warning')
+        return redirect(url_for('auth.account'))
+
+    oauth = get_sso_client() or init_sso_client(current_app)
+    if not oauth:
+        flash('Failed to initialize SSO client. Check server logs.', 'danger')
+        return redirect(url_for('auth.account'))
+
+    link_state = secrets.token_urlsafe(32)
     session['sso_link_user_id'] = current_user.id
+    session['sso_link_state'] = link_state
     session['sso_next'] = url_for('auth.account')
 
-    return redirect(url_for('auth.sso_login'))
+    return oauth.sso.authorize_redirect(
+        redirect_uri=get_sso_config().get('redirect_uri'),
+        state=link_state,
+    )
 
 
 @auth_bp.route('/auth/sso/unlink', methods=['POST'])
@@ -378,6 +423,8 @@ def logout():
     # needed. A future hardening pass should move logout to POST so a
     # CSRF-redirected GET can't log a victim out, but that is a behaviour
     # change deferred from this security release.
+    session.pop('sso_link_user_id', None)
+    session.pop('sso_link_state', None)
     logout_user()
     return redirect(url_for('auth.login'))
 
