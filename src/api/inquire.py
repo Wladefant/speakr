@@ -16,7 +16,7 @@ from werkzeug.utils import secure_filename
 from src.database import db
 from src.models import *
 from src.utils import *
-from src.services.embeddings import get_accessible_recording_ids, semantic_search_chunks, EMBEDDINGS_AVAILABLE
+from src.services.embeddings import get_accessible_recording_ids, get_visible_tags_for_user, semantic_search_chunks, EMBEDDINGS_AVAILABLE
 from src.services.llm import call_llm_completion, call_chat_completion, process_streaming_with_thinking, client, chat_client, TokenBudgetExceeded
 
 # Create blueprint
@@ -157,7 +157,10 @@ def inquire_search():
             results.append(result)
         
         return jsonify({'results': results})
-        
+
+    except TokenBudgetExceeded as e:
+        current_app.logger.warning(f"Token budget exceeded in inquire search for user {current_user.id}: {e}")
+        return jsonify({'error': str(e), 'budget_exceeded': True}), 429
     except Exception as e:
         current_app.logger.error(f"Error in inquire search: {e}")
         return jsonify({'error': str(e)}), 500
@@ -516,9 +519,9 @@ Respond with only a JSON array of strings: ["term1", "term2", ...]"""
                 # Build organized context pieces
                 context_pieces = []
                 
-                for recording_id, data in recording_chunks.items():
-                    recording = data['recording']
-                    chunks = data['chunks']
+                for recording_id, rec_data in recording_chunks.items():
+                    recording = rec_data['recording']
+                    chunks = rec_data['chunks']
                     
                     # Sort chunks by their index to maintain chronological order
                     chunks.sort(key=lambda x: x['chunk'].chunk_index)
@@ -574,8 +577,10 @@ Respond with only a JSON array of strings: ["term1", "term2", ...]"""
                 filter_description = []
                 with app.app_context():
                     if data.get('filter_tags'):
-                        tag_names = [tag.name for tag in Tag.query.filter(Tag.id.in_(data['filter_tags'])).all()]
-                        filter_description.append(f"tags: {', '.join(tag_names)}")
+                        visible_tags = get_visible_tags_for_user(user_id, data['filter_tags'])
+                        tag_names = [tag.name for tag in visible_tags]
+                        if tag_names:
+                            filter_description.append(f"tags: {', '.join(tag_names)}")
                 if data.get('filter_speakers'):
                     filter_description.append(f"speakers: {', '.join(data['filter_speakers'])}")
                 if data.get('filter_date_from') or data.get('filter_date_to'):

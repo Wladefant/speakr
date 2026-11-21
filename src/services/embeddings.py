@@ -158,6 +158,13 @@ def _api_embed(texts, user_id=None):
     if client is None or not texts:
         return []
 
+    from src.services.llm import TokenBudgetExceeded
+    if user_id is not None:
+        from src.services.token_tracking import token_tracker
+        allowed, _pct, err_msg = token_tracker.check_budget(user_id)
+        if not allowed:
+            raise TokenBudgetExceeded(err_msg or "Monthly token budget exceeded")
+
     kwargs = {'input': texts, 'model': EMBEDDING_MODEL}
     if EMBEDDING_DIMENSIONS is not None:
         kwargs['dimensions'] = EMBEDDING_DIMENSIONS
@@ -192,6 +199,8 @@ def _api_embed(texts, user_id=None):
 
             return [np.array(d.embedding, dtype=np.float32) for d in response.data]
 
+        except TokenBudgetExceeded:
+            raise
         except Exception as e:
             last_exc = e
             transient = _is_transient_embedding_error(e)
@@ -353,8 +362,111 @@ def get_accessible_recording_ids(user_id):
     return list(accessible_ids)
 
 
+def get_visible_tags_for_user(user_id, tag_ids=None):
+    """Return Tag rows visible to ``user_id`` (personal, user's group tags, or active share-reason tags)."""
+    from src.models import Tag, GroupMembership
 
-def process_recording_chunks(recording_id):
+    memberships = GroupMembership.query.filter_by(user_id=user_id).all()
+    user_group_ids = [m.group_id for m in memberships]
+
+    share_tag_ids = set()
+    if ENABLE_INTERNAL_SHARING:
+        share_rows = db.session.query(InternalShare.source_tag_id).filter(
+            InternalShare.shared_with_user_id == user_id,
+            InternalShare.source_tag_id.isnot(None),
+        ).all()
+        share_tag_ids = {row[0] for row in share_rows if row[0] is not None}
+
+    conditions = [
+        db.and_(Tag.user_id == user_id, Tag.group_id.is_(None)),
+    ]
+    if user_group_ids:
+        conditions.append(Tag.group_id.in_(user_group_ids))
+    if share_tag_ids:
+        conditions.append(Tag.id.in_(share_tag_ids))
+
+    query = Tag.query.filter(db.or_(*conditions))
+    if tag_ids is not None:
+        clean_ids = []
+        for tid in tag_ids:
+            try:
+                clean_ids.append(int(tid))
+            except (TypeError, ValueError):
+                continue
+        if not clean_ids:
+            return []
+        query = query.filter(Tag.id.in_(clean_ids))
+    return query.all()
+
+
+def _apply_visible_tag_filter(chunks_query, user_id, requested_tag_ids):
+    """Filter ``chunks_query`` (already joined to ``Recording``) by tags actually visible to ``user_id`` on each recording.
+
+    Prevents shared recipients from probing an owner's private/hidden tags on a shared recording.
+    Returns ``(filtered_query, has_any_visible_match_possible)``.
+    """
+    from src.models import Tag, GroupMembership
+
+    clean_ids = set()
+    for tid in requested_tag_ids or []:
+        try:
+            clean_ids.add(int(tid))
+        except (TypeError, ValueError):
+            continue
+    if not clean_ids:
+        return chunks_query, False
+
+    memberships = GroupMembership.query.filter_by(user_id=user_id).all()
+    user_group_ids = {m.group_id for m in memberships}
+
+    candidate_tags = Tag.query.filter(Tag.id.in_(clean_ids)).all()
+    own_allowed_tag_ids = set()
+    group_allowed_tag_ids = set()
+    for tag in candidate_tags:
+        if tag.group_id is None:
+            if tag.user_id == user_id:
+                own_allowed_tag_ids.add(tag.id)
+        elif tag.group_id in user_group_ids:
+            own_allowed_tag_ids.add(tag.id)
+            group_allowed_tag_ids.add(tag.id)
+
+    share_reason_pairs = set()
+    if ENABLE_INTERNAL_SHARING:
+        share_rows = db.session.query(
+            InternalShare.recording_id, InternalShare.source_tag_id
+        ).filter(
+            InternalShare.shared_with_user_id == user_id,
+            InternalShare.source_tag_id.in_(clean_ids),
+        ).all()
+        share_reason_pairs = {(r_id, t_id) for r_id, t_id in share_rows if t_id is not None}
+
+    visibility_clauses = []
+    if own_allowed_tag_ids:
+        visibility_clauses.append(
+            db.and_(Recording.user_id == user_id, RecordingTag.tag_id.in_(own_allowed_tag_ids))
+        )
+    if group_allowed_tag_ids:
+        visibility_clauses.append(
+            db.and_(Recording.user_id != user_id, RecordingTag.tag_id.in_(group_allowed_tag_ids))
+        )
+    if share_reason_pairs:
+        visibility_clauses.append(
+            db.or_(*[
+                db.and_(Recording.id == r_id, RecordingTag.tag_id == t_id)
+                for r_id, t_id in share_reason_pairs
+            ])
+        )
+
+    if not visibility_clauses:
+        return chunks_query, False
+
+    filtered = chunks_query.join(
+        RecordingTag, Recording.id == RecordingTag.recording_id
+    ).filter(db.or_(*visibility_clauses))
+    return filtered, True
+
+
+def process_recording_chunks(recording_id, raise_on_budget=False):
     """
     Process a recording by creating chunks and generating embeddings.
 
@@ -416,8 +528,14 @@ def process_recording_chunks(recording_id):
         return True
 
     except Exception as e:
-        current_app.logger.error(f"Error processing chunks for recording {recording_id}: {e}")
+        from src.services.llm import TokenBudgetExceeded
         db.session.rollback()
+        if isinstance(e, TokenBudgetExceeded):
+            current_app.logger.warning(f"Token budget exceeded while embedding recording {recording_id}: {e}")
+            if raise_on_budget:
+                raise
+            return False
+        current_app.logger.error(f"Error processing chunks for recording {recording_id}: {e}")
         return False
 
 
@@ -449,9 +567,9 @@ def basic_text_search_chunks(user_id, query, filters=None, top_k=5):
                 chunks_query = chunks_query.join(Recording)
 
             if filters.get('tag_ids'):
-                chunks_query = chunks_query.join(
-                    RecordingTag, Recording.id == RecordingTag.recording_id
-                ).filter(RecordingTag.tag_id.in_(filters['tag_ids']))
+                chunks_query, tag_ok = _apply_visible_tag_filter(chunks_query, user_id, filters['tag_ids'])
+                if not tag_ok:
+                    return []
 
             if filters.get('speaker_names'):
                 # Filter by the participants field on the recording.
@@ -581,9 +699,9 @@ def semantic_search_chunks(user_id, query, filters=None, top_k=5):
                 chunks_query = chunks_query.join(Recording)
 
             if filters.get('tag_ids'):
-                chunks_query = chunks_query.join(
-                    RecordingTag, Recording.id == RecordingTag.recording_id
-                ).filter(RecordingTag.tag_id.in_(filters['tag_ids']))
+                chunks_query, tag_ok = _apply_visible_tag_filter(chunks_query, user_id, filters['tag_ids'])
+                if not tag_ok:
+                    return []
 
             if filters.get('speaker_names'):
                 # Filter by the participants field on the recording.
@@ -666,6 +784,9 @@ def semantic_search_chunks(user_id, query, filters=None, top_k=5):
         return [(kept_chunks[i], float(similarities[i])) for i in order]
         
     except Exception as e:
+        from src.services.llm import TokenBudgetExceeded
+        if isinstance(e, TokenBudgetExceeded):
+            raise
         current_app.logger.error(f"Error in semantic search: {e}")
         return []
 
