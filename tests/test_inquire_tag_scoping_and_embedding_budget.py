@@ -116,7 +116,7 @@ def test_inquire_search_cannot_probe_hidden_owner_tags_and_chat_does_not_leak_fo
                 recording_id=rec.id,
                 owner_id=owner.id,
                 shared_with_user_id=recipient.id,
-                permission_level="view",
+                can_edit=False,
             )
             db.session.add(share)
             vec = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
