@@ -430,6 +430,7 @@ def test_api_embed_records_token_usage(api_emb):
     client.embeddings.create.return_value = resp
 
     tracker = MagicMock()
+    tracker.check_budget.return_value = (True, 10.0, None)
     fake_tt_mod = MagicMock(token_tracker=tracker)
     with app.app_context():
         with patch.object(api_emb, "get_embedding_api_client", return_value=client):
@@ -456,6 +457,7 @@ def test_api_embed_usage_tracking_failure_is_swallowed(api_emb):
     client.embeddings.create.return_value = resp
 
     tracker = MagicMock()
+    tracker.check_budget.return_value = (True, 10.0, None)
     tracker.record_usage.side_effect = RuntimeError("db down")
     fake_tt_mod = MagicMock(token_tracker=tracker)
     with app.app_context():

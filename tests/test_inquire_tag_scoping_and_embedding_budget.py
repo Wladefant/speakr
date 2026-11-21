@@ -54,7 +54,6 @@ def test_inquire_search_and_process_chunks_return_429_on_embedding_budget_exceed
                 user_id=user.id,
                 title="Budget Rec",
                 original_filename="b.mp3",
-                filename="b.mp3",
                 transcription="Sample transcript content for chunking.",
                 status="COMPLETED",
             )
@@ -102,7 +101,6 @@ def test_inquire_search_cannot_probe_hidden_owner_tags_and_chat_does_not_leak_fo
                 user_id=owner.id,
                 title="Shared Strategy",
                 original_filename="s.mp3",
-                filename="s.mp3",
                 transcription="Quarterly roadmap review discussion",
                 status="COMPLETED",
             )
