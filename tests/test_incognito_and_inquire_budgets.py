@@ -290,7 +290,7 @@ def test_incognito_transcription_records_canonical_provider_and_positive_fallbac
              patch("src.tasks.processing.chunking_service", fake_chunking), \
              patch("src.services.transcription.get_registry", return_value=fake_registry), \
              patch("src.tasks.processing.is_video_file", return_value=False), \
-             patch("src.tasks.processing.needs_conversion_for_connector", return_value=(False, None)), \
+             patch("src.tasks.processing.convert_if_needed", return_value=MagicMock(was_converted=False, output_path=str(audio_file), mime_type="audio/mpeg")), \
              patch("src.tasks.processing._generate_incognito_title", return_value="Test"):
             out = processing_module.transcribe_incognito(str(audio_file), "short.mp3", user=fake_user)
 
