@@ -53,10 +53,16 @@ export const showToast = (message, iconClass = 'fa-info-circle', duration = 3000
         fullIconClass = `fas ${iconClass}`;
     }
 
-    toast.innerHTML = `
-        <i class="${fullIconClass}" style="color: ${iconColor}"></i>
-        <span class="flex-1">${message}</span>
-    `;
+    const iconEl = document.createElement('i');
+    iconEl.className = fullIconClass;
+    iconEl.style.color = iconColor;
+
+    const messageEl = document.createElement('span');
+    messageEl.className = 'flex-1';
+    messageEl.textContent = message == null ? '' : String(message);
+
+    toast.appendChild(iconEl);
+    toast.appendChild(messageEl);
 
     // Make toast clickable to dismiss
     toast.style.cursor = 'pointer';

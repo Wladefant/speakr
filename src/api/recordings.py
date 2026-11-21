@@ -3247,8 +3247,8 @@ def delete_recording(recording_id):
         if not recording:
             return jsonify({'error': 'Recording not found'}), 404
 
-        # Check if the recording belongs to the current user
-        if recording.user_id and recording.user_id != current_user.id:
+        # Check if the recording belongs to the current user (admins may delete legacy unowned rows)
+        if recording.user_id != current_user.id and not (recording.user_id is None and current_user.is_admin):
             return jsonify({'error': 'You do not have permission to delete this recording'}), 403
 
         # Check deletion permissions (admin-only if USERS_CAN_DELETE is false)
@@ -4245,8 +4245,8 @@ def bulk_delete_recordings():
                     errors.append(f"Recording {recording_id} not found")
                     continue
 
-                # Check ownership
-                if recording.user_id and recording.user_id != current_user.id:
+                # Check ownership (admins may delete legacy unowned rows)
+                if recording.user_id != current_user.id and not (recording.user_id is None and current_user.is_admin):
                     errors.append(f"No permission for recording {recording_id}")
                     continue
 
@@ -4313,7 +4313,15 @@ def bulk_update_tags():
         if not tag:
             return jsonify({'error': 'Tag not found'}), 404
 
-        if tag.user_id != current_user.id and not tag.group_id:
+        group_membership = None
+        if tag.group_id:
+            group_membership = GroupMembership.query.filter_by(
+                group_id=tag.group_id,
+                user_id=current_user.id
+            ).first()
+            if not group_membership:
+                return jsonify({'error': 'No permission to use this tag'}), 403
+        elif tag.user_id != current_user.id:
             return jsonify({'error': 'No permission to use this tag'}), 403
 
         affected_ids = []
@@ -4326,6 +4334,10 @@ def bulk_update_tags():
 
                 # Check ownership or edit access
                 if not has_recording_access(recording, current_user, require_edit=True):
+                    continue
+
+                # Match single-tag group rules: only recording owner or group admin may apply/remove group tags
+                if tag.group_id and recording.user_id != current_user.id and group_membership.role != 'admin':
                     continue
 
                 if action == 'add':

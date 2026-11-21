@@ -156,8 +156,8 @@ def delete_event(event_id):
         if not event:
             return jsonify({'error': 'Event not found'}), 404
 
-        # Check permissions through recording access
-        if not has_recording_access(event.recording, current_user):
+        # Check permissions through recording access (deletion requires edit permission)
+        if not has_recording_access(event.recording, current_user, require_edit=True):
             return jsonify({'error': 'Unauthorized'}), 403
 
         db.session.delete(event)
