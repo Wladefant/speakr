@@ -566,7 +566,8 @@ def test_sso_callback_links_to_target_user(cleanup_users):
             s['_user_id'] = str(uid)
             s['_fresh'] = True
             s['sso_link_user_id'] = uid
-        resp = client.get('/auth/sso/callback')
+            s['sso_link_state'] = 'link-state-test'
+        resp = client.get('/auth/sso/callback?state=link-state-test')
         assert resp.status_code == 302
         assert '/account' in resp.headers['Location']
     refreshed = db.session.get(User, uid)
