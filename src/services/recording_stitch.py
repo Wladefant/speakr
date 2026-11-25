@@ -51,6 +51,7 @@ from typing import Tuple
 
 from src.database import db
 from src.models import RecordingSession, Recording
+from src.utils.ffmpeg_utils import decode_ffmpeg_output
 
 
 logger = logging.getLogger(__name__)
@@ -66,7 +67,7 @@ def _session_dir(upload_folder: str, session_id: str) -> str:
     return os.path.join(upload_folder, '_sessions', session_id)
 
 
-def _chunk_paths(session_dir: str) -> list:
+def session_chunk_paths(session_dir: str) -> list:
     """Return chunk file paths in monotonic order. ``chunk-NNNNNN.bin``
     naming sorts lexicographically by index because of the zero pad."""
     if not os.path.isdir(session_dir):
@@ -129,7 +130,7 @@ def _partition_into_segments(chunk_paths: list) -> list:
     return segments
 
 
-def _byte_join(chunk_paths: list, output_path: str) -> None:
+def byte_join(chunk_paths: list, output_path: str) -> None:
     """Raw byte concatenation in order, streamed for flat memory use."""
     with open(output_path, 'wb') as out:
         for p in chunk_paths:
@@ -144,7 +145,11 @@ def _remux_copy(src_path: str, output_path: str) -> None:
     losing the recording — logged loudly so it can be investigated."""
     cmd = [
         'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
-        '-i', src_path, '-c', 'copy', output_path,
+        '-i', src_path, '-c', 'copy',
+        # MP4 outputs (Safari MediaRecorder emits audio/mp4) must be
+        # pipe-streamable for the ASR webservice: moov first (#372).
+        *(['-movflags', '+faststart'] if output_path.lower().endswith(('.m4a', '.mp4', '.mov')) else []),
+        output_path,
     ]
     try:
         result = subprocess.run(cmd, capture_output=True, timeout=600)
@@ -155,7 +160,7 @@ def _remux_copy(src_path: str, output_path: str) -> None:
     except subprocess.TimeoutExpired:
         raise StitchError('ffmpeg remux timed out after 10 minutes')
     if result.returncode != 0:
-        stderr = (result.stderr.decode('utf-8', errors='replace') or '').strip()
+        stderr = decode_ffmpeg_output(result.stderr).strip()
         logger.warning(
             f"Remux failed (exit {result.returncode}): {stderr[:300]}; "
             "falling back to raw byte-joined stream"
@@ -175,7 +180,9 @@ def _concat_demux(segment_files: list, output_path: str, work_dir: str) -> None:
     cmd = [
         'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
         '-f', 'concat', '-safe', '0', '-i', manifest_path,
-        '-c', 'copy', output_path,
+        '-c', 'copy',
+        *(['-movflags', '+faststart'] if output_path.lower().endswith(('.m4a', '.mp4', '.mov')) else []),
+        output_path,
     ]
     try:
         result = subprocess.run(cmd, capture_output=True, timeout=600)
@@ -184,7 +191,7 @@ def _concat_demux(segment_files: list, output_path: str, work_dir: str) -> None:
     except subprocess.TimeoutExpired:
         raise StitchError('ffmpeg segment concat timed out after 10 minutes')
     if result.returncode != 0:
-        stderr = (result.stderr.decode('utf-8', errors='replace') or '').strip()
+        stderr = decode_ffmpeg_output(result.stderr).strip()
         raise StitchError(f'ffmpeg segment concat failed (exit {result.returncode}): {stderr[:500]}')
 
 
@@ -205,7 +212,7 @@ def _assemble_session_audio(chunk_paths: list, output_path: str, mime_type: str)
         segment_files = []
         for i, seg_chunks in enumerate(segments):
             seg_path = os.path.join(work_dir, f'segment-{i:04d}.bin')
-            _byte_join(seg_chunks, seg_path)
+            byte_join(seg_chunks, seg_path)
             segment_files.append(seg_path)
 
         if len(segment_files) == 1:
@@ -319,7 +326,7 @@ def stitch_recording_session(session_id: str) -> Tuple[int, str, dict]:
     upload_folder = current_app.config.get('UPLOAD_FOLDER') or '/data/uploads'
     sess_dir = _session_dir(upload_folder, session_id)
 
-    chunk_paths = _chunk_paths(sess_dir)
+    chunk_paths = session_chunk_paths(sess_dir)
     if not chunk_paths:
         raise StitchError(f'session {session_id} has no chunks on disk')
 
@@ -373,9 +380,10 @@ def stitch_recording_session(session_id: str) -> Tuple[int, str, dict]:
     # title — instead of a fabricated default being mistaken for a user
     # choice and AI titling getting skipped (the same class of bug fixed for
     # the share target in 482614c).
-    from src.utils.titles import resolve_upload_title
+    from src.utils.titles import resolve_upload_title, upload_title_source
     user_title = (metadata.get('title') or '').strip()
     recording.title = resolve_upload_title(user_title, final_filename)
+    recording.title_source = upload_title_source(user_title)
     recording.audio_path = final_path
     recording.original_filename = final_filename
     recording.file_size = file_size
@@ -482,6 +490,7 @@ def _try_kickoff_merge(recording, user_id, metadata) -> bool:
             source_ids,
             title=(intent.get('title') or None),
             delete_originals=bool(intent.get('delete_originals', False)),
+            remove_original_audio=bool(intent.get('remove_original_audio', False)),
             require_settled=False,
             notes_source_id=notes_source_id,
         )

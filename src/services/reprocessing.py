@@ -1,0 +1,118 @@
+"""Queue a transcription or summary again: the one way every route does it.
+
+Before #412 the web routes, API v1 (single and batch) and the bulk action each
+had their own copy: some cleared the old transcript, summary and events and
+some did not, and the API skipped the status, audio and transcription checks.
+Every reprocess path now calls these functions, so the checks, the clearing
+and the resolved settings are the same on all of them. The routes keep their
+own access checks and response shapes.
+"""
+
+from src.database import db
+from src.models import Event
+
+IN_PROGRESS = ('QUEUED', 'PROCESSING', 'SUMMARIZING')
+
+
+class ReprocessError(Exception):
+    """A reprocess request that cannot be queued; status is the HTTP status.
+
+    code is a server.apiError key (#477); message is its text in the
+    interface language, looked up when read (during the request).
+    """
+
+    def __init__(self, code, status=400):
+        super().__init__(code)
+        self.code = code
+        self.status = status
+
+    @property
+    def message(self):
+        from src.utils.localization import translate
+        return translate(f'server.apiError.{self.code}')
+
+
+def queue_transcription_reprocess(recording, user, overrides=None):
+    """Clear the transcript, summary and events and queue a new transcription.
+
+    overrides: per-request transcription settings (language, speaker counts,
+    hotwords, initial prompt, model); the rest comes from tag, folder, account
+    and admin defaults (resolve_transcription_params). The title is generated
+    again unless the user typed it (title_source). Returns the job id.
+    """
+    from src.services.job_queue import job_queue
+    from src.services.storage import get_storage_service
+    from src.services.transcription_defaults import resolve_transcription_params
+
+    if recording.audio_deleted_at or not recording.audio_path \
+            or not get_storage_service().exists(recording.audio_path):
+        raise ReprocessError('reprocess_audio_not_found', 404)
+    if recording.status in IN_PROGRESS:
+        raise ReprocessError('recording_already_processing', 400)
+
+    # Settings first: a lookup that raises after the clearing below has
+    # committed leaves a QUEUED recording with no job and no transcript,
+    # which nothing can reprocess ("already being processed") or reset.
+    params = resolve_transcription_params(recording, overrides or {})
+    params['user_id'] = user.id
+
+    recording.transcription = None
+    recording.summary = None
+    recording.status = 'QUEUED'
+    Event.query.filter_by(recording_id=recording.id).delete()
+    db.session.commit()
+
+    try:
+        return job_queue.enqueue(user_id=user.id, recording_id=recording.id,
+                                 job_type='reprocess_transcription', params=params)
+    except Exception as e:
+        # Same trap from the other side: the results are gone, so leave the
+        # recording FAILED, which the reprocess and reset routes accept.
+        db.session.rollback()
+        recording = db.session.get(type(recording), recording.id)
+        recording.status = 'FAILED'
+        from src.tasks.processing import _sanitize_error_message
+        recording.error_message = _sanitize_error_message(f'Could not queue reprocessing: {e}')
+        db.session.commit()
+        raise ReprocessError('reprocess_queue_failed', 503) from e
+
+
+def queue_summary_reprocess(recording, user, custom_prompt=None, prompt_mode='replace',
+                            prompt_variables=None, job_type='reprocess_summary'):
+    """Clear the summary and events and queue a new summary. Returns the job id.
+
+    custom_prompt replaces the resolved prompt, or is appended to it when
+    prompt_mode is 'append'. prompt_variables, when given, replace the
+    recording's template variables (sanitised as at upload).
+    """
+    from src.services import llm
+    from src.services.job_queue import job_queue
+    from src.utils.error_formatting import is_transcription_error
+    from src.utils.prompt_variables import sanitize_variable_values
+
+    if not recording.transcription or len(recording.transcription.strip()) < 10:
+        raise ReprocessError('no_transcription_for_summary', 400)
+    if is_transcription_error(recording.transcription):
+        raise ReprocessError('summary_blocked_transcription_failed', 400)
+    if recording.status in ('PROCESSING', 'SUMMARIZING'):
+        raise ReprocessError('recording_already_processing', 400)
+    if llm.client is None:
+        raise ReprocessError('summary_llm_not_configured', 503)
+
+    custom_prompt = (custom_prompt or '').strip() or None
+    mode = (prompt_mode or 'replace').strip().lower()
+    if mode not in ('replace', 'append'):
+        mode = 'replace'
+    if prompt_variables is not None:
+        recording.prompt_variables = sanitize_variable_values(prompt_variables)
+
+    recording.summary = None
+    Event.query.filter_by(recording_id=recording.id).delete()
+    db.session.commit()
+
+    params = {
+        'custom_prompt': custom_prompt,
+        'custom_prompt_append': bool(custom_prompt) and mode == 'append',
+        'user_id': user.id,
+    }
+    return job_queue.enqueue(user_id=user.id, recording_id=recording.id, job_type=job_type, params=params)

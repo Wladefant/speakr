@@ -10,11 +10,25 @@ When your Docker container refuses to start or immediately exits, the problem us
 
 If you see database connection errors, ensure your database file has proper permissions. The container runs as a specific user and needs read/write access to the data directories. On Linux systems, you might need to adjust ownership with `chown -R 1000:1000 ./uploads ./instance`.
 
+### "table user_new already exists" on Startup (Fixed in v0.10.5-alpha)
+
+Installations upgraded from a version older than v0.5.9-alpha may log `Could not migrate password column to nullable (may cause issues with SSO): table user_new already exists` on every startup, repeated once per worker process. The application otherwise runs normally, and no data is lost.
+
+The cause was a migration that rebuilt the whole user table to make one column nullable for SSO support. On those older databases the copy step failed, and because SQLite's Python driver does not wrap schema changes in a transaction, the temporary `user_new` table survived and blocked every later attempt. The practical consequence is that `user.password` stayed `NOT NULL`, so accounts without a local password, meaning SSO accounts, could not be created.
+
+Upgrade to v0.10.5-alpha or later. The migration now alters only the column it needs and removes the leftover table for you. **Do not delete `user_new` manually on an older version.** Doing so lets the old migration complete, and it rebuilds the user table from a column list frozen years earlier, discarding later settings such as token budgets, verification state and transcription hints.
+
 ### Can't Access the Web Interface
 
 When Speakr starts successfully but you can't reach the web interface, network configuration is usually the issue. First, verify the container is actually running with `docker ps`. Check that port 8899 is properly mapped - the docker-compose file should show `"8899:8899"` in the ports section.
 
 Firewall rules often block access, especially on cloud servers. Ensure port 8899 is open in your firewall, security groups (AWS), or network policies. If accessing from another machine, remember that `localhost` won't work - use the server's actual IP address or hostname.
+
+### Actions Fail Behind a Reverse Proxy with a Referer or Host Error
+
+Over HTTPS, Speakr's CSRF protection requires the browser's Referer header to match the host the server receives. If every action that changes something (reprocessing, resetting a status, saving) fails with HTTP 400 and a message naming the Referer header or two different host names, the reverse proxy is the cause. The server log shows a matching `CSRF validation failed` warning with both hosts.
+
+Two proxy settings produce this. The proxy may strip the Referer header, either directly or through a `Referrer-Policy: no-referrer` header it adds; use `strict-origin-when-cross-origin` or leave the header to Speakr. Alternatively, the proxy may forward a different Host header than the address in the browser (for example the container name); forward the original Host (in Nginx, `proxy_set_header Host $host;`) or set `X-Forwarded-Host`, and set `TRUSTED_PROXY_HOPS` to the number of proxies in front of Speakr. Reloading the page does not help with either, because every request fails the same check.
 
 ### Admin Login Fails
 
@@ -37,6 +51,8 @@ When recordings stay in "pending" or "queued" status indefinitely, check these c
 **Network connectivity**: The container needs to reach external API endpoints. If you're behind a corporate proxy, you'll need to configure proxy settings in your Docker environment.
 
 ### Transcription Fails Immediately
+
+A failed transcription is shown in place of the transcript, with the cause, a hint and a **Reprocess transcription** button. **Technical details** opens the error message returned by the transcription service; when you report a problem, copy it with the button beside it.
 
 Quick failures usually indicate API authentication problems. Double-check your API keys in the environment file. Remember that OpenAI and OpenRouter use different key formats. OpenAI keys start with "sk-" while OpenRouter keys look different. Ensure you're using the right key for your configured service.
 
@@ -100,6 +116,10 @@ Network speed affects transcription time since audio must upload to API services
 
 The choice of transcription model impacts speed. Whisper Large is more accurate but slower than Whisper Base. If speed matters more than perfect accuracy, consider using a smaller model through your API settings.
 
+### Slow Summaries and Titles With a Reasoning Model
+
+Models that reason before answering, such as Qwen3, GPT-5 or DeepSeek, can take many times longer than the answer alone requires, and on paid services the reasoning tokens are billed as output. Summaries and titles rarely benefit from long reasoning. Lower the reasoning effort or turn reasoning off with `TEXT_MODEL_EXTRA_BODY`, using the field your provider accepts; see [Provider-Specific Request Parameters](admin-guide/model-configuration.md#provider-specific-request-parameters). Compare the response time or the token counts in the [system statistics](admin-guide/statistics.md) before and after the change, since some local servers ignore fields they do not recognise.
+
 ### Recordings Stuck After Restart
 
 If Speakr crashed or restarted while recordings were processing, they automatically resume on next startup. The job queue persists to the database, so no uploads are lost. Check the logs for "Recovered orphaned jobs" messages confirming jobs were resumed.
@@ -137,7 +157,21 @@ Browser performance degrades with very large transcriptions. Recordings over 2 h
 
 Clear your browser cache if the interface gradually becomes slower over time. Speakr caches data locally for performance, but this cache can become corrupted. In Chrome or Firefox, hard refresh with Ctrl+Shift+R to reload fresh assets.
 
+### Blank Screens or Missing Text After Upgrading
+
+If the interface shows blank panels or raw translation keys (console messages like `Translation not found for key: ...`) right after upgrading the Docker image, your browser is serving cached assets from the previous version against the new pages. Clear the site data for your Speakr domain (in Chrome: DevTools → Application → Storage → Clear site data), or unregister the service worker and hard refresh.
+
+From v0.10.3-alpha onward this heals itself: each release installs a service worker with its own cache namespace, static assets are revalidated on load, and translation files are always fetched fresh, so an image upgrade can no longer strand a stale app shell. Upgrades from versions before v0.10.3-alpha may still need the one-time manual clear described above.
+
+### App Unresponsive While Media Plays or Chats Stream
+
+Since v0.10.4-alpha the stock image runs threaded gunicorn workers (3 processes x 8 threads), so streaming responses such as chat answers and audio or video playback no longer occupy one of only three request slots. If you override the container command, adopt `--worker-class gthread --threads 8` to get the same behavior. Behind nginx, `proxy_buffering on` helps further: nginx absorbs each response at local speed and feeds slow clients itself, freeing the application thread in seconds rather than for the duration of playback.
+
 ## Feature-Specific Issues
+
+### Chat Responses End Mid-Sentence
+
+If a chat or Inquire response stops abruptly with a note that the output token limit was reached, the model hit the configured `CHAT_MAX_TOKENS` ceiling (default 2000). This is common with reasoning models, whose hidden reasoning tokens share the same budget as the visible answer. Ask the model to continue from where it stopped, raise `CHAT_MAX_TOKENS` in your `.env`, or lower the model's reasoning effort with `TEXT_MODEL_EXTRA_BODY` (or `CHAT_MODEL_EXTRA_BODY` for a separate chat model), as described in [Provider-Specific Request Parameters](admin-guide/model-configuration.md#provider-specific-request-parameters). Before v0.10.3-alpha these truncated responses were displayed as if they had completed normally; they are now flagged explicitly.
 
 ### Speaker Identification Not Working
 
@@ -165,6 +199,7 @@ whisper-asr:
   image: learnedmachine/whisperx-asr-service:latest
   environment:
     - TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=true
+    - HF_HOME=/.cache  # keep model downloads in the cache volume
     # ... your other environment variables
 ```
 
@@ -178,6 +213,21 @@ docker compose up -d whisper-asr
 ```
 
 For more details, see the [WhisperX issue discussion](https://github.com/m-bain/whisperX/issues/1304).
+
+### Diarization Fails After Enabling Offline Mode (WhisperX ASR Service)
+
+If speaker diarization worked while online but fails with an error like this after setting `HF_HUB_OFFLINE=1`:
+
+```
+Speaker diarization failed: An error happened while trying to locate the file
+on the Hub and we cannot find the requested files in the local cache.
+```
+
+the pyannote diarization model was never stored in the cache volume. Unless `HF_HOME` is set, Hugging Face downloads go to `/root/.cache/huggingface` inside the container filesystem, so the model silently disappears whenever the container is recreated. Recreating the container is exactly what enabling offline mode requires, which is when the missing model surfaces.
+
+**Solution**: Add `HF_HOME=/.cache` to the ASR container's environment so it points at the mounted cache volume, remove `HF_HUB_OFFLINE=1` for now, and recreate the container. Run one transcription with diarization while online so the model downloads into the volume, then re-enable `HF_HUB_OFFLINE=1`. You can confirm the model is in the volume by checking for `/.cache/hub/models--pyannote--speaker-diarization-community-1` inside the container.
+
+Images newer than v0.4.0 of the WhisperX ASR service set `HF_HOME=/.cache` by default, so this only affects v0.4.0 and earlier deployments configured without it.
 
 ### WhisperX Shows UNKNOWN_SPEAKER
 

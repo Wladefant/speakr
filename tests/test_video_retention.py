@@ -129,11 +129,10 @@ class TestUploadHandlerVideoRetention(unittest.TestCase):
             cls.content = f.read()
 
     def test_upload_handler_parses_keep_audio_only_form_field(self):
-        """The new per-upload `keep_audio_only` form field is parsed at
-        the top of the upload handler. Without this parse, the override
-        is silently ignored."""
+        """The shared upload core parses the `keep_audio_only` form field.
+        Without this parse, the per-upload override is silently ignored."""
         self.assertIn(
-            "request.form.get('keep_audio_only', 'false').lower() == 'true'",
+            "form.get('keep_audio_only', 'false').lower() == 'true'",
             self.content,
         )
         self.assertIn('keep_audio_only_flag', self.content)
@@ -261,20 +260,20 @@ class TestSendFileConditional(unittest.TestCase):
     def test_recordings_streaming_has_conditional(self):
         """Streaming send_file in recordings.py has conditional=True."""
         content = self._read_file('src/api/recordings.py')
-        self.assertIn('return send_file(delivery.local_path, mimetype=recording.mime_type, conditional=True)', content)
+        self.assertIn('send_file(delivery.local_path, mimetype=serve_mime, conditional=True)', content)
 
     def test_recordings_download_has_conditional(self):
         """Download send_file in recordings.py has conditional=True."""
         content = self._read_file('src/api/recordings.py')
         self.assertIn('as_attachment=True,', content)
         self.assertIn('download_name=download_name,', content)
-        self.assertIn('mimetype=recording.mime_type,', content)
+        self.assertIn('mimetype=serve_mime,', content)
         self.assertIn('conditional=True,', content)
 
     def test_shares_has_conditional(self):
         """send_file in shares.py has conditional=True."""
         content = self._read_file('src/api/shares.py')
-        self.assertIn('send_file(delivery.local_path, mimetype=(recording.mime_type or delivery.mimetype), conditional=True)', content)
+        self.assertIn('send_file(delivery.local_path, mimetype=serve_mime, conditional=True)', content)
 
 
 class TestFrontendTemplates(unittest.TestCase):

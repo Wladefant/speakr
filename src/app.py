@@ -1,7 +1,7 @@
 # Speakr - Audio Transcription and Summarization App
 import os
 import sys
-from flask import Flask, render_template, request, jsonify, send_file, redirect, url_for, flash, Response, make_response
+from flask import Flask, render_template, request, jsonify, send_file, redirect, url_for, flash, Response, make_response, session
 from urllib.parse import urlparse, urljoin, quote
 from email.utils import encode_rfc2231
 from markupsafe import Markup
@@ -11,7 +11,6 @@ from openai import OpenAI # Keep using the OpenAI library
 import json
 from werkzeug.utils import secure_filename
 from werkzeug.exceptions import RequestEntityTooLarge
-from werkzeug.middleware.proxy_fix import ProxyFix
 from sqlalchemy import select
 from sqlalchemy.orm import joinedload
 import threading
@@ -20,7 +19,6 @@ import httpx
 import re
 import subprocess
 import mimetypes
-import markdown
 import bleach
 
 # Add common audio MIME type mappings that might be missing
@@ -33,7 +31,7 @@ mimetypes.add_type('audio/ogg', '.ogg')
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from flask_bcrypt import Bcrypt
 from flask_wtf import FlaskForm
-from flask_wtf.csrf import CSRFProtect
+from flask_wtf.csrf import CSRFProtect, CSRFError
 from wtforms import StringField, PasswordField, SubmitField, BooleanField
 from wtforms.validators import DataRequired, Length, Email, EqualTo, ValidationError
 from flask_limiter import Limiter
@@ -43,6 +41,7 @@ import logging
 import secrets
 import time
 from src.audio_chunking import AudioChunkingService, ChunkProcessingError, ChunkingNotSupportedError
+from src.utils.localization import api_error, format_number, translate
 
 # Optional imports for embedding functionality
 try:
@@ -160,29 +159,24 @@ root_logger.addHandler(handler)
 markdown_logger = logging.getLogger('MARKDOWN')
 markdown_logger.setLevel(logging.WARNING)
 
-# --- Initialize Markdown Once (Performance Optimization) ---
-# Create a single reusable Markdown instance to avoid reinitializing extensions on every call
-_markdown_instance = markdown.Markdown(extensions=[
-    'fenced_code',      # Fenced code blocks
-    'tables',           # Table support
-    'attr_list',        # Attribute lists
-    'def_list',         # Definition lists
-    'footnotes',        # Footnotes
-    'abbr',             # Abbreviations
-    'codehilite',       # Syntax highlighting for code blocks
-    'smarty'            # Smart quotes, dashes, etc.
-])
-
 # --- Rate Limiting Setup (will be configured after app creation) ---
 # RATELIMIT_ENABLED (default true) lets the test suite and any deployment that
 # fronts its own rate limiting turn Flask-Limiter off. The per-endpoint auth
 # limits (login/register/password-reset) are applied via the rate_limit
 # decorator in src/api/auth.py and src/api/tokens.py.
 _RATELIMIT_ENABLED = os.environ.get('RATELIMIT_ENABLED', 'true').lower() != 'false'
+def _token_request_exempt():
+    # Token traffic has per-token limits (src/utils/token_auth.require_scope);
+    # the app-wide per-IP defaults apply to session traffic only (mailr spec G1).
+    from src.utils.token_auth import is_token_request
+    return is_token_request()
+
+
 limiter = Limiter(
     get_remote_address,
     app=None,  # Defer initialization
     default_limits=["5000 per day", "1000 per hour"],
+    default_limits_exempt_when=_token_request_exempt,
     enabled=_RATELIMIT_ENABLED,
 )
 
@@ -249,6 +243,40 @@ def has_recording_access(recording, user, require_edit=False, require_reshare=Fa
 
     # User has at least view access
     return True
+
+
+def editable_recording_ids(recordings, user, share_map):
+    """has_recording_access(..., require_edit=True) for a page of recordings.
+
+    share_map is {recording_id: InternalShare} of the user's shares for these
+    recordings. Returns the ids the user may edit, with one query in all for
+    the group-admin rule instead of one per row (D#483).
+    """
+    editable = {r.id for r in recordings if r.user_id == user.id}
+    if not ENABLE_INTERNAL_SHARING:
+        return editable
+    needs_admin = []
+    for recording in recordings:
+        share = share_map.get(recording.id)
+        if recording.id in editable or not share:
+            continue
+        if share.can_edit:
+            editable.add(recording.id)
+        else:
+            needs_admin.append(recording.id)
+    if needs_admin:
+        editable.update(rid for (rid,) in db.session.query(RecordingTag.recording_id).join(
+            Tag, RecordingTag.tag_id == Tag.id
+        ).join(
+            GroupMembership, Tag.group_id == GroupMembership.group_id
+        ).filter(
+            RecordingTag.recording_id.in_(needs_admin),
+            GroupMembership.user_id == user.id,
+            GroupMembership.role == 'admin',
+            Tag.group_id.isnot(None),
+            db.or_(Tag.auto_share_on_apply == True, Tag.share_with_group_lead == True)
+        ).distinct())
+    return editable
 
 
 def get_user_recording_status(recording, user):
@@ -351,6 +379,8 @@ def enrich_recording_dict_with_user_status(recording_dict, recording, user):
     user_inbox, user_highlighted = get_user_recording_status(recording, user)
     recording_dict['is_inbox'] = user_inbox
     recording_dict['is_highlighted'] = user_highlighted
+    from src.services.recording_state import get_user_archived
+    recording_dict['is_archived'] = get_user_archived(recording, user)
     return recording_dict
 
 
@@ -360,6 +390,13 @@ app = Flask(__name__,
 # Use environment variables or default paths for Docker compatibility
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('SQLALCHEMY_DATABASE_URI', 'sqlite:////data/instance/transcriptions.db')
 app.config['UPLOAD_FOLDER'] = os.environ.get('UPLOAD_FOLDER', '/data/uploads')
+
+# Static files ship with no Cache-Control by default, which lets browsers
+# apply heuristic freshness (often days/weeks for rarely-changed files).
+# After an image upgrade that served users a mix of new templates and stale
+# JS/locale JSON — a blank UI with "Translation not found" spam (issue #357).
+# max-age=0 forces a cheap conditional revalidation (304 unless changed).
+app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 
 # SQLite concurrency settings for multi-worker job queue
 if 'sqlite' in app.config['SQLALCHEMY_DATABASE_URI']:
@@ -371,19 +408,48 @@ if 'sqlite' in app.config['SQLALCHEMY_DATABASE_URI']:
         'pool_pre_ping': True  # Verify connections before use
     }
 # MAX_CONTENT_LENGTH will be set dynamically after database initialization
-# Set a secret key for session management and CSRF protection
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'default-dev-key-change-in-production')
+# Set a secret key for session management and CSRF protection.
+
+# The old code fell back to a hardcoded constant when SECRET_KEY was unset.
+# That key signs the session cookie AND itsdangerous password-reset tokens,
+# so a publicly-known value lets anyone forge a session cookie for any
+# user_id (instant admin takeover) and mint valid reset tokens. resolve_secret_key
+# refuses the known-bad default and, when nothing is configured, auto-generates
+# a strong per-deployment key and persists it — so a self-hoster who never sets
+# the env var is secure by default instead of silently exploitable. (The key
+# only signs sessions/tokens; it does not encrypt stored data, so a lost key
+# means a one-time re-login, never data loss.)
+from src.utils.security import resolve_secret_key as _resolve_secret_key
+
+try:
+    _secret_key, _secret_key_action = _resolve_secret_key(
+        os.environ.get('SECRET_KEY'),
+        app.config['SQLALCHEMY_DATABASE_URI'],
+        key_file=os.environ.get('SECRET_KEY_FILE') or None,
+    )
+except ValueError as _sk_exc:
+    raise RuntimeError(str(_sk_exc))
+app.config['SECRET_KEY'] = _secret_key
+if _secret_key_action == 'generated':
+    app.logger.warning(
+        "SECRET_KEY was not set; generated a strong random key and persisted "
+        "it under the instance directory. It is included in a normal data-volume "
+        "backup; set SECRET_KEY explicitly for multi-host or key-rotation setups."
+    )
+elif _secret_key_action == 'ephemeral':
+    app.logger.error(
+        "SECRET_KEY not set and an auto-generated key could not be persisted. "
+        "Using an ephemeral key: sessions will not survive a restart. Set "
+        "SECRET_KEY to fix this."
+    )
 
 # Apply ProxyFix to handle headers from a reverse proxy (like Nginx or Caddy)
 # This is crucial for request.is_secure to work correctly behind an SSL-terminating proxy.
-trusted_proxy_hops = int(os.environ.get('TRUSTED_PROXY_HOPS', '1'))
-app.wsgi_app = ProxyFix(
-    app.wsgi_app, 
-    x_for=trusted_proxy_hops, 
-    x_proto=trusted_proxy_hops, 
-    x_host=trusted_proxy_hops, 
-    x_prefix=trusted_proxy_hops
-)
+# TRUSTED_PROXY_HOPS is the hop count; TRUSTED_PROXIES, when set, limits the
+# forwarded headers to requests from those peers (#498, #501).
+from src.utils.proxy import TrustedProxyMiddleware, log_proxy_trust
+app.wsgi_app = TrustedProxyMiddleware(app.wsgi_app)
+log_proxy_trust()
 
 # --- Secure Session Cookie Configuration ---
 # Default is False so http://localhost / LAN deployments continue to
@@ -396,6 +462,59 @@ app.config['SESSION_COOKIE_SECURE'] = (
 )
 app.config['SESSION_COOKIE_HTTPONLY'] = True  # Still protect against XSS
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'  # CSRF protection
+
+# Remember-me cookie (#437). Flask-Login's defaults are a 365-day cookie with
+# no Secure flag and no SameSite attribute. It now follows the session
+# cookie's Secure setting, is SameSite=Lax, and lasts REMEMBER_COOKIE_DAYS
+# (default 30) from the sign-in. It is set only when "Remember me" is ticked:
+# REMEMBER_COOKIE_REFRESH_EACH_REQUEST stays off, because with it Flask-Login
+# sets the cookie on every response for every signed-in user.
+app.config['REMEMBER_COOKIE_SECURE'] = app.config['SESSION_COOKIE_SECURE']
+app.config['REMEMBER_COOKIE_HTTPONLY'] = True
+app.config['REMEMBER_COOKIE_SAMESITE'] = 'Lax'
+try:
+    _remember_days = max(1, int(os.environ.get('REMEMBER_COOKIE_DAYS', '30')))
+except ValueError:
+    _remember_days = 30
+app.config['REMEMBER_COOKIE_DURATION'] = timedelta(days=_remember_days)
+
+# --- Security response headers ---
+# Set at the app level so a deployment WITHOUT a hardening reverse proxy is
+# still protected (previously the app set only X-Robots-Tag, leaving direct /
+# plain-proxy deployments with no clickjacking, MIME-sniffing, or CSP defense).
+# All are `setdefault`-applied in add_security_headers so an operator's proxy
+# can still override them.
+#
+# CSP note: the frontend loads Vue's full build (in-DOM template compiler, so
+# script execution needs 'unsafe-eval') and bootstraps from inline <script>
+# blocks in every template ('unsafe-inline'), so the script-src cannot be
+# locked down without a frontend build step that precompiles templates and
+# adds per-response nonces. The policy still meaningfully constrains object-src,
+# base-uri, form-action, frame-ancestors, and the connect/img/media/font
+# origins. Override the whole policy via CONTENT_SECURITY_POLICY, or disable
+# the block with SECURITY_HEADERS_ENABLED=false.
+SECURITY_HEADERS_ENABLED = os.environ.get('SECURITY_HEADERS_ENABLED', 'true').lower() == 'true'
+_DEFAULT_CSP = (
+    "default-src 'self'; "
+    "script-src 'self' 'unsafe-inline' 'unsafe-eval'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data: blob:; "
+    "media-src 'self' blob: data:; "
+    "font-src 'self' data:; "
+    "connect-src 'self'; "
+    "worker-src 'self' blob:; "
+    "manifest-src 'self'; "
+    "object-src 'none'; "
+    "base-uri 'self'; "
+    "form-action 'self'; "
+    "frame-ancestors 'self'"
+)
+CONTENT_SECURITY_POLICY = os.environ.get('CONTENT_SECURITY_POLICY', _DEFAULT_CSP).strip()
+# HSTS is only meaningful (and only emitted) over HTTPS. Configurable so
+# operators terminating TLS elsewhere can tune or disable it.
+HSTS_HEADER_VALUE = os.environ.get(
+    'HSTS_HEADER', 'max-age=63072000; includeSubDomains'
+).strip()
 if app.config['SESSION_COOKIE_SECURE']:
     app.logger.info("Session cookies marked Secure (HTTPS-only)")
 else:
@@ -407,6 +526,10 @@ else:
 # Import database instance from extracted module
 from src.database import db
 db.init_app(app)
+
+# updated_at and tombstones for API clients (mailr spec G2)
+from src.services.recording_changes import register_change_tracking
+register_change_tracking()
 
 # Import all models from extracted modules
 from src.models import (
@@ -438,9 +561,6 @@ from src.services.retention import (
     is_recording_exempt_from_deletion, get_retention_days_for_recording, process_auto_deletion
 )
 from src.services.calendar import generate_ics_content, escape_ical_text
-from src.services.speaker import (
-    update_speaker_usage, identify_speakers_from_text, identify_unidentified_speakers_from_text
-)
 
 # Import background task functions
 from src.tasks.processing import (
@@ -459,7 +579,54 @@ login_manager.login_view = 'auth.login'
 login_manager.login_message_category = 'info'
 bcrypt = Bcrypt()
 bcrypt.init_app(app)
-limiter.init_app(app)  # Initialize the limiter (uses in-memory storage by default)
+# Rate-limit headers, including Retry-After on 429 (mailr spec G1).
+app.config.setdefault("RATELIMIT_HEADERS_ENABLED", True)
+# The default in-memory storage counts in each gunicorn worker separately, so
+# every limit is in effect multiplied by the number of workers. A shared
+# backend (redis:// with the bundled client; memcached:// needs pymemcache)
+# makes the limits exact (#484).
+# While that backend is unreachable, counting falls back to memory instead of
+# failing the request.
+if os.environ.get("RATELIMIT_STORAGE_URI"):
+    app.config.setdefault("RATELIMIT_STORAGE_URI", os.environ["RATELIMIT_STORAGE_URI"])
+    app.config.setdefault("RATELIMIT_IN_MEMORY_FALLBACK_ENABLED", True)
+limiter.init_app(app)
+
+
+from flask_limiter.errors import RateLimitExceeded as _RateLimitExceeded
+
+
+@app.errorhandler(_RateLimitExceeded)
+def _rate_limit_exceeded(e):
+    """The limiter's own 429 response, plus Retry-After in seconds (mailr spec G1)."""
+    import time as _time
+    resp = e.get_response()
+    retry = None
+    try:
+        current = limiter.current_limit
+        if current is not None:
+            retry = max(1, int(current.reset_at - _time.time()))
+    except Exception:
+        retry = None
+    if retry is None:
+        try:
+            retry = int(e.limit.limit.get_expiry())
+        except Exception:
+            retry = 60
+    from src.utils.token_auth import is_token_request, user_rate_key
+    if is_token_request():
+        # API clients get JSON that says which budget ran out: the token's own
+        # or the one all tokens of the account share (#484).
+        from flask import jsonify
+        account = getattr(e.limit, 'key_func', None) is user_rate_key
+        resp = jsonify({
+            'error': e.description,
+            'code': 'account_rate_limit_exceeded' if account else 'token_rate_limit_exceeded',
+            'limit': str(e.limit.limit),
+        })
+        resp.status_code = 429
+    resp.headers["Retry-After"] = str(retry)
+    return resp
 
 # Exempt frequently-polled status endpoints from rate limiting
 @limiter.request_filter
@@ -505,6 +672,25 @@ app.config['WTF_CSRF_CHECK_DEFAULT'] = False
 
 
 @app.before_request
+def refuse_query_token_writes():
+    """?token= is deprecated and read-only (#500).
+
+    resolve_request_token() ignores a token supplied only as ?token= on any
+    method other than GET and HEAD. Such a request is answered here with 401
+    and a clear error, before the CSRF check and before any view runs. A
+    browser session takes precedence over a token, as in Flask-Login.
+    """
+    if not request.endpoint or request.endpoint == 'static' or session.get('_user_id'):
+        return
+    from src.utils.token_auth import query_token_refused
+    if query_token_refused():
+        resp = jsonify(api_error('query_token_read_only'))
+        resp.status_code = 401
+        resp.headers['WWW-Authenticate'] = 'Bearer error="invalid_request"'
+        return resp
+
+
+@app.before_request
 def csrf_token_aware_check():
     """Per-request CSRF check that allows valid header-only API tokens
     to bypass CSRF, without ever mutating Flask-WTF's exemption set.
@@ -533,8 +719,14 @@ def csrf_token_aware_check():
     # Note that csrf._exempt_blueprints holds Blueprint OBJECTS, so we
     # resolve the request's blueprint name through app.blueprints, the
     # same way Flask-WTF's own protect() hook does.
+    #
+    # These exemptions exist for token clients. A request that carries a
+    # browser session or remember-me cookie is signed in by that cookie,
+    # so it still needs a CSRF token here, which the web UI sends (#478).
     if app.blueprints.get(request.blueprint) in csrf._exempt_blueprints:
-        return
+        remember_cookie = app.config.get('REMEMBER_COOKIE_NAME', 'remember_token')
+        if not session.get('_user_id') and remember_cookie not in request.cookies:
+            return
 
     # View-level registration-time exemptions (e.g. share_target).
     # Flask-WTF identifies exempt views by f"{__module__}.{__name__}";
@@ -559,25 +751,182 @@ def csrf_token_aware_check():
     csrf.protect()
 
 
+@app.before_request
+def enforce_token_scopes():
+    """Scoped API tokens (mailr spec G1), checked before any view runs.
+
+    Sessions and full tokens (scopes NULL, every token made before scopes) pass
+    unchanged. A scoped token must come from a header, may only reach routes
+    marked with require_scope, and must hold every scope the route needs.
+    A refused request therefore has no side effect and fires no webhook.
+    """
+    if not request.endpoint or request.endpoint == 'static':
+        return
+    if session.get('_user_id'):
+        return  # a browser session takes precedence over a token, as in Flask-Login
+    from src.utils.token_auth import resolve_request_token, scope_error_response
+    api_token, via_query = resolve_request_token()
+    if api_token is None or api_token.scope_set is None:
+        return
+    if via_query:
+        resp = jsonify({'error': translate('server.apiError.scoped_token_header_only'),
+                        'code': 'invalid_token'})
+        resp.status_code = 401
+        return resp
+    view = app.view_functions.get(request.endpoint)
+    required = getattr(view, '_required_scopes', None)
+    if required is None:
+        return scope_error_response(None, api_token)
+    missing = required - api_token.scope_set
+    if missing:
+        return scope_error_response(missing, api_token)
+
+
+
+def _csrf_rejection_message(reason):
+    """Turn a Flask-WTF CSRFError description into something an admin can act on.
+
+    Token failures (missing, expired, mismatched) are fixed by reloading the
+    page. The two referrer failures are not: Flask-WTF checks the Referer
+    header on every HTTPS request, so a proxy that strips it or rewrites the
+    Host header makes every POST fail, however often the token is refreshed
+    (issue #388). Those get a message that names the proxy setting.
+    """
+    if 'referrer header is missing' in reason:
+        return False, translate('server.apiError.csrf_referrer_missing')
+    if 'referrer does not match' in reason:
+        referrer_host = urlparse(request.referrer or '').netloc
+        if not referrer_host:
+            return False, translate('server.apiError.csrf_referrer_mismatch_unknown', host=request.host)
+        return False, translate('server.apiError.csrf_referrer_mismatch',
+                                referrerHost=referrer_host, host=request.host)
+    return True, translate('server.apiError.csrf_session_expired')
+
+
+@app.errorhandler(CSRFError)
+def handle_csrf_error(error):
+    """Answer fetch/XHR callers with JSON that says why CSRF validation failed.
+
+    Flask-WTF's default is an HTML 400 page. The frontend cannot tell a
+    referrer failure from an expired token in that page, so it refreshes the
+    token, retries, fails again and shows a generic error, while the server
+    logs nothing. Browser form posts still get the HTML page.
+    """
+    reason = error.description or ''
+    retryable, message = _csrf_rejection_message(reason.lower())
+    app.logger.warning(
+        'CSRF validation failed for %s %s: %s (Referer host: %s, request host: %s, scheme: %s)',
+        request.method, request.path, reason,
+        urlparse(request.referrer or '').netloc or '-', request.host, request.scheme,
+    )
+    is_form_navigation = (
+        request.mimetype in ('application/x-www-form-urlencoded', 'multipart/form-data')
+        and 'text/html' in request.headers.get('Accept', '')
+    )
+    if is_form_navigation:
+        return error
+    return jsonify({
+        'error': message,
+        'csrf_reason': reason,
+        'csrf_retryable': retryable,
+    }), 400
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def handle_request_entity_too_large(_error):
+    """Keep oversized requests JSON-shaped even when parsing fails early."""
+    limit_mb = float(app.config['MAX_CONTENT_LENGTH']) / (1024 * 1024)
+    return jsonify({
+        **api_error('file_too_large_max', maxSize=format_number(limit_mb)),
+        'max_size_mb': limit_mb,
+        'effective_limit_mb': limit_mb,
+        'audio_only_mode': False,
+    }), 413
+
+
 # Add context processor to make 'now' available to all templates
 @app.context_processor
 def inject_now():
     return {'now': datetime.now()}
 
+# Expose the app version to templates so the service worker registration URL
+# (and therefore its cache namespace) changes on every release, forcing the
+# browser to install the new worker and refetch the app shell (issue #357).
+_app_version = get_version()
+
+@app.context_processor
+def inject_app_version():
+    return {'app_version': _app_version}
+
+from src.utils.i18n_bootstrap import i18n_bootstrap as _i18n_bootstrap
+
+@app.context_processor
+def inject_i18n_bootstrap():
+    """Translations embedded in pages that load i18n.js (includes/i18n_bootstrap.html)."""
+    return {'i18n_bootstrap': _i18n_bootstrap}
+
+@app.context_processor
+def inject_account_theme():
+    """The theme saved with the signed-in user's account (D#419), for
+    includes/theme_account.html. None for a visitor who is not signed in."""
+    from flask import has_request_context
+    from flask_login import current_user
+    if not has_request_context() or not current_user.is_authenticated:
+        return {'account_theme': None}
+    return {'account_theme': {'dark': current_user.theme_dark_mode,
+                              'scheme': current_user.theme_color_scheme}}
+
+
+@app.context_processor
+def inject_inquire_mode_flag():
+    """The shared header shows the Inquire button on every page."""
+    return {'inquire_mode_enabled': ENABLE_INQUIRE_MODE}
+
+
+@app.context_processor
+def inject_help_center_link():
+    """Optional custom help link in the user menu (#371).
+
+    Admins hosting their own FAQ/tutorial page set HELP_CENTER_URL (and
+    optionally HELP_CENTER_LABEL) to surface it prominently for users.
+    """
+    return {
+        'help_center_url': os.environ.get('HELP_CENTER_URL', '').strip(),
+        'help_center_label': os.environ.get('HELP_CENTER_LABEL', '').strip(),
+    }
+
+@app.context_processor
+def inject_registration_flag():
+    """The login page offers the register link only when /register accepts (#479)."""
+    from src.api.auth import registration_enabled
+    return {'registration_enabled': registration_enabled()}
+
 @app.context_processor
 def inject_group_admin_status():
-    """Inject is_group_admin flag into all templates."""
+    """Inject is_group_admin flag and the admin-group list into all templates.
+
+    user_admin_groups feeds the shared tag/folder modals (group assignment
+    dropdown), which render on the account page AND the main app now that
+    tags/folders can be created inline from the upload dialog.
+    """
     from flask_login import current_user
     from src.models.organization import GroupMembership
 
-    is_group_admin = False
+    user_admin_groups = []
     if current_user.is_authenticated:
-        is_group_admin = GroupMembership.query.filter_by(
+        memberships = GroupMembership.query.filter_by(
             user_id=current_user.id,
             role='admin'
-        ).first() is not None
+        ).all()
+        user_admin_groups = [
+            {'id': m.group.id, 'name': m.group.name}
+            for m in memberships if m.group
+        ]
 
-    return {'is_group_admin': is_group_admin}
+    return {
+        'is_group_admin': bool(user_admin_groups),
+        'user_admin_groups': user_admin_groups,
+    }
 
 # Ensure upload and instance directories exist
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
@@ -591,7 +940,18 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 # --- User loader for Flask-Login ---
 @login_manager.user_loader
 def load_user(user_id):
-    return db.session.get(User, int(user_id))
+    # "<id>" or "<id>:<session_version>" (see User.get_id). A sign-in made
+    # before the password was last set carries an older version and is
+    # refused (#437).
+    uid, _, version = str(user_id).partition(':')
+    try:
+        user = db.session.get(User, int(uid))
+        version = int(version or 0)
+    except ValueError:
+        return None
+    if user is None or (user.session_version or 0) != version:
+        return None
+    return user
 
 
 @login_manager.request_loader
@@ -604,6 +964,42 @@ def load_user_from_request(request):
     """
     from src.utils.token_auth import load_user_from_token
     return load_user_from_token()
+
+
+@login_manager.unauthorized_handler
+def handle_unauthorized():
+    """API requests get a JSON 401; browser page loads keep the login redirect.
+
+    Flask-Login's default is a 302 to /login for everything. Nearly every
+    HTTP client follows redirects and treats the resulting 200 text/html
+    login page as success, so integrations with a missing/invalid/expired
+    token "pass" their connection checks and fail later with confusing
+    JSON parse errors — or worse, report an upload as successful after the
+    redirect silently dropped the multipart body (issue #333).
+
+    A request is API-shaped when it targets an /api/ path or presented an
+    API token in any of the forms token_auth accepts; a token client
+    deserves a 401 whichever path it hits.
+    """
+    presented_token = bool(
+        request.headers.get('Authorization', '').startswith('Bearer ')
+        or request.headers.get('X-API-Token')
+        or request.headers.get('API-Token')
+        or request.args.get('token')
+    )
+    if request.path.startswith('/api/') or presented_token:
+        response = jsonify(api_error('authentication_required'))
+        response.status_code = 401
+        response.headers['WWW-Authenticate'] = 'Bearer'
+        return response
+
+    # Browser page load: replicate Flask-Login's default behavior
+    # (flash the login message, redirect to the login view with ?next=).
+    from flask_login.utils import login_url as _login_url
+    if login_manager.login_message:
+        from src.utils.localization import translate
+        flash(translate('server.flash.loginRequired'), category=login_manager.login_message_category)
+    return redirect(_login_url(url_for(login_manager.login_view), request.url))
 
 
 # --- Embedding and Chunking Utilities ---
@@ -625,6 +1021,7 @@ from src.api.initial_prompt_templates import initial_prompt_templates_bp
 from src.api.events import events_bp, init_events_helpers
 from src.api.system import system_bp, init_system_helpers
 from src.api.push_notifications import push_bp
+from src.api.notifications import notifications_bp
 from src.api.api_v1 import api_v1_bp, init_api_v1_helpers
 from src.api.recording_sessions import recording_sessions_bp
 from src.api.webhooks import webhooks_bp
@@ -642,7 +1039,7 @@ client, chunking_service, version = initialize_config(app)
 init_auth_extensions(bcrypt, csrf, limiter)
 init_tokens_helpers(bcrypt, csrf, limiter)
 init_shares_helpers(has_recording_access)
-init_recordings_helpers(has_recording_access=has_recording_access, get_user_recording_status=get_user_recording_status, set_user_recording_status=set_user_recording_status, enrich_recording_dict_with_user_status=enrich_recording_dict_with_user_status, bcrypt=bcrypt, csrf=csrf, limiter=limiter, chunking_service=chunking_service)
+init_recordings_helpers(has_recording_access=has_recording_access, editable_recording_ids=editable_recording_ids, get_user_recording_status=get_user_recording_status, set_user_recording_status=set_user_recording_status, enrich_recording_dict_with_user_status=enrich_recording_dict_with_user_status, bcrypt=bcrypt, csrf=csrf, limiter=limiter, chunking_service=chunking_service)
 init_tags_helpers(has_recording_access=has_recording_access, bcrypt=bcrypt, csrf=csrf, limiter=limiter)
 init_folders_helpers(has_recording_access=has_recording_access, bcrypt=bcrypt, csrf=csrf, limiter=limiter)
 init_groups_helpers(has_recording_access=has_recording_access, bcrypt=bcrypt, csrf=csrf, limiter=limiter)
@@ -672,8 +1069,9 @@ app.register_blueprint(initial_prompt_templates_bp)
 app.register_blueprint(events_bp)
 app.register_blueprint(system_bp)
 app.register_blueprint(push_bp)
+app.register_blueprint(notifications_bp)
 app.register_blueprint(api_v1_bp)
-csrf.exempt(api_v1_bp)  # API v1 uses token auth, not CSRF
+csrf.exempt(api_v1_bp)  # token clients only; browser sessions still need CSRF (#478)
 
 # Recording sessions (#287 c/d): the streaming client POSTs binary chunk
 # bodies via fetch with the session cookie. CSRF tokens are easy to attach
@@ -711,6 +1109,39 @@ def add_no_crawl_headers(response):
     This provides defense-in-depth alongside robots.txt and meta tags.
     """
     response.headers['X-Robots-Tag'] = 'noindex, nofollow, noarchive, nosnippet, noimageindex'
+    return response
+
+
+@app.after_request
+def add_query_token_deprecation_header(response):
+    """Mark responses to requests that sent an API token as ?token= (#500)."""
+    from src.utils.token_auth import query_token_used
+    if query_token_used():
+        response.headers['Deprecation'] = 'true'
+    return response
+
+
+@app.after_request
+def add_security_headers(response):
+    """Set baseline security headers so the app is safe even without a
+    hardening reverse proxy. Uses setdefault so a proxy that already sets a
+    header wins (no duplicates). See the SECURITY_HEADERS config block above.
+    """
+    if not SECURITY_HEADERS_ENABLED:
+        return response
+    response.headers.setdefault('X-Frame-Options', 'SAMEORIGIN')
+    response.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    response.headers.setdefault('Referrer-Policy', 'strict-origin-when-cross-origin')
+    # Deny sensors the app never uses; allow mic + screen capture (recording).
+    response.headers.setdefault(
+        'Permissions-Policy',
+        'geolocation=(), camera=(), microphone=(self), display-capture=(self), interest-cohort=()'
+    )
+    if CONTENT_SECURITY_POLICY:
+        response.headers.setdefault('Content-Security-Policy', CONTENT_SECURITY_POLICY)
+    # HSTS only over HTTPS (request.is_secure reflects X-Forwarded-Proto via ProxyFix).
+    if HSTS_HEADER_VALUE and request.is_secure:
+        response.headers.setdefault('Strict-Transport-Security', HSTS_HEADER_VALUE)
     return response
 
 # --- No-Crawl System: Serve robots.txt ---

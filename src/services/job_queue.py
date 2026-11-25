@@ -73,6 +73,8 @@ class FairJobQueue:
         self._last_user_id_summary = None
         # Lock for claiming jobs (SQLite doesn't support row-level locking)
         self._claim_lock = threading.Lock()
+        # Whether this process won the queue-owner election (see startup.initialize_job_queue)
+        self._is_owner = False
         self._initialized = True
 
         logger.info(f"FairJobQueue initialized: {TRANSCRIPTION_WORKERS} transcription workers, {SUMMARY_WORKERS} summary workers")
@@ -90,9 +92,20 @@ class FairJobQueue:
         else:
             yield
 
+    def mark_as_owner(self):
+        """Mark this process as the elected owner of the queue."""
+        self._is_owner = True
+
     def start(self):
         """Start the worker threads for both queues."""
         if self._running:
+            return
+
+        # Only the elected owner runs workers; this also covers the auto-start in enqueue()
+        if not self._is_owner:
+            logger.debug(
+                "Not the job queue owner; no worker threads started in this process"
+            )
             return
 
         self._running = True
@@ -283,6 +296,9 @@ class FairJobQueue:
             'payment required',
             'quota exceeded',
             'insufficient funds',
+            # A paid submission with no clear outcome (Tencent ASR); only a
+            # reprocess, which starts a new job, submits it again.
+            'had no clear outcome',
             'model not found',
             'invalid model',
             'unsupported format',
@@ -366,8 +382,36 @@ class FairJobQueue:
                 except Exception as e:
                     logger.warning(f"Webhook emit on job {job_id} completion failed: {e}")
 
+                # Email notification (#386), independent of webhooks so a user
+                # can have one without the other. Also best-effort: an SMTP
+                # server that is down must not fail a completed job.
+                try:
+                    self._emit_completion_email(job_type, recording_id)
+                except Exception as e:
+                    logger.warning(f"Completion email for job {job_id} failed: {e}")
+
             except Exception as e:
                 error_str = str(e)
+                # A failed flush (for example on a recording deleted while
+                # the job ran) leaves the session unusable until it is rolled
+                # back; without this every query below raised
+                # PendingRollbackError (#432).
+                try:
+                    db.session.rollback()
+                except Exception:
+                    pass
+
+                if db.session.get(Recording, recording_id) is None:
+                    # Deleted while the job ran: nothing to retry or report
+                    logger.info(f"Job {job_id}: recording {recording_id} was deleted while the job ran; job dropped")
+                    job = db.session.get(ProcessingJob, job_id)
+                    if job:
+                        job.status = 'failed'
+                        job.error_message = 'Recording deleted while the job ran'
+                        job.completed_at = datetime.utcnow()
+                        db.session.commit()
+                    return
+
                 logger.error(f"Job {job_id} failed: {e}", exc_info=True)
 
                 # Check if this is a permanent error that shouldn't be retried
@@ -398,9 +442,14 @@ class FairJobQueue:
                         if recording:
                             # Keep the recording with FAILED status so user can see the error and fix settings
                             recording.status = 'FAILED'
-                            # Format the error for nice display
+                            # Format the error for nice display. A failed summary
+                            # job keeps the transcript and shows the error as the
+                            # summary; it used to overwrite a good transcript (#412).
                             from src.utils.error_formatting import format_error_for_storage
-                            recording.transcription = format_error_for_storage(error_str)
+                            if job_type in ('summarize', 'reprocess_summary'):
+                                recording.summary = format_error_for_storage(error_str)
+                            else:
+                                recording.transcription = format_error_for_storage(error_str)
 
                         if is_permanent_error:
                             logger.error(f"Job {job_id} failed permanently (non-retryable error)")
@@ -415,6 +464,11 @@ class FairJobQueue:
                             self._emit_failure_webhook(job_type, recording_id, error_str)
                         except Exception as e:
                             logger.warning(f"Webhook emit on job {job_id} failure failed: {e}")
+
+                        try:
+                            self._emit_failure_email(job_type, recording_id, error_str)
+                        except Exception as e:
+                            logger.warning(f"Failure email for job {job_id} failed: {e}")
 
                     db.session.commit()
 
@@ -541,6 +595,19 @@ class FairJobQueue:
         if not session_id:
             raise ValueError("stitch job missing required 'session_id' param")
 
+        # The session must point at this recording, and both must belong to
+        # the same user. Otherwise the job is dropped without touching the
+        # recording: raising would mark another user's recording FAILED (#505).
+        # A missing session is left to stitch_recording_session, as before.
+        from src.models import RecordingSession
+        from src.database import db
+        sess = db.session.get(RecordingSession, session_id)
+        if sess is not None and (sess.finalized_recording_id != recording.id
+                                 or sess.user_id != recording.user_id):
+            logger.error(f"Stitch job {job.id}: session {session_id} does not belong to "
+                         f"recording {recording.id}; job dropped")
+            return
+
         try:
             recording_id, final_path, metadata = stitch_recording_session(session_id)
         except StitchError as e:
@@ -640,7 +707,7 @@ class FairJobQueue:
 
             db.session.commit()
 
-            # Auto-start workers if not running
+            # Auto-start workers if not running (no-op unless this process owns the queue)
             if not self._running:
                 self.start()
 
@@ -764,11 +831,13 @@ class FairJobQueue:
 
     # --- Webhook emission helpers (#275) ---------------------------------
 
+    # recording.summary.completed is emitted by the summary step itself
+    # (processing.generate_summary_only_task, #412): a summary job can end with
+    # a FAILED summary, and the first summary of an upload runs inside the
+    # transcribe job, so the job type alone cannot say whether a summary exists.
     _COMPLETION_EVENT_MAP = {
         'transcribe': 'recording.transcription.completed',
-        'summarize': 'recording.summary.completed',
         'reprocess_transcription': 'recording.transcription.completed',
-        'reprocess_summary': 'recording.summary.completed',
     }
 
     _FAILURE_EVENT_MAP = {
@@ -824,19 +893,65 @@ class FairJobQueue:
             recording = db.session.get(Recording, recording_id)
             if not recording:
                 return
+            # Both of these were documented from #275 and neither was ever
+            # sent. audio_duration_seconds read `recording.audio_duration`,
+            # which is not a column, and `language` read a per-recording
+            # language that did not exist either. getattr's default made both
+            # None and the None-filter below then dropped the keys.
+            #
+            # The language is now recorded at transcription time from what the
+            # service reports, so it describes this audio rather than the
+            # user's current preference. It stays absent for recordings
+            # transcribed before that column existed, and for backends that
+            # report no language.
             data = {
                 'recording_id': recording.id,
                 'title': recording.title,
-                'language': getattr(recording, 'transcription_language', None),
-                'audio_duration_seconds': getattr(recording, 'audio_duration', None),
-                'transcription_duration_seconds': getattr(recording, 'transcription_duration_seconds', None),
-                'summarization_duration_seconds': getattr(recording, 'summarization_duration_seconds', None),
+                'language': recording.transcription_language,
+                'audio_duration_seconds': recording.audio_duration_seconds,
+                'transcription_duration_seconds': recording.transcription_duration_seconds,
+                'summarization_duration_seconds': recording.summarization_duration_seconds,
             }
             emit_webhook_event(
                 user_id=recording.user_id,
                 event_type=event_type,
                 data={k: v for k, v in data.items() if v is not None},
             )
+
+    # Only transcription reaches the inbox. A summary finishing is not an
+    # event a user waits on the way they wait on a transcript, and mailing
+    # both would double the volume for no extra signal.
+    _EMAIL_JOB_TYPES = ('transcribe', 'reprocess_transcription')
+
+    def _load_recording_and_owner(self, recording_id: int):
+        from src.database import db
+        from src.models import Recording, User
+        recording = db.session.get(Recording, recording_id)
+        if not recording:
+            return None, None
+        return recording, db.session.get(User, recording.user_id)
+
+    def _emit_completion_email(self, job_type: str, recording_id: int):
+        if job_type not in self._EMAIL_JOB_TYPES:
+            return
+        with self._app_context():
+            from src.services.email import send_transcription_complete_email
+            recording, owner = self._load_recording_and_owner(recording_id)
+            if not recording or not owner:
+                return
+            if send_transcription_complete_email(owner, recording):
+                logger.info(f"Sent completion email for recording {recording_id} to user {owner.id}")
+
+    def _emit_failure_email(self, job_type: str, recording_id: int, error: str):
+        if job_type not in self._EMAIL_JOB_TYPES:
+            return
+        with self._app_context():
+            from src.services.email import send_transcription_failed_email
+            recording, owner = self._load_recording_and_owner(recording_id)
+            if not recording or not owner:
+                return
+            if send_transcription_failed_email(owner, recording, error):
+                logger.info(f"Sent failure email for recording {recording_id} to user {owner.id}")
 
     def _emit_failure_webhook(self, job_type: str, recording_id: int, error: str):
         event_type = self._FAILURE_EVENT_MAP.get(job_type)

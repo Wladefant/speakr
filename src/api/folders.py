@@ -6,6 +6,7 @@ Folders are one-to-many (a recording can only belong to one folder).
 """
 
 import os
+import re
 from datetime import datetime
 from flask import Blueprint, request, jsonify, current_app
 from flask_login import login_required, current_user
@@ -14,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 
 from src.database import db
 from src.models import *
+from src.utils.localization import api_error
 
 # Create blueprint
 folders_bp = Blueprint('folders', __name__)
@@ -38,6 +40,53 @@ def init_folders_helpers(**kwargs):
     limiter = kwargs.get('limiter')
 
 
+# Folder.name is String(50) and Folder.color is String(7). SQLite does not
+# enforce VARCHAR lengths and PostgreSQL rejects an over-long value with a
+# DataError at commit, so both are checked here (#512).
+FOLDER_NAME_MAX_LENGTH = 50
+DEFAULT_FOLDER_COLOR = '#10B981'
+_FOLDER_COLOR_RE = re.compile(r'#[0-9A-Fa-f]{6}')
+_CONTROL_CHARS_RE = re.compile(r'[\x00-\x1f\x7f]')
+
+
+def _clean_folder_name(value):
+    """Return (name, None) for a valid folder name, else (None, error key)."""
+    if not isinstance(value, str) or not value.strip():
+        return None, 'folder_name_required'
+    if _CONTROL_CHARS_RE.search(value):
+        return None, 'folder_name_invalid'
+    name = value.strip()
+    if len(name) > FOLDER_NAME_MAX_LENGTH:
+        return None, 'folder_name_too_long'
+    return name, None
+
+
+def _clean_folder_color(value):
+    """Return (color, None) for #RRGGBB or a missing value, else (None, error key)."""
+    if value is None:
+        return DEFAULT_FOLDER_COLOR, None
+    if isinstance(value, str) and _FOLDER_COLOR_RE.fullmatch(value):
+        return value, None
+    return None, 'folder_color_invalid'
+
+
+def _folder_name_error(error_key):
+    if error_key == 'folder_name_too_long':
+        return jsonify(api_error(error_key, max=FOLDER_NAME_MAX_LENGTH)), 400
+    return jsonify(api_error(error_key)), 400
+
+
+def _name_taken_key(name, group_id, group_key):
+    """Error key for a folder write that lost on a unique index.
+
+    The pre-checks catch the common case; this runs when two writes race
+    or when the creator's own (name, user_id) constraint is what refused it.
+    """
+    if group_id and Folder.query.filter_by(name=name, group_id=group_id).first():
+        return group_key
+    return 'folder_name_exists'
+
+
 # --- Routes ---
 
 @folders_bp.route('/api/folders', methods=['GET'])
@@ -50,7 +99,9 @@ def get_folders():
         return jsonify([])
 
     # Get user's personal folders
-    user_folders = Folder.query.filter_by(user_id=current_user.id, group_id=None).order_by(Folder.name).all()
+    from src.services.recording_list import folder_dicts, folder_load_options
+    user_folders = (Folder.query.filter_by(user_id=current_user.id, group_id=None)
+                    .options(*folder_load_options()).order_by(Folder.name).all())
 
     # Get user's team memberships with roles
     memberships = GroupMembership.query.filter_by(user_id=current_user.id).all()
@@ -60,21 +111,23 @@ def get_folders():
     # Get group folders for all teams the user is a member of
     team_folders = []
     if team_ids:
-        team_folders = Folder.query.filter(Folder.group_id.in_(team_ids)).order_by(Folder.name).all()
+        team_folders = (Folder.query.filter(Folder.group_id.in_(team_ids))
+                        .options(*folder_load_options()).order_by(Folder.name).all())
 
     # Build response with edit permissions
     result = []
+    dicts = dict(zip([f.id for f in user_folders + team_folders], folder_dicts(user_folders + team_folders)))
 
     # Personal folders - user can always edit their own
     for folder in user_folders:
-        folder_dict = folder.to_dict()
+        folder_dict = dicts[folder.id]
         folder_dict['can_edit'] = True
         folder_dict['user_role'] = None
         result.append(folder_dict)
 
     # Group folders - only admins can edit
     for folder in team_folders:
-        folder_dict = folder.to_dict()
+        folder_dict = dicts[folder.id]
         user_role = team_roles.get(folder.group_id, 'member')
         folder_dict['can_edit'] = (user_role == 'admin')
         folder_dict['user_role'] = user_role
@@ -90,12 +143,18 @@ def create_folder():
     # Check if folders feature is enabled
     folders_enabled = SystemSetting.get_setting('enable_folders', False)
     if not folders_enabled:
-        return jsonify({'error': 'Folders feature is not enabled'}), 403
+        return jsonify(api_error('folders_disabled')), 403
 
-    data = request.get_json()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify(api_error('folder_name_required')), 400
 
-    if not data or not data.get('name'):
-        return jsonify({'error': 'Folder name is required'}), 400
+    name, error_key = _clean_folder_name(data.get('name'))
+    if error_key:
+        return _folder_name_error(error_key)
+    color, error_key = _clean_folder_color(data.get('color'))
+    if error_key:
+        return jsonify(api_error(error_key)), 400
 
     group_id = data.get('group_id')
 
@@ -107,17 +166,17 @@ def create_folder():
         ).first()
 
         if not membership or membership.role != 'admin':
-            return jsonify({'error': 'Only group admins can create group folders'}), 403
+            return jsonify(api_error('group_folder_create_admin_only')), 403
 
         # Check if group folder with same name already exists for this group
-        existing_folder = Folder.query.filter_by(name=data['name'], group_id=group_id).first()
+        existing_folder = Folder.query.filter_by(name=name, group_id=group_id).first()
         if existing_folder:
-            return jsonify({'error': 'A folder with this name already exists for this group'}), 400
+            return jsonify(api_error('folder_name_exists_for_group')), 400
     else:
         # Check if personal folder with same name already exists for this user
-        existing_folder = Folder.query.filter_by(name=data['name'], user_id=current_user.id, group_id=None).first()
+        existing_folder = Folder.query.filter_by(name=name, user_id=current_user.id, group_id=None).first()
         if existing_folder:
-            return jsonify({'error': 'Folder with this name already exists'}), 400
+            return jsonify(api_error('folder_name_exists')), 400
 
     # Handle retention_days: -1 means protected from deletion
     retention_days = data.get('retention_days')
@@ -132,21 +191,22 @@ def create_folder():
     if naming_template_id:
         template = NamingTemplate.query.filter_by(id=naming_template_id, user_id=current_user.id).first()
         if not template:
-            return jsonify({'error': 'Naming template not found'}), 404
+            return jsonify(api_error('naming_template_not_found')), 404
 
     # Validate export_template_id if provided
     export_template_id = data.get('export_template_id')
     if export_template_id:
         template = ExportTemplate.query.filter_by(id=export_template_id, user_id=current_user.id).first()
         if not template:
-            return jsonify({'error': 'Export template not found'}), 404
+            return jsonify(api_error('export_template_not_found')), 404
 
     folder = Folder(
-        name=data['name'],
+        name=name,
         user_id=current_user.id,
         group_id=group_id,
-        color=data.get('color', '#10B981'),
+        color=color,
         custom_prompt=data.get('custom_prompt'),
+        title_prompt=data.get('title_prompt'),
         default_language=data.get('default_language'),
         default_min_speakers=data.get('default_min_speakers'),
         default_max_speakers=data.get('default_max_speakers'),
@@ -165,10 +225,11 @@ def create_folder():
 
     try:
         db.session.commit()
-    except IntegrityError as e:
+    except IntegrityError:
+        # A duplicate name is a refused request, not an application error (#511).
         db.session.rollback()
-        current_app.logger.error(f"Folder creation failed due to integrity constraint: {str(e)}")
-        return jsonify({'error': 'A folder with this name already exists'}), 400
+        current_app.logger.info("Folder create refused: the name is already in use")
+        return jsonify(api_error(_name_taken_key(name, group_id, 'folder_name_exists_for_group'))), 400
 
     return jsonify(folder.to_dict()), 201
 
@@ -180,11 +241,11 @@ def update_folder(folder_id):
     # Check if folders feature is enabled
     folders_enabled = SystemSetting.get_setting('enable_folders', False)
     if not folders_enabled:
-        return jsonify({'error': 'Folders feature is not enabled'}), 403
+        return jsonify(api_error('folders_disabled')), 403
 
     folder = db.session.get(Folder, folder_id)
     if not folder:
-        return jsonify({'error': 'Folder not found'}), 404
+        return jsonify(api_error('folder_not_found')), 404
 
     # Check permissions
     if folder.group_id:
@@ -195,24 +256,36 @@ def update_folder(folder_id):
         ).first()
 
         if not membership or membership.role != 'admin':
-            return jsonify({'error': 'Only group admins can edit group folders'}), 403
+            return jsonify(api_error('group_folder_edit_admin_only')), 403
     else:
         # Personal folder - must be the owner
         if folder.user_id != current_user.id:
-            return jsonify({'error': 'You do not have permission to edit this folder'}), 403
+            return jsonify(api_error('folder_edit_denied')), 403
 
-    data = request.get_json()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        data = {}
 
     if 'name' in data:
-        # Check if new name conflicts with another folder
-        if folder.group_id:
-            existing_folder = Folder.query.filter_by(name=data['name'], group_id=folder.group_id).filter(Folder.id != folder_id).first()
+        # A stored name from before the length check (#512) can be sent back
+        # unchanged with the rest of the form.
+        if isinstance(data['name'], str) and data['name'].strip() == folder.name:
+            new_name = folder.name
         else:
-            existing_folder = Folder.query.filter_by(name=data['name'], user_id=current_user.id).filter(Folder.id != folder_id).first()
+            new_name, error_key = _clean_folder_name(data['name'])
+            if error_key:
+                return _folder_name_error(error_key)
+
+        # Check if new name conflicts with another folder. Personal names
+        # are unique among the user's personal folders only (#513).
+        if folder.group_id:
+            existing_folder = Folder.query.filter_by(name=new_name, group_id=folder.group_id).filter(Folder.id != folder_id).first()
+        else:
+            existing_folder = Folder.query.filter_by(name=new_name, user_id=current_user.id, group_id=None).filter(Folder.id != folder_id).first()
 
         if existing_folder:
-            return jsonify({'error': 'Another folder with this name already exists'}), 400
-        folder.name = data['name']
+            return jsonify(api_error('folder_rename_conflict')), 400
+        folder.name = new_name
 
     # Handle group_id changes (converting between personal and group folders)
     if 'group_id' in data:
@@ -226,14 +299,19 @@ def update_folder(folder_id):
             ).first()
 
             if not membership or membership.role != 'admin':
-                return jsonify({'error': 'Only group admins can assign folders to groups'}), 403
+                return jsonify(api_error('folder_group_assign_admin_only')), 403
 
         folder.group_id = new_group_id
 
     if 'color' in data:
-        folder.color = data['color']
+        color, error_key = _clean_folder_color(data['color'])
+        if error_key:
+            return jsonify(api_error(error_key)), 400
+        folder.color = color
     if 'custom_prompt' in data:
         folder.custom_prompt = data['custom_prompt']
+    if 'title_prompt' in data:
+        folder.title_prompt = data['title_prompt'] or None
     if 'default_language' in data:
         folder.default_language = data['default_language']
     if 'default_min_speakers' in data:
@@ -273,24 +351,26 @@ def update_folder(folder_id):
         if naming_template_id:
             template = NamingTemplate.query.filter_by(id=naming_template_id, user_id=current_user.id).first()
             if not template:
-                return jsonify({'error': 'Naming template not found'}), 404
+                return jsonify(api_error('naming_template_not_found')), 404
         folder.naming_template_id = naming_template_id if naming_template_id else None
     if 'export_template_id' in data:
         export_template_id = data['export_template_id']
         if export_template_id:
             template = ExportTemplate.query.filter_by(id=export_template_id, user_id=current_user.id).first()
             if not template:
-                return jsonify({'error': 'Export template not found'}), 404
+                return jsonify(api_error('export_template_not_found')), 404
         folder.export_template_id = export_template_id if export_template_id else None
 
     folder.updated_at = datetime.utcnow()
+    name, group_id = folder.name, folder.group_id
 
     try:
         db.session.commit()
-    except IntegrityError as e:
+    except IntegrityError:
+        # A duplicate name is a refused request, not an application error (#511).
         db.session.rollback()
-        current_app.logger.error(f"Folder update failed due to integrity constraint: {str(e)}")
-        return jsonify({'error': 'A folder with this name already exists'}), 400
+        current_app.logger.info("Folder update refused: the name is already in use")
+        return jsonify(api_error(_name_taken_key(name, group_id, 'folder_rename_conflict'))), 400
 
     return jsonify(folder.to_dict())
 
@@ -302,11 +382,11 @@ def delete_folder(folder_id):
     # Check if folders feature is enabled
     folders_enabled = SystemSetting.get_setting('enable_folders', False)
     if not folders_enabled:
-        return jsonify({'error': 'Folders feature is not enabled'}), 403
+        return jsonify(api_error('folders_disabled')), 403
 
     folder = db.session.get(Folder, folder_id)
     if not folder:
-        return jsonify({'error': 'Folder not found'}), 404
+        return jsonify(api_error('folder_not_found')), 404
 
     # Check permissions
     if folder.group_id:
@@ -317,11 +397,11 @@ def delete_folder(folder_id):
         ).first()
 
         if not membership or membership.role != 'admin':
-            return jsonify({'error': 'Only group admins can delete group folders'}), 403
+            return jsonify(api_error('group_folder_delete_admin_only')), 403
     else:
         # Personal folder - must belong to the user
         if folder.user_id != current_user.id:
-            return jsonify({'error': 'You do not have permission to delete this folder'}), 403
+            return jsonify(api_error('folder_delete_denied')), 403
 
     # Recordings in this folder will have folder_id set to NULL via ondelete='SET NULL'
     db.session.delete(folder)
@@ -336,15 +416,15 @@ def create_group_folder(group_id):
     # Check if folders feature is enabled
     folders_enabled = SystemSetting.get_setting('enable_folders', False)
     if not folders_enabled:
-        return jsonify({'error': 'Folders feature is not enabled'}), 403
+        return jsonify(api_error('folders_disabled')), 403
 
     if not ENABLE_INTERNAL_SHARING:
-        return jsonify({'error': 'Group folders require internal sharing to be enabled. Please set ENABLE_INTERNAL_SHARING=true in your configuration.'}), 403
+        return jsonify(api_error('group_folders_require_internal_sharing')), 403
 
     # Verify team exists
     team = db.session.get(Group, group_id)
     if not team:
-        return jsonify({'error': 'Group not found'}), 404
+        return jsonify(api_error('group_not_found')), 404
 
     # Verify user is a team admin
     membership = GroupMembership.query.filter_by(
@@ -353,13 +433,18 @@ def create_group_folder(group_id):
     ).first()
 
     if not membership or membership.role != 'admin':
-        return jsonify({'error': 'Only group admins can create group folders'}), 403
+        return jsonify(api_error('group_folder_create_admin_only')), 403
 
-    data = request.get_json()
-    name = data.get('name', '').strip()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify(api_error('folder_name_required')), 400
 
-    if not name:
-        return jsonify({'error': 'Folder name is required'}), 400
+    name, error_key = _clean_folder_name(data.get('name'))
+    if error_key:
+        return _folder_name_error(error_key)
+    color, error_key = _clean_folder_color(data.get('color'))
+    if error_key:
+        return jsonify(api_error(error_key)), 400
 
     # Check if a group folder with this name already exists for this team
     existing_folder = Folder.query.filter_by(
@@ -368,29 +453,30 @@ def create_group_folder(group_id):
     ).first()
 
     if existing_folder:
-        return jsonify({'error': 'A group folder with this name already exists'}), 400
+        return jsonify(api_error('group_folder_name_exists')), 400
 
     # Validate naming_template_id if provided
     naming_template_id = data.get('naming_template_id')
     if naming_template_id:
         template = NamingTemplate.query.filter_by(id=naming_template_id, user_id=current_user.id).first()
         if not template:
-            return jsonify({'error': 'Naming template not found'}), 404
+            return jsonify(api_error('naming_template_not_found')), 404
 
     # Validate export_template_id if provided
     export_template_id = data.get('export_template_id')
     if export_template_id:
         template = ExportTemplate.query.filter_by(id=export_template_id, user_id=current_user.id).first()
         if not template:
-            return jsonify({'error': 'Export template not found'}), 404
+            return jsonify(api_error('export_template_not_found')), 404
 
     # Create the group folder with all supported parameters
     folder = Folder(
         name=name,
         user_id=current_user.id,  # Creator
         group_id=group_id,
-        color=data.get('color', '#10B981'),
+        color=color,
         custom_prompt=data.get('custom_prompt'),
+        title_prompt=data.get('title_prompt'),
         default_language=data.get('default_language'),
         default_min_speakers=data.get('default_min_speakers'),
         default_max_speakers=data.get('default_max_speakers'),
@@ -409,10 +495,11 @@ def create_group_folder(group_id):
 
     try:
         db.session.commit()
-    except IntegrityError as e:
+    except IntegrityError:
+        # A duplicate name is a refused request, not an application error (#511).
         db.session.rollback()
-        current_app.logger.error(f"Folder creation failed due to integrity constraint: {str(e)}")
-        return jsonify({'error': 'A folder with this name already exists'}), 400
+        current_app.logger.info("Group folder create refused: the name is already in use")
+        return jsonify(api_error(_name_taken_key(name, group_id, 'group_folder_name_exists'))), 400
 
     return jsonify(folder.to_dict()), 201
 
@@ -424,12 +511,12 @@ def get_group_folders(group_id):
     # Check if folders feature is enabled
     folders_enabled = SystemSetting.get_setting('enable_folders', False)
     if not folders_enabled:
-        return jsonify({'error': 'Folders feature is not enabled'}), 403
+        return jsonify(api_error('folders_disabled')), 403
 
     # Verify team exists
     team = db.session.get(Group, group_id)
     if not team:
-        return jsonify({'error': 'Group not found'}), 404
+        return jsonify(api_error('group_not_found')), 404
 
     # Verify user is a team member
     membership = GroupMembership.query.filter_by(
@@ -438,12 +525,13 @@ def get_group_folders(group_id):
     ).first()
 
     if not membership:
-        return jsonify({'error': 'You must be a team member to view group folders'}), 403
+        return jsonify(api_error('group_folders_members_only')), 403
 
     # Get all group folders
-    folders = Folder.query.filter_by(group_id=group_id).all()
+    from src.services.recording_list import folder_dicts, folder_load_options
+    folders = Folder.query.filter_by(group_id=group_id).options(*folder_load_options()).order_by(Folder.id).all()
 
-    return jsonify({'folders': [folder.to_dict() for folder in folders]})
+    return jsonify({'folders': folder_dicts(folders)})
 
 
 @folders_bp.route('/api/recordings/<int:recording_id>/folder', methods=['PUT'])
@@ -453,20 +541,23 @@ def assign_recording_folder(recording_id):
     # Check if folders feature is enabled
     folders_enabled = SystemSetting.get_setting('enable_folders', False)
     if not folders_enabled:
-        return jsonify({'error': 'Folders feature is not enabled'}), 403
+        return jsonify(api_error('folders_disabled')), 403
 
     recording = db.session.get(Recording, recording_id)
     if not recording:
-        return jsonify({'error': 'Recording not found'}), 404
+        return jsonify(api_error('recording_not_found')), 404
 
-    # Check access to recording (require edit permission)
+    # Check access to recording (require edit permission). A recording the
+    # caller cannot see answers like a missing id.
     if has_recording_access:
+        if not has_recording_access(recording, current_user):
+            return jsonify(api_error('recording_not_found')), 404
         if not has_recording_access(recording, current_user, require_edit=True):
-            return jsonify({'error': 'You do not have permission to modify this recording'}), 403
+            return jsonify(api_error('recording_modify_denied')), 403
     else:
         # Fallback: only owner can assign folder
         if recording.user_id != current_user.id:
-            return jsonify({'error': 'You do not have permission to modify this recording'}), 403
+            return jsonify(api_error('recording_modify_denied')), 403
 
     data = request.get_json()
     folder_id = data.get('folder_id')
@@ -475,21 +566,12 @@ def assign_recording_folder(recording_id):
         # Verify folder exists and user has access
         folder = db.session.get(Folder, folder_id)
         if not folder:
-            return jsonify({'error': 'Folder not found'}), 404
+            return jsonify(api_error('folder_not_found')), 404
 
-        # Check if user can use this folder
-        if folder.group_id:
-            # Group folder - user must be a member
-            membership = GroupMembership.query.filter_by(
-                group_id=folder.group_id,
-                user_id=current_user.id
-            ).first()
-            if not membership:
-                return jsonify({'error': 'You do not have access to this folder'}), 403
-        else:
-            # Personal folder - must be owner
-            if folder.user_id != current_user.id:
-                return jsonify({'error': 'You do not have access to this folder'}), 403
+        # Check if user can put this recording in this folder
+        error_key = folder_assign_error(recording, folder, current_user, 'folder_access_denied')
+        if error_key:
+            return jsonify(api_error(error_key)), 403
 
         # Handle auto-sharing for group folders
         old_folder_id = recording.folder_id
@@ -517,20 +599,23 @@ def remove_recording_folder(recording_id):
     # Check if folders feature is enabled
     folders_enabled = SystemSetting.get_setting('enable_folders', False)
     if not folders_enabled:
-        return jsonify({'error': 'Folders feature is not enabled'}), 403
+        return jsonify(api_error('folders_disabled')), 403
 
     recording = db.session.get(Recording, recording_id)
     if not recording:
-        return jsonify({'error': 'Recording not found'}), 404
+        return jsonify(api_error('recording_not_found')), 404
 
-    # Check access to recording (require edit permission)
+    # Check access to recording (require edit permission). A recording the
+    # caller cannot see answers like a missing id.
     if has_recording_access:
+        if not has_recording_access(recording, current_user):
+            return jsonify(api_error('recording_not_found')), 404
         if not has_recording_access(recording, current_user, require_edit=True):
-            return jsonify({'error': 'You do not have permission to modify this recording'}), 403
+            return jsonify(api_error('recording_modify_denied')), 403
     else:
         # Fallback: only owner can remove folder
         if recording.user_id != current_user.id:
-            return jsonify({'error': 'You do not have permission to modify this recording'}), 403
+            return jsonify(api_error('recording_modify_denied')), 403
 
     recording.folder_id = None
     db.session.commit()
@@ -546,21 +631,21 @@ def bulk_assign_folder():
     # Check if folders feature is enabled
     folders_enabled = SystemSetting.get_setting('enable_folders', False)
     if not folders_enabled:
-        return jsonify({'error': 'Folders feature is not enabled'}), 403
+        return jsonify(api_error('folders_disabled')), 403
 
     data = request.get_json()
     recording_ids = data.get('recording_ids', [])
     folder_id = data.get('folder_id')  # Can be None to remove from folder
 
     if not recording_ids:
-        return jsonify({'error': 'No recordings specified'}), 400
+        return jsonify(api_error('no_recordings_specified')), 400
 
     # Verify folder if specified
     folder = None
     if folder_id:
         folder = db.session.get(Folder, folder_id)
         if not folder:
-            return jsonify({'error': 'Folder not found'}), 404
+            return jsonify(api_error('folder_not_found')), 404
 
         # Check if user can use this folder
         if folder.group_id:
@@ -569,12 +654,12 @@ def bulk_assign_folder():
                 user_id=current_user.id
             ).first()
             if not membership:
-                return jsonify({'error': 'You do not have access to this folder'}), 403
+                return jsonify(api_error('folder_access_denied')), 403
         else:
             if folder.user_id != current_user.id:
-                return jsonify({'error': 'You do not have access to this folder'}), 403
+                return jsonify(api_error('folder_access_denied')), 403
 
-    updated_count = 0
+    recordings = []
     for rec_id in recording_ids:
         recording = db.session.get(Recording, rec_id)
         if not recording:
@@ -588,6 +673,15 @@ def bulk_assign_folder():
             if recording.user_id != current_user.id:
                 continue
 
+        # Another user's recording: refuse the whole move before changing any
+        if folder is not None:
+            error_key = folder_assign_error(recording, folder, current_user, 'folder_access_denied')
+            if error_key:
+                return jsonify(api_error(error_key)), 403
+        recordings.append(recording)
+
+    updated_count = 0
+    for recording in recordings:
         recording.folder_id = folder_id
 
         # Apply auto-shares if moving to a group folder
@@ -601,6 +695,42 @@ def bulk_assign_folder():
     current_app.logger.info(f"Bulk folder update: {updated_count} recordings {action} by user {current_user.id}")
 
     return jsonify({'success': True, 'updated_count': updated_count})
+
+
+def folder_assign_error(recording, folder, user, denied_key):
+    """Why `user` may not put `recording` into `folder`, as an error key, or None.
+
+    The group-tag rule applies (#515): your own recordings go into your own
+    folders and your groups' folders; another user's recording goes only into
+    a group folder, and only from an admin of that group. Without it, an
+    editor of a shared recording could share it with a whole group by moving
+    it. Edit access to the recording is checked by each move path.
+    denied_key is the path's error for a folder the user cannot use at all.
+    """
+    if folder.group_id:
+        membership = GroupMembership.query.filter_by(
+            group_id=folder.group_id, user_id=user.id
+        ).first()
+        if not membership:
+            return denied_key
+        if recording.user_id != user.id and membership.role != 'admin':
+            return 'folder_assign_restricted'
+        return None
+    if folder.user_id != user.id:
+        return denied_key
+    if recording.user_id != user.id:
+        return 'folder_assign_restricted'
+    return None
+
+
+def apply_group_folder_shares(recording, folder):
+    """Share a recording placed in a group folder, as that folder's settings say.
+
+    Every path that puts a recording in a folder calls this, so the v1 API and
+    uploads share the same way as moving it in the web app (#515).
+    """
+    if folder is not None and folder.group_id and (folder.auto_share_on_apply or folder.share_with_group_lead):
+        _apply_folder_auto_shares(recording, folder)
 
 
 def _apply_folder_auto_shares(recording, folder):

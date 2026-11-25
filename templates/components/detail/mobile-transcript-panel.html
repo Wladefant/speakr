@@ -34,52 +34,7 @@
 
         <!-- Error Display (when transcription is an error message) -->
         <div v-if="processedTranscription.isError" class="error-display-container p-2">
-            <div :class="[
-                'rounded-lg p-4 border',
-                processedTranscription.error.type === 'size_limit' ? 'bg-amber-500/10 border-amber-500/30' :
-                processedTranscription.error.type === 'timeout' ? 'bg-orange-500/10 border-orange-500/30' :
-                processedTranscription.error.type === 'auth' ? 'bg-red-500/10 border-red-500/30' :
-                'bg-gray-500/10 border-gray-500/30'
-            ]">
-                <div class="flex items-start gap-3">
-                    <div :class="[
-                        'flex-shrink-0 w-10 h-10 rounded-full flex items-center justify-center',
-                        processedTranscription.error.type === 'size_limit' ? 'bg-amber-500/20' :
-                        processedTranscription.error.type === 'timeout' ? 'bg-orange-500/20' :
-                        processedTranscription.error.type === 'auth' ? 'bg-red-500/20' :
-                        'bg-gray-500/20'
-                    ]">
-                        <i :class="[
-                            'fas',
-                            processedTranscription.error.icon,
-                            processedTranscription.error.type === 'size_limit' ? 'text-amber-500' :
-                            processedTranscription.error.type === 'timeout' ? 'text-orange-500' :
-                            processedTranscription.error.type === 'auth' ? 'text-red-500' :
-                            'text-gray-500'
-                        ]"></i>
-                    </div>
-                    <div class="flex-1 min-w-0">
-                        <h3 class="font-semibold text-[var(--text-primary)] mb-1">
-                            ${processedTranscription.error.title}
-                        </h3>
-                        <p class="text-sm text-[var(--text-secondary)] mb-2">
-                            ${processedTranscription.error.message}
-                        </p>
-                        <div v-if="processedTranscription.error.guidance" class="text-xs text-[var(--text-muted)] bg-[var(--bg-tertiary)]/50 rounded p-2">
-                            <i class="fas fa-lightbulb text-yellow-500 mr-1"></i>
-                            ${processedTranscription.error.guidance}
-                        </div>
-                    </div>
-                </div>
-                <div class="mt-3 pt-3 border-t border-[var(--border-secondary)]">
-                    <button @click="reprocessTranscription(selectedRecording.id)"
-                            v-if="selectedRecording.can_edit !== false"
-                            class="btn btn--primary w-full">
-                        <i class="fas fa-redo-alt"></i>
-                        <span>Reprocess</span>
-                    </button>
-                </div>
-            </div>
+            {% include 'components/detail/_transcription-error.html' %}
         </div>
 
         <!-- Transcription content (show regardless of processing state if transcription exists) -->
@@ -117,7 +72,7 @@
                     <div v-if="processedTranscription.simpleSegments && processedTranscription.simpleSegments.length > 0">
                         <div v-for="(segment, index) in processedTranscription.simpleSegments" :key="`seg-${index}-${segment.startTime}`" :class="['transcript-segment cursor-pointer hover:bg-[var(--bg-accent-hover)] p-2 rounded transition-colors', { 'active-playing-segment': currentPlayingSegmentIndex === index }]" @click="seekAudioFromEvent" @dblclick.stop="openAsrEditorAtSegment(index)" :data-start-time="segment.startTime" :data-segment-index="index"><span v-if="showTimestampsSimpleView" class="speaker-segment-timestamp speaker-segment-timestamp--inline">${ formatTimestamp(segment.startTime) }</span>${segment.sentence}</div>
                     </div>
-                    <div v-else class="whitespace-pre-wrap">${processedTranscription.content}</div>
+                    <div v-else class="whitespace-pre-wrap bidi-auto">${processedTranscription.content}</div>
                 </div>
             </div>
             <div v-else-if="transcriptionViewMode === 'bubble'" class="transcription-with-speakers">

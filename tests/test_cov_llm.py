@@ -71,10 +71,10 @@ def make_completion(content="hello", usage=None, finish_reason="stop", **msg_ext
     )
 
 
-def make_chunk(content=None, usage=None):
+def make_chunk(content=None, usage=None, finish_reason=None):
     """A streaming chunk with one choice delta."""
     delta = SimpleNamespace(content=content)
-    choice = SimpleNamespace(delta=delta)
+    choice = SimpleNamespace(delta=delta, finish_reason=finish_reason)
     chunk = SimpleNamespace(choices=[choice], usage=usage)
     return chunk
 
@@ -183,15 +183,16 @@ def test_get_chat_config_base_url_falls_back_to_text(monkeypatch):
 
 def test_call_llm_completion_no_client(monkeypatch):
     monkeypatch.setattr(llm, "client", None)
-    with pytest.raises(ValueError, match="not initialized"):
+    with pytest.raises(ValueError, match="No text model is configured"):
         call_llm_completion([{"role": "user", "content": "hi"}])
 
 
-def test_call_llm_completion_no_api_key(monkeypatch):
-    install_client(monkeypatch)
+def test_call_llm_completion_without_api_key(monkeypatch):
+    # A local server needs no key (#403): the call goes through.
+    install_client(monkeypatch, return_value=make_completion("local"))
     monkeypatch.setattr(llm, "TEXT_MODEL_API_KEY", None)
-    with pytest.raises(ValueError, match="TEXT_MODEL_API_KEY"):
-        call_llm_completion([{"role": "user", "content": "hi"}])
+    resp = call_llm_completion([{"role": "user", "content": "hi"}])
+    assert resp.choices[0].message.content == "local"
 
 
 # ===========================================================================
@@ -462,15 +463,16 @@ def test_call_chat_completion_no_client(monkeypatch):
         call_chat_completion([{"role": "user", "content": "hi"}])
 
 
-def test_call_chat_completion_no_api_key(monkeypatch):
+def test_call_chat_completion_without_api_key(monkeypatch):
+    """A local server often needs no key (#403), for chat as for summaries."""
     fake = FakeClient(return_value=make_completion("ok"))
     monkeypatch.setattr(llm, "chat_client", fake)
     monkeypatch.setattr(llm, "client", fake)
     monkeypatch.setattr(llm, "CHAT_MODEL_API_KEY", None)
     monkeypatch.setattr(llm, "CHAT_MODEL_NAME", None)
     monkeypatch.setattr(llm, "TEXT_MODEL_API_KEY", None)
-    with pytest.raises(ValueError, match="API key not configured"):
-        call_chat_completion([{"role": "user", "content": "hi"}])
+    response = call_chat_completion([{"role": "user", "content": "hi"}])
+    assert response.choices[0].message.content == "ok"
 
 
 def test_call_chat_completion_success(monkeypatch):
@@ -686,6 +688,35 @@ def test_streaming_unclosed_thinking_tag():
     events = _collect(process_streaming_with_thinking(stream))
     thinking = [e["thinking"] for e in events if "thinking" in e]
     assert thinking == ["still thinking"]
+    assert events[-1] == {"end_of_stream": True}
+
+
+def test_streaming_finish_reason_length_marks_truncated():
+    # Provider hit its output-token cap: the terminal event must carry the
+    # truncation signal instead of a bare end_of_stream (issue #349).
+    stream = [make_chunk("partial answer", finish_reason="length")]
+    events = _collect(process_streaming_with_thinking(stream))
+    assert events[-1] == {
+        "end_of_stream": True,
+        "finish_reason": "length",
+        "truncated": True,
+    }
+
+
+def test_streaming_finish_reason_stop_not_truncated():
+    stream = [make_chunk("done", finish_reason="stop")]
+    events = _collect(process_streaming_with_thinking(stream))
+    assert events[-1] == {"end_of_stream": True, "finish_reason": "stop"}
+    assert "truncated" not in events[-1]
+
+
+def test_streaming_chunks_without_finish_reason_attr():
+    # Chunks lacking a finish_reason attribute entirely (older/odd providers)
+    # must still produce a plain end_of_stream event.
+    delta = SimpleNamespace(content="hi")
+    choice = SimpleNamespace(delta=delta)
+    stream = [SimpleNamespace(choices=[choice], usage=None)]
+    events = _collect(process_streaming_with_thinking(stream))
     assert events[-1] == {"end_of_stream": True}
 
 

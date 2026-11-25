@@ -3,10 +3,37 @@
  * Handles dark mode, color schemes, sidebar, and other UI state
  */
 
+import { filenameFromContentDisposition } from '../utils/content-disposition.js';
+
+/**
+ * Decide whether the sidebar should start collapsed.
+ *
+ * Under Tailwind's `lg` breakpoint the sidebar stops being a column and becomes
+ * an overlay with a half-opaque backdrop across the whole app
+ * (templates/components/sidebar.html renders that backdrop whenever the sidebar
+ * is expanded and the screen is narrow). So on a narrow screen an expanded
+ * sidebar does not just take up room, it greys out everything behind it.
+ *
+ * The stored `sidebarCollapsed` value is a preference someone set at a desktop
+ * width, and restoring it on a narrow screen is what puts a first-time visitor
+ * behind that grey. Narrow screens therefore always start collapsed, and the
+ * stored preference is left alone so it still applies when the window is wide
+ * again.
+ *
+ * @param {string|null} saved  raw localStorage value ('true' / 'false' / null)
+ * @param {boolean} isMobileScreen  true below the lg breakpoint
+ * @returns {boolean} whether the sidebar should start collapsed
+ */
+export function resolveSidebarCollapsed(saved, isMobileScreen) {
+    if (isMobileScreen) return true;
+    if (saved === null || saved === undefined) return false;
+    return saved === 'true';
+}
+
 export function useUI(state, utils, processedTranscription) {
     const {
         isDarkMode, currentColorScheme, colorSchemes, isSidebarCollapsed,
-        showColorSchemeModal, isUserMenuOpen, showHeaderFolderMenu, currentView, showUploadModal, selectedRecording,
+        showColorSchemeModal, isUserMenuOpen, showHeaderFolderMenu, showHeaderReprocessMenu, showHeaderMoreMenu, currentView, showUploadModal, selectedRecording,
         windowWidth, isMobileScreen, showAdvancedFilters, showSortOptions,
         searchTipsExpanded, isMetadataExpanded, editingParticipants, editingMeetingDate,
         editingSummary, tempSummaryContent, summaryMarkdownEditorInstance,
@@ -46,6 +73,7 @@ export function useUI(state, utils, processedTranscription) {
 
         // Re-apply current color scheme for new mode
         applyColorScheme(currentColorScheme.value);
+        if (window.speakrSaveTheme) window.speakrSaveTheme('darkMode');
     };
 
     // Initialize dark mode from storage
@@ -117,12 +145,14 @@ export function useUI(state, utils, processedTranscription) {
     // Select a color scheme
     const selectColorScheme = (schemeId) => {
         applyColorScheme(schemeId);
+        if (window.speakrSaveTheme) window.speakrSaveTheme('colorScheme');
         showToast(t('messages.colorSchemeApplied'), 'fa-palette');
     };
 
     // Reset to default color scheme
     const resetColorScheme = () => {
         applyColorScheme('blue');
+        if (window.speakrSaveTheme) window.speakrSaveTheme('colorScheme');
         showToast(t('messages.colorSchemeReset'), 'fa-undo');
     };
 
@@ -134,10 +164,10 @@ export function useUI(state, utils, processedTranscription) {
 
     // Initialize sidebar state
     const initializeSidebar = () => {
-        const saved = localStorage.getItem('sidebarCollapsed');
-        if (saved !== null) {
-            isSidebarCollapsed.value = saved === 'true';
-        }
+        isSidebarCollapsed.value = resolveSidebarCollapsed(
+            localStorage.getItem('sidebarCollapsed'),
+            isMobileScreen.value
+        );
     };
 
     // Switch to upload view. Guarded against silently abandoning an unsaved
@@ -287,14 +317,9 @@ export function useUI(state, utils, processedTranscription) {
         }
     };
 
-    // Format file size
-    const formatFileSize = (bytes) => {
-        if (!bytes) return '0 B';
-        const k = 1024;
-        const sizes = ['B', 'KB', 'MB', 'GB'];
-        const i = Math.floor(Math.log(bytes) / Math.log(k));
-        return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-    };
+    // Format file size: localized number and units (#481)
+    // Without i18n.js (not loaded yet) the page still shows a size.
+    const formatFileSize = (bytes) => (window.i18n?.formatFileSize ? window.i18n.formatFileSize(bytes) : `${Number(bytes) || 0} bytes`);
 
     // Format status
     const formatStatus = (status) => {
@@ -394,7 +419,7 @@ export function useUI(state, utils, processedTranscription) {
             });
 
             const data = await response.json();
-            if (!response.ok) throw new Error(data.error || 'Failed to save metadata');
+            if (!response.ok) throw new Error(data.error || t('messages.saveMetadataFailed'));
 
             // Update the recording with returned HTML
             if (data.recording) {
@@ -481,10 +506,10 @@ export function useUI(state, utils, processedTranscription) {
             });
 
             const data = await response.json();
-            if (!response.ok) throw new Error(data.error || 'Failed to regenerate title');
+            if (!response.ok) throw new Error(data.error || t('messages.regenerateTitleFailed'));
 
             selectedRecording.value.title = data.title;
-            showToast('Title regenerated', 'fa-check-circle', 3000, 'success');
+            showToast(t('messages.titleRegenerated'), 'fa-check-circle', 3000, 'success');
         } catch (error) {
             showToast(error.message, 'fa-exclamation-circle', 3000, 'error');
         } finally {
@@ -531,6 +556,10 @@ export function useUI(state, utils, processedTranscription) {
             summaryMarkdownEditorInstance.value = new EasyMDE({
                 element: summaryMarkdownEditor.value,
                 spellChecker: false,
+                // The vendored bundle otherwise injects a Font Awesome stylesheet
+                // from an external CDN, which the app's CSP blocks (console error
+                // on every editor mount). Icons come from the locally served FA.
+                autoDownloadFontAwesome: false,
                 autofocus: true,
                 placeholder: t('form.enterSummaryMarkdown'),
                 initialValue: selectedRecording.value?.summary || '',
@@ -643,6 +672,10 @@ export function useUI(state, utils, processedTranscription) {
             markdownEditorInstance.value = new EasyMDE({
                 element: notesMarkdownEditor.value,
                 spellChecker: false,
+                // The vendored bundle otherwise injects a Font Awesome stylesheet
+                // from an external CDN, which the app's CSP blocks (console error
+                // on every editor mount). Icons come from the locally served FA.
+                autoDownloadFontAwesome: false,
                 autofocus: true,
                 placeholder: t('form.enterNotesMarkdown'),
                 initialValue: selectedRecording.value?.notes || '',
@@ -871,7 +904,7 @@ export function useUI(state, utils, processedTranscription) {
                 hour: '2-digit',
                 minute: '2-digit'
             };
-            return date.toLocaleString(undefined, options);
+            return date.toLocaleString(window.i18n?.getIntlLocale?.(), options);
         } catch (e) {
             return dateTimeStr;
         }
@@ -1602,19 +1635,7 @@ export function useUI(state, utils, processedTranscription) {
             a.href = url;
 
             const contentDisposition = response.headers.get('Content-Disposition');
-            let filename = 'summary.docx';
-            if (contentDisposition) {
-                const utf8Match = /filename\*=utf-8''(.+)/.exec(contentDisposition);
-                if (utf8Match) {
-                    filename = decodeURIComponent(utf8Match[1]);
-                } else {
-                    const regularMatch = /filename="(.+)"/.exec(contentDisposition);
-                    if (regularMatch) {
-                        filename = regularMatch[1];
-                    }
-                }
-            }
-            a.download = filename;
+            a.download = filenameFromContentDisposition(contentDisposition, 'summary.docx');
 
             document.body.appendChild(a);
             a.click();
@@ -1663,7 +1684,7 @@ export function useUI(state, utils, processedTranscription) {
                     <div class="modal-panel modal-panel--sm">
                         <div class="modal-header">
                             <h3 class="modal-title">${_esc(t('transcriptTemplates.selectTemplate'))}</h3>
-                            <button class="modal-close cancel-btn" title="Close"><i class="fas fa-times"></i></button>
+                            <button class="modal-close cancel-btn" title="${_esc(t('common.close'))}"><i class="fas fa-times"></i></button>
                         </div>
                         <div class="modal-body" style="padding: var(--sp-2);">
                             <div class="space-y-1 max-h-60 overflow-y-auto">
@@ -1729,7 +1750,7 @@ export function useUI(state, utils, processedTranscription) {
                     const transcriptionData = JSON.parse(selectedRecording.value.transcription);
                     if (Array.isArray(transcriptionData)) {
                         rawText = transcriptionData.map(segment => {
-                            const speaker = segment.speaker || 'Unknown';
+                            const speaker = segment.speaker || t('sharing.unknown');
                             const text = segment.sentence || '';
                             return `${speaker}: ${text}`;
                         }).join('\n');
@@ -1769,13 +1790,7 @@ export function useUI(state, utils, processedTranscription) {
 
             const blob = await response.blob();
             const contentDisposition = response.headers.get('content-disposition');
-            let filename = `transcript.${fmt}`;
-            if (contentDisposition) {
-                const matches = contentDisposition.match(/filename="([^"]+)"/);
-                if (matches && matches[1]) {
-                    filename = matches[1];
-                }
-            }
+            const filename = filenameFromContentDisposition(contentDisposition, `transcript.${fmt}`);
 
             const downloadUrl = URL.createObjectURL(blob);
             const a = document.createElement('a');
@@ -1810,13 +1825,7 @@ export function useUI(state, utils, processedTranscription) {
 
             const blob = await response.blob();
             const contentDisposition = response.headers.get('content-disposition');
-            let filename = `transcript.${fmt}`;
-            if (contentDisposition) {
-                const matches = contentDisposition.match(/filename="([^"]+)"/);
-                if (matches && matches[1]) {
-                    filename = matches[1];
-                }
-            }
+            const filename = filenameFromContentDisposition(contentDisposition, `transcript.${fmt}`);
 
             const downloadUrl = URL.createObjectURL(blob);
             const a = document.createElement('a');
@@ -1929,6 +1938,14 @@ export function useUI(state, utils, processedTranscription) {
                 }
             }
 
+            // Close the detail-header Reprocess and More menus if clicking outside
+            if (showHeaderReprocessMenu.value && !target.closest('[data-header-reprocess-menu]')) {
+                showHeaderReprocessMenu.value = false;
+            }
+            if (showHeaderMoreMenu.value && !target.closest('[data-header-more-menu]')) {
+                showHeaderMoreMenu.value = false;
+            }
+
             // Close sort options if clicking outside
             if (showSortOptions.value) {
                 const sortButton = target.closest('[data-sort-toggle]');
@@ -1985,6 +2002,10 @@ export function useUI(state, utils, processedTranscription) {
             recordingMarkdownEditorInstance.value = new EasyMDE({
                 element: recordingNotesEditor.value,
                 spellChecker: false,
+                // The vendored bundle otherwise injects a Font Awesome stylesheet
+                // from an external CDN, which the app's CSP blocks (console error
+                // on every editor mount). Icons come from the locally served FA.
+                autoDownloadFontAwesome: false,
                 autofocus: false,
                 // Use the same placeholder key as the plain textarea so the
                 // wording is consistent ("Type your notes in Markdown format…").

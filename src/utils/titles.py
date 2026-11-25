@@ -15,16 +15,20 @@ normal upload instead of being silently skipped.
 """
 
 
+# Length of Recording.title; PostgreSQL refuses a longer value (#430)
+TITLE_MAX_LENGTH = 200
+
+
 def placeholder_title(original_filename):
     """The default placeholder title for an upload with no user-supplied title."""
-    return f"Recording - {original_filename}"
+    return f"Recording - {original_filename}"[:TITLE_MAX_LENGTH]
 
 
 def placeholder_titles(original_filename):
     """All placeholder titles the AI title generator may overwrite."""
     return (
-        f"Recording - {original_filename}",
-        f"Auto-processed - {original_filename}",
+        f"Recording - {original_filename}"[:TITLE_MAX_LENGTH],
+        f"Auto-processed - {original_filename}"[:TITLE_MAX_LENGTH],
     )
 
 
@@ -36,8 +40,29 @@ def resolve_upload_title(user_title, original_filename):
     recognises, so AI title generation runs.
     """
     if user_title and user_title.strip():
-        return user_title.strip()
+        return user_title.strip()[:TITLE_MAX_LENGTH]
     return placeholder_title(original_filename)
+
+
+def upload_title_source(user_title):
+    """title_source for a recording created with this form value: 'user' when a
+    title was typed, else None (a placeholder the title step replaces)."""
+    return 'user' if user_title and user_title.strip() else None
+
+
+def title_is_user_chosen(recording):
+    """True when the title step must keep the recording's title (#412).
+
+    'user' titles are kept and 'auto' titles are regenerated, for example on a
+    transcription reprocess. Recordings from before title_source existed keep
+    the earlier rule: a placeholder gets a title, anything else is kept.
+    """
+    source = getattr(recording, 'title_source', None)
+    if source == 'user':
+        return True
+    if source == 'auto':
+        return False
+    return not is_placeholder_title(recording.title, recording.original_filename)
 
 
 def is_placeholder_title(title, original_filename):

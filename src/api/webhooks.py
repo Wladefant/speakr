@@ -13,9 +13,11 @@ from datetime import datetime
 
 from flask import Blueprint, request, jsonify, current_app
 from flask_login import login_required, current_user
+from src.utils.token_auth import require_scope
 
 from src.database import db
 from src.models import Webhook, WebhookDelivery, WEBHOOK_EVENT_TYPES, generate_webhook_secret
+from src.utils.localization import api_error
 from src.services.webhook_dispatch import (
     is_url_safe_for_webhook,
     emit_webhook_event,
@@ -36,13 +38,14 @@ def _load_owned(webhook_id: int):
     """Return the webhook if the current user owns it, else (None, 404 tuple)."""
     wh = db.session.get(Webhook, webhook_id)
     if wh is None or wh.user_id != current_user.id:
-        return None, (jsonify({'error': 'Webhook not found'}), 404)
+        return None, (jsonify(api_error('webhook_not_found')), 404)
     return wh, None
 
 
 # ---- Collection ------------------------------------------------------------
 
 @webhooks_bp.route('', methods=['GET'])
+@require_scope('webhooks')
 @login_required
 def list_webhooks():
     """List the caller's webhooks."""
@@ -60,11 +63,12 @@ def list_webhooks():
 
 
 @webhooks_bp.route('', methods=['POST'])
+@require_scope('webhooks')
 @login_required
 def create_webhook():
     """Create a webhook.
 
-    Body: ``{name, url, events, allow_http=false, enabled=true}``.
+    Body: ``{name, url, events, allow_http=false, enabled=true, include_shared=false}``.
     The newly-minted HMAC secret is returned **once** in this response;
     after that it is never exposed.
     """
@@ -76,16 +80,16 @@ def create_webhook():
     enabled = bool(data.get('enabled', True))
 
     if not name:
-        return jsonify({'error': 'name is required'}), 400
+        return jsonify(api_error('name_required')), 400
     if not url:
-        return jsonify({'error': 'url is required'}), 400
+        return jsonify(api_error('url_required')), 400
     if not isinstance(events, list) or not events:
-        return jsonify({'error': 'events must be a non-empty list'}), 400
+        return jsonify(api_error('invalid_events_list')), 400
 
     unknown = [e for e in events if e not in WEBHOOK_EVENT_TYPES]
     if unknown:
         return jsonify({
-            'error': f'unknown event types: {unknown}',
+            **api_error('unknown_event_types', events=', '.join(str(e) for e in unknown)),
             'allowed': list(WEBHOOK_EVENT_TYPES),
         }), 400
 
@@ -96,7 +100,7 @@ def create_webhook():
     existing = Webhook.query.filter_by(user_id=current_user.id).count()
     if existing >= _max_per_user():
         return jsonify({
-            'error': f'Per-user webhook cap reached ({existing}/{_max_per_user()})',
+            **api_error('webhook_cap_reached', count=existing, max=_max_per_user()),
             'max_per_user': _max_per_user(),
         }), 409
 
@@ -106,6 +110,7 @@ def create_webhook():
         url=url[:500],
         allow_http=allow_http,
         enabled=enabled,
+        include_shared=bool(data.get('include_shared', False)),
         secret=generate_webhook_secret(),
     )
     try:
@@ -122,6 +127,7 @@ def create_webhook():
 # ---- Single resource -------------------------------------------------------
 
 @webhooks_bp.route('/<int:webhook_id>', methods=['GET'])
+@require_scope('webhooks')
 @login_required
 def get_webhook(webhook_id):
     wh, err = _load_owned(webhook_id)
@@ -131,6 +137,7 @@ def get_webhook(webhook_id):
 
 
 @webhooks_bp.route('/<int:webhook_id>', methods=['PATCH'])
+@require_scope('webhooks')
 @login_required
 def update_webhook(webhook_id):
     wh, err = _load_owned(webhook_id)
@@ -141,7 +148,7 @@ def update_webhook(webhook_id):
     if 'name' in data:
         name = (data.get('name') or '').strip()
         if not name:
-            return jsonify({'error': 'name cannot be empty'}), 400
+            return jsonify(api_error('name_empty')), 400
         wh.name = name[:100]
     if 'url' in data or 'allow_http' in data:
         new_url = (data.get('url') or wh.url).strip()
@@ -154,11 +161,13 @@ def update_webhook(webhook_id):
     if 'events' in data:
         events = data.get('events') or []
         if not isinstance(events, list) or not events:
-            return jsonify({'error': 'events must be a non-empty list'}), 400
+            return jsonify(api_error('invalid_events_list')), 400
         try:
             wh.event_list = events
         except ValueError as e:
             return jsonify({'error': str(e)}), 400
+    if 'include_shared' in data:
+        wh.include_shared = bool(data.get('include_shared'))
     if 'enabled' in data:
         enabled = bool(data.get('enabled'))
         wh.enabled = enabled
@@ -170,6 +179,7 @@ def update_webhook(webhook_id):
 
 
 @webhooks_bp.route('/<int:webhook_id>', methods=['DELETE'])
+@require_scope('webhooks')
 @login_required
 def delete_webhook(webhook_id):
     wh, err = _load_owned(webhook_id)
@@ -183,12 +193,27 @@ def delete_webhook(webhook_id):
 # ---- Secret rotation -------------------------------------------------------
 
 @webhooks_bp.route('/<int:webhook_id>/rotate-secret', methods=['POST'])
+@require_scope('webhooks')
 @login_required
 def rotate_secret(webhook_id):
     """Generate a fresh HMAC secret and return it once."""
     wh, err = _load_owned(webhook_id)
     if err:
         return err
+    # The old secret stays valid for WEBHOOK_SECRET_GRACE_HOURS: Speakr-Signature-V2
+    # carries a second v1= value signed with it until then (spec W2).
+    import os as _os
+    from datetime import timedelta
+    try:
+        grace_hours = float(_os.environ.get('WEBHOOK_SECRET_GRACE_HOURS', '24'))
+    except ValueError:
+        grace_hours = 24.0
+    if grace_hours > 0:
+        wh.previous_secret = wh.secret
+        wh.previous_secret_expires_at = datetime.utcnow() + timedelta(hours=grace_hours)
+    else:
+        wh.previous_secret = None
+        wh.previous_secret_expires_at = None
     wh.secret = generate_webhook_secret()
     db.session.commit()
     return jsonify(wh.to_dict(include_secret=True))
@@ -197,6 +222,7 @@ def rotate_secret(webhook_id):
 # ---- Test fire -------------------------------------------------------------
 
 @webhooks_bp.route('/<int:webhook_id>/test', methods=['POST'])
+@require_scope('webhooks')
 @login_required
 def test_fire(webhook_id):
     """Enqueue a synthetic ``webhook.test`` delivery against this webhook.
@@ -210,7 +236,7 @@ def test_fire(webhook_id):
     if err:
         return err
     if not wh.enabled:
-        return jsonify({'error': 'Webhook is disabled; enable it first'}), 409
+        return jsonify(api_error('webhook_disabled')), 409
 
     import uuid
     from src.services.webhook_dispatch import _build_envelope, serialize_envelope
@@ -235,6 +261,7 @@ def test_fire(webhook_id):
 # ---- Deliveries listing / replay ------------------------------------------
 
 @webhooks_bp.route('/<int:webhook_id>/deliveries', methods=['GET'])
+@require_scope('webhooks')
 @login_required
 def list_deliveries(webhook_id):
     wh, err = _load_owned(webhook_id)
@@ -258,6 +285,7 @@ def list_deliveries(webhook_id):
 
 
 @webhooks_bp.route('/<int:webhook_id>/deliveries/<int:delivery_id>', methods=['GET'])
+@require_scope('webhooks')
 @login_required
 def get_delivery(webhook_id, delivery_id):
     wh, err = _load_owned(webhook_id)
@@ -265,13 +293,14 @@ def get_delivery(webhook_id, delivery_id):
         return err
     d = db.session.get(WebhookDelivery, delivery_id)
     if not d or d.webhook_id != wh.id:
-        return jsonify({'error': 'Delivery not found'}), 404
+        return jsonify(api_error('delivery_not_found')), 404
     payload = d.to_dict()
     payload['payload'] = d.payload  # full body, for debugging
     return jsonify(payload)
 
 
 @webhooks_bp.route('/<int:webhook_id>/deliveries/<int:delivery_id>/replay', methods=['POST'])
+@require_scope('webhooks')
 @login_required
 def replay_delivery(webhook_id, delivery_id):
     """Re-enqueue the delivery as a brand-new attempt with the same payload."""
@@ -280,7 +309,7 @@ def replay_delivery(webhook_id, delivery_id):
         return err
     src = db.session.get(WebhookDelivery, delivery_id)
     if not src or src.webhook_id != wh.id:
-        return jsonify({'error': 'Delivery not found'}), 404
+        return jsonify(api_error('delivery_not_found')), 404
 
     import uuid
     import json as _json
@@ -291,6 +320,7 @@ def replay_delivery(webhook_id, delivery_id):
         envelope = _json.loads(src.payload)
         envelope['id'] = new_event_id
         envelope['timestamp'] = datetime.utcnow().isoformat() + 'Z'
+        envelope['occurred_at'] = envelope['timestamp']
         envelope['replayed_from'] = src.event_id
         new_payload = serialize_envelope(envelope)
     except Exception:

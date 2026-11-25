@@ -259,7 +259,7 @@ class TestModeDispatch(unittest.TestCase):
         self.ctx = app.app_context()
         self.ctx.push()
         self.temp_dir = tempfile.mkdtemp()
-        self.username = _uniq('cov_fm_dispatch')
+        self.username = _uniq('fm_dispatch')
         self.user = User(
             username=self.username,
             email=f'{self.username}@test.com',
@@ -311,6 +311,32 @@ class TestModeDispatch(unittest.TestCase):
         monitor._scan_tag_subdirectories = lambda *a, **kw: None
         monitor._scan_user_directories()
         # Only the valid user's directory got scanned.
+        self.assertEqual(scanned, [self.uid])
+
+    def test_user_directories_username_named_folder(self):
+        """#365: a watch folder named after the username (not the id) resolves."""
+        os.makedirs(os.path.join(self.temp_dir, f'u{self.uid}'))
+        # An unknown name is silently ignored (no 'user' prefix -> no warning path).
+        os.makedirs(os.path.join(self.temp_dir, 'not_a_user'))
+
+        monitor = _make_monitor(self.temp_dir, self.uid, mode='user_directories')
+        scanned = []
+        monitor._scan_directory_for_user = lambda d, u, **kw: scanned.append(u)
+        monitor._scan_tag_subdirectories = lambda *a, **kw: None
+        monitor._scan_user_directories()
+        self.assertEqual(scanned, [self.uid])
+
+    def test_user_directories_id_takes_precedence_over_username(self):
+        """A dir named user<id> resolves by id even if a username also matches."""
+        os.makedirs(os.path.join(self.temp_dir, f'user{self.uid}'))
+        monitor = _make_monitor(self.temp_dir, self.uid, mode='user_directories')
+        # Poison the username map: if the username fallback ran first it would
+        # resolve to a different (nonexistent) user id.
+        monitor._username_to_id[f'user{self.uid}'] = 424242
+        scanned = []
+        monitor._scan_directory_for_user = lambda d, u, **kw: scanned.append(u)
+        monitor._scan_tag_subdirectories = lambda *a, **kw: None
+        monitor._scan_user_directories()
         self.assertEqual(scanned, [self.uid])
 
     def test_user_directories_missing_base_dir(self):
@@ -402,8 +428,8 @@ class TestAdminUserSelection(unittest.TestCase):
         self.ctx = app.app_context()
         self.ctx.push()
         self.temp_dir = tempfile.mkdtemp()
-        self.admin_username = _uniq('cov_fm_admin')
-        self.normal_username = _uniq('cov_fm_normal')
+        self.admin_username = _uniq('fm_admin')
+        self.normal_username = _uniq('fm_normal')
         self.admin = User(
             username=self.admin_username,
             email=f'{self.admin_username}@test.com',
@@ -469,7 +495,7 @@ class TestProcessFile(unittest.TestCase):
         self.ctx.push()
         self.temp_dir = tempfile.mkdtemp()
         self.staging_dir = tempfile.mkdtemp()
-        self.username = _uniq('cov_fm_proc')
+        self.username = _uniq('fm_proc')
         self.user = User(
             username=self.username,
             email=f'{self.username}@test.com',
@@ -847,7 +873,7 @@ class TestModuleHelpers(unittest.TestCase):
         # user<id>), plus a tag whose user no longer exists (skip) and one with
         # no folder name (skip).
         with app.app_context():
-            username = _uniq('cov_fm_ensure')
+            username = _uniq('fm_ensure')
             user = User(username=username, email=f'{username}@t.com',
                         password='x', is_admin=True)
             db.session.add(user)

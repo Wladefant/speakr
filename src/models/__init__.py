@@ -15,9 +15,12 @@ from src.database import db
 
 # Import all models
 from .user import User, Speaker
+from .voice import VoiceEmbeddingSpace, SpeakerVoiceSample
 from .api_token import APIToken
+from .login_failure import LoginFailure
 from .speaker_snippet import SpeakerSnippet
-from .recording import Recording, TranscriptChunk
+from .recording import Recording, RecordingTombstone, TranscriptChunk
+from .external_ref import RecordingExternalRef
 from .sharing import Share, InternalShare, SharedRecordingState
 from .organization import Group, GroupMembership, Tag, RecordingTag, Folder
 from .events import Event
@@ -29,8 +32,14 @@ from .inquire import InquireSession
 from .system import SystemSetting
 from .audit import ShareAuditLog
 from .push_subscription import PushSubscription
+from .notification import (
+    Notification,
+    NOTIFICATION_LEVELS,
+    KIND_VOICE_EMBEDDING_CHANGED,
+)
 from .processing_job import ProcessingJob
-from .recording_session import RecordingSession, RECORDING_SESSION_STATUSES
+from .recording_session import RecordingSession, RECORDING_SESSION_KINDS, RECORDING_SESSION_STATUSES
+from .upload_join import UploadJoinPart
 from .token_usage import TokenUsage
 from .transcription_usage import TranscriptionUsage
 from .webhook import (
@@ -48,11 +57,14 @@ __all__ = [
     # User models
     'User',
     'Speaker',
+    'VoiceEmbeddingSpace',
+    'SpeakerVoiceSample',
     'APIToken',
+    'LoginFailure',
     'SpeakerSnippet',
     # Recording models
     'Recording',
-    'TranscriptChunk',
+    'TranscriptChunk', 'RecordingTombstone', 'RecordingExternalRef',
     # Sharing models
     'Share',
     'InternalShare',
@@ -73,8 +85,13 @@ __all__ = [
     'InquireSession',
     'SystemSetting',
     'PushSubscription',
+    'Notification',
+    'NOTIFICATION_LEVELS',
+    'KIND_VOICE_EMBEDDING_CHANGED',
     'ProcessingJob',
     'RecordingSession',
+    'UploadJoinPart',
+    'RECORDING_SESSION_KINDS',
     'RECORDING_SESSION_STATUSES',
     'TokenUsage',
     'TranscriptionUsage',

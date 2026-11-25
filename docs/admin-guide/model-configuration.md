@@ -32,6 +32,8 @@ TEXT_MODEL_NAME=openai/gpt-4o-mini
 
 **Custom Endpoints**: Speakr works with any OpenAI-compatible API endpoint, including self-hosted solutions like LocalAI, Ollama with OpenAI compatibility, or enterprise API gateways.
 
+**Local servers without a key**: `TEXT_MODEL_API_KEY` is optional. Leave it unset for a server that needs no key, such as Ollama, vLLM or llama.cpp on your own network; set only `TEXT_MODEL_BASE_URL` and `TEXT_MODEL_NAME`.
+
 **Google Gemini (OpenAI-compatible)**: Google exposes Gemini models behind an OpenAI-compatible URL. Point Speakr at it like any other base URL:
 
 ```bash
@@ -130,6 +132,19 @@ Speakr automatically detects when you're using:
 
 1. A GPT-5 model (based on model name)
 2. The official OpenAI API (based on base URL containing `api.openai.com`)
+
+### GPT-5 Through Azure AI Foundry and Other Gateways
+
+The automatic detection only activates on the official OpenAI API URL. If you serve a GPT-5 model through Azure AI Foundry or another gateway, requests fail with an error such as `Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.` In that case, force GPT-5 parameter handling explicitly:
+
+```bash
+# Force GPT-5 parameters (reasoning_effort, verbosity, max_completion_tokens)
+# regardless of the base URL
+GPT5_FORCE_MODE=true
+
+# Same, for a separately configured chat model (not inherited from the above)
+# CHAT_GPT5_FORCE_MODE=true
+```
 
 When both conditions are met, Speakr automatically:
 
@@ -248,10 +263,13 @@ CHAT_MODEL_NAME=openai/gpt-4o
 | Configuration | Behavior |
 |--------------|----------|
 | No `CHAT_MODEL_*` variables set | Chat uses `TEXT_MODEL_*` settings (default) |
-| Only `CHAT_MODEL_NAME` set | Falls back to `TEXT_MODEL_*` (API key required) |
+| Only `CHAT_MODEL_NAME` set | Falls back to `TEXT_MODEL_*` (a key or a base URL is required) |
 | Only `CHAT_MODEL_API_KEY` set | Falls back to `TEXT_MODEL_*` (model name required) |
 | `CHAT_MODEL_API_KEY` + `CHAT_MODEL_NAME` set | Uses chat config with `TEXT_MODEL_BASE_URL` |
+| `CHAT_MODEL_BASE_URL` + `CHAT_MODEL_NAME` set | Uses a dedicated chat server; no key is sent unless `CHAT_MODEL_API_KEY` is set (suits a local server) |
 | All `CHAT_MODEL_*` variables set | Uses fully dedicated chat configuration |
+
+The text model's key is sent only to the text model's server. For a chat model on another server, `CHAT_MODEL_API_KEY` is used, or no key.
 
 ### GPT-5 Settings for Chat
 
@@ -358,13 +376,40 @@ After changing model configuration:
 4. Test the chat feature
 5. Monitor logs for any errors or warnings
 
+## Provider-Specific Request Parameters
+
+Reasoning ("thinking") is controlled differently by each provider, and some models think by default, which makes summaries and titles slower and more expensive. `TEXT_MODEL_EXTRA_BODY` holds a JSON object whose fields are added to every request to the text model. `CHAT_MODEL_EXTRA_BODY` is the same setting for a separately configured chat model.
+
+```bash
+# Turn off thinking for a Qwen3 model on vLLM, SGLang or llama.cpp
+TEXT_MODEL_EXTRA_BODY={"chat_template_kwargs": {"enable_thinking": false}}
+```
+
+The fields are sent unchanged, so they must be ones your provider and model accept:
+
+| Provider | Example |
+|----------|---------|
+| OpenRouter, any reasoning model | `{"reasoning": {"effort": "low"}}`, or `{"reasoning": {"enabled": false}}` to turn reasoning off |
+| OpenAI (o-series, GPT-5) | `{"reasoning_effort": "minimal"}` |
+| vLLM, SGLang or llama.cpp, Qwen3 and similar models | `{"chat_template_kwargs": {"enable_thinking": false}}` |
+| vLLM, gpt-oss | `{"reasoning_effort": "low"}` |
+
+The name of the `chat_template_kwargs` field depends on the model's chat template and is given on the model card.
+
+- The fields are added after Speakr's own parameters and replace any with the same name, including the GPT-5 settings and `max_tokens`.
+- When chat uses the text model, `TEXT_MODEL_EXTRA_BODY` applies to chat as well. A separately configured chat model does not inherit it.
+- In `.env`, the JSON is written without surrounding quotes.
+- If the value is not a JSON object, requests to that model fail with an error that names the variable.
+- When a provider rejects a request, the log lists the fields added by this setting. Some servers ignore fields they do not recognise, so compare response times or token counts before and after a change to confirm its effect.
+- Reasoning tokens are counted as completion tokens in the token statistics. The reasoning text is not stored with summaries, titles or chat answers.
+
 ## Environment Variables Reference
 
 ```bash
 # Required: API endpoint
 TEXT_MODEL_BASE_URL=https://api.openai.com/v1
 
-# Required: API key
+# API key (can be left out for a local server without authentication)
 TEXT_MODEL_API_KEY=your_api_key_here
 
 # Required: Model identifier
@@ -383,9 +428,10 @@ TITLE_MAX_TOKENS=200
 # Optional: Maximum tokens for event extraction from transcripts (default: 4000)
 EVENT_MAX_TOKENS=4000
 
-# Optional: Prefix-cache-friendly title/summary prompts (default: false)
-# Only useful on self-hosted backends with automatic prefix caching. See below.
+# Optional: Prefix-cache-friendly title/summary prompts (default: false). See below.
 PREFIX_CACHE_OPTIMIZED_PROMPTS=false
+# Optional: cache breakpoints for Anthropic models (default: false). See below.
+TEXT_MODEL_CACHE_BREAKPOINTS=false
 
 # GPT-5 specific (only used with GPT-5 models and OpenAI API)
 GPT5_REASONING_EFFORT=medium  # minimal, low, medium, high
@@ -399,11 +445,16 @@ CHAT_MODEL_NAME=openai/gpt-4o
 # Chat-specific GPT-5 settings (optional - falls back to GPT5_* if not set)
 CHAT_GPT5_REASONING_EFFORT=medium  # minimal, low, medium, high
 CHAT_GPT5_VERBOSITY=medium          # low, medium, high
+
+# Provider-specific request parameters, a JSON object (optional)
+# See Provider-Specific Request Parameters above
+TEXT_MODEL_EXTRA_BODY={"reasoning": {"effort": "low"}}
+CHAT_MODEL_EXTRA_BODY={"reasoning": {"effort": "low"}}
 ```
 
 ## Prefix-Cache-Friendly Prompts (`PREFIX_CACHE_OPTIMIZED_PROMPTS`)
 
-**Default: `false`. Opt-in. Only relevant for self-hosted text-generation backends.**
+**Default: `false`. Opt-in.**
 
 For each recording, Speakr makes two LLM calls over the same transcript
 back-to-back: title generation, then summary generation. By default these two
@@ -425,14 +476,15 @@ trailing instructions.
 
 **When to enable it:**
 
-- You self-host the text model on a backend with automatic prefix caching, and
-- Your transcripts are large (long diarized meetings), so prefill dominates the
-  title+summary cost.
+- You self-host the text model on a backend with automatic prefix caching, or
+  you use a hosted model with prompt caching (OpenAI models cache a shared
+  prefix automatically; Anthropic models also need
+  `TEXT_MODEL_CACHE_BREAKPOINTS`, described below), and
+- Your transcripts are large (long diarized meetings), so the transcript
+  dominates the title and summary cost.
 
 **When to leave it off (the default):**
 
-- You use a hosted API (OpenRouter, OpenAI, etc.) — prefix caching there is
-  opaque/automatic and this flag gives no benefit.
 - You want the exact upstream prompt wording. With the flag off, prompts are
   unchanged.
 
@@ -454,8 +506,8 @@ off by default on most backends. The settings below are for vLLM; other servers
   hits in the API response when it is *also* started with
   `--enable-prompt-tokens-details`, which defaults to off. With that flag set,
   each response includes `usage.prompt_tokens_details.cached_tokens`, which
-  Speakr records and displays in the admin dashboard under **System Statistics →
-  Token Usage** as "Cache reads". Without it, caching still works, but the
+  Speakr records and shows in the admin dashboard under **System Statistics →
+  Usage and Cost**, in the prompt-cache line below the language-model chart. Without it, caching still works, but the
   dashboard shows zero cache reads because the server never reports them. You can
   confirm caching independently from vLLM's `/metrics` endpoint, which exposes
   `vllm:prefix_cache_hits_total` and `vllm:prompt_tokens_cached_total` regardless
@@ -473,6 +525,39 @@ vllm serve <model> \
 A note on what to expect: the very first call over a transcript is always a cache
 miss and reports zero cached tokens; the saving appears on the second call that
 reuses the prefix.
+
+### Cache breakpoints for Anthropic models (`TEXT_MODEL_CACHE_BREAKPOINTS`)
+
+**Default: `false`. Used only together with `PREFIX_CACHE_OPTIMIZED_PROMPTS=true`.**
+
+Anthropic models, called directly or through OpenRouter, cache a prompt only up
+to an explicit `cache_control` breakpoint. Without one, the transcript is billed
+in full on both the title and the summary call.
+
+```bash
+PREFIX_CACHE_OPTIMIZED_PROMPTS=true
+TEXT_MODEL_CACHE_BREAKPOINTS=true
+```
+
+With both settings on, the user message of the title and summary calls is sent
+as two text parts: the shared transcript block, marked with
+`"cache_control": {"type": "ephemeral"}`, and the task instructions. The text of
+the prompt is unchanged. The title call writes the transcript to the cache, and
+the summary call a few seconds later reads it at a tenth of the input price.
+Anthropic charges 1.25 times the input price for a cache write, so a call with
+no second call within five minutes, such as a summary regenerated on its own,
+costs slightly more on its transcript part. Prompts shorter than the model's
+minimum cacheable length (about 1,000 to 4,000 tokens, depending on the model)
+are not cached.
+
+The cache reads and writes are recorded and shown under **System Statistics →
+Usage and Cost**.
+
+Enable this setting only for a provider that accepts a list of text parts in a
+message and the `cache_control` field. Through OpenRouter, other models accept
+the request and ignore the field. Some local and OpenAI-compatible servers
+reject it; with such a server, the title and summary calls fail until the
+setting is turned off.
 
 ## Per-Upload, Per-Tag, Per-Folder Transcription Models
 
@@ -492,9 +577,10 @@ Resolution order at upload time:
 1. Per-upload selection (Advanced ASR Options dropdown)
 2. First tag's `default_transcription_model`
 3. Folder's `default_transcription_model`
-4. Global `TRANSCRIPTION_MODEL` env var (current behaviour)
+4. The default transcription model chosen by an administrator in the admin settings
+5. The connector's own model. For the OpenAI, Mistral and VibeVoice connectors this is `TRANSCRIPTION_MODEL`. The `asr_endpoint` connector has none: it sends no `model` parameter, and the ASR service uses its own default.
 
-If the override isn't in `TRANSCRIPTION_MODELS_AVAILABLE`, it's silently dropped and Speakr falls back to the global default — useful as a safety net against stale browser caches sending old model ids.
+If the override isn't in `TRANSCRIPTION_MODELS_AVAILABLE`, it's dropped with a warning in the log and the recording uses the connector's own model, which guards against stale browser caches sending old model ids. The same resolution applies to reprocessing, bulk reprocessing, API v1, watch folders, incognito mode and the startup voice embedding check.
 
 The override is propagated to the connector via the `model` field on `TranscriptionRequest`. Connectors that key on a model name (OpenAI Whisper / Transcribe, Mistral, VibeVoice) honour it directly. The `asr_endpoint` connector forwards the override as a `model=` query parameter; the [whisperx-asr-service](https://github.com/murtaza-nasir/whisperx-asr-service) fork uses it to switch the loaded Whisper model on demand, while the upstream `ahmetoner/whisper-asr-webservice` ignores unknown query parameters, so the override is safe in either case.
 
@@ -553,6 +639,29 @@ EMBEDDING_BASE_URL=https://openrouter.ai/api/v1
 EMBEDDING_API_KEY=sk-or-...
 EMBEDDING_MODEL=openai/text-embedding-3-large
 ```
+
+For Voyage AI's official endpoint, use:
+
+```env
+ENABLE_INQUIRE_MODE=true
+EMBEDDING_BASE_URL=https://api.voyageai.com/v1
+EMBEDDING_API_KEY=your-voyage-api-key
+EMBEDDING_MODEL=voyage-4-lite
+# EMBEDDING_DIMENSIONS=1024  # optional; must be supported by the model
+```
+
+When `EMBEDDING_BASE_URL` points at `api.voyageai.com`, requests are sent in
+Voyage's format: `EMBEDDING_DIMENSIONS` is sent as `output_dimension`, recording
+chunks are sent with `input_type=document` and searches with `input_type=query`.
+Requests to any other host, including a proxy for Voyage, keep the
+OpenAI-compatible format. No Voyage SDK or local model is required. Meeting text
+and search queries are sent to Voyage for embedding. If Voyage refuses the
+configured dimension, indexing fails and searches use text search until the
+setting is corrected.
+
+After changing embedding providers, models, or dimensions, use **Admin →
+Vector Store → Re-embed all recordings** to rebuild existing vectors. Audio does
+not need to be transcribed again.
 
 API mode does not require sentence-transformers to be installed, so the lightweight Docker image (`learnedmachine/speakr:lite`) can now run full semantic search by combining `EMBEDDING_BASE_URL` with any compatible provider. The lite image already ships `openai` and `scikit-learn`, so no further dependencies are needed.
 

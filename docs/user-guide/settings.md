@@ -4,7 +4,7 @@ Your account settings are the control center for personalizing Speakr to work ex
 
 ## Account Information Tab
 
-![Account Information](../assets/images/screenshots/settings account info.png)
+![Account Information](../assets/images/screenshots/settings-account-info.png)
 
 The Account Information tab presents a comprehensive view of your profile, statistics, and account actions.
 
@@ -71,6 +71,14 @@ Understanding prompt precedence helps you use this feature effectively. Tag prom
 
 Multiple tag prompts combine intelligently when applied together. A recording tagged with both "Client" and "Technical" receives both sets of instructions, creating comprehensive summaries without needing complex single prompts trying to cover every scenario.
 
+### Title Prompt
+
+The **Title Generation Prompt** field sets the instructions for the titles Speakr generates for your recordings. Leave it blank to use the current default, which is shown below the field. Only the instructions are yours to change: the transcript, your output language and the rule that the model replies with the title alone are added automatically.
+
+Title prompts follow the same precedence as summary prompts. A tag's title prompt applies first (several tags with title prompts combine, in the order the tags were added), then the folder's, then yours, then the administrator's default, and finally the built-in default. Tags and folders have a **Title Prompt** field next to their summary prompt for this purpose. A naming template (Account → Templates → Recording Titles) still controls the final title format, and its `{{ai_title}}` placeholder is filled with the title these instructions produce.
+
+The naming template comes from the first tag on the recording that has one, then from the recording's folder, then from your default template. The same template is applied when you regenerate a title from the recording header. When a recording is processed again, for example after you reprocess its transcription, a generated title is generated again with the current tags and templates; a title you typed or edited is kept. A merged recording without a typed title is titled the same way as an upload.
+
 ### Transcription Hints
 
 Below the summary prompt, you'll find the **Transcription Hints** section with two fields that help improve transcription accuracy:
@@ -83,6 +91,15 @@ These defaults apply to all your recordings unless overridden by tag defaults, f
 !!! tip "When to use hotwords vs initial prompt"
     Use **hotwords** for specific terms the model tends to misspell - proper nouns, brand names, technical acronyms. Use **initial prompt** for broader context that helps the model understand the domain and make better overall word choices.
 
+### Inquire Privacy
+
+The **Inquire Privacy** section controls what the Inquire AI may read when answering your questions. Transcripts are always available, since they are the minimum Inquire needs to function; everything else is your choice:
+
+- **Allow access to summaries** (on by default) - lets Inquire read your recordings' AI summaries, which is a fast way for the agentic mode to survey a long recording before deciding whether to read its transcript.
+- **Allow access to your notes** (off by default) - your private notes stay unavailable unless you enable this. Only your own notes are ever used; notes on recordings shared with you are never exposed, regardless of this setting.
+
+These settings are enforced structurally: a disabled content type is removed from the AI's capabilities entirely rather than merely discouraged. See [Inquire Mode](inquire-mode.md#agentic-inquire-beta) for how the agentic mode uses these permissions.
+
 ### Timestamp Availability for Summary and Chat
 
 At the top of the Prompt Options you can control whether the AI receives per-line timestamps with the transcript. There are two independent toggles, one for **summarization** and one for **chat**, so you can enable the feature only where you need it:
@@ -91,6 +108,10 @@ At the top of the Prompt Options you can control whether the AI receives per-lin
 - **Chat** - when on, the chat assistant can answer time-aware questions such as "what was discussed near the start" or "around the 20-minute mark".
 
 Each toggle has a format dropdown. **Default** uses a compact `[hh:mm:ss] Speaker: text` layout; you can also select any of your saved transcript templates to control exactly how each line is rendered. Both toggles are off by default, which keeps the prompt shorter and avoids spending tokens on timestamps when you do not need them.
+
+### Notes in Summaries
+
+When **Give the summarization agent my notes** is on, your notes on a recording are added to the summary request as context. Notes can hold the correct spelling of names and products, an agenda, or text pasted from an email or a chat thread. The transcript remains the record of what was said. The setting is off by default, applies to summaries generated after it is turned on (regenerate a summary to use it on an existing recording), and uses only your own notes, never those of people a recording is shared with. Up to 8,000 characters of notes are sent.
 
 ### Writing Effective Prompts
 
@@ -108,11 +129,37 @@ The Preferences tab is the home for display and editor behaviour settings that s
 
 Three language settings shape your Speakr experience. The interface language dropdown immediately transforms all menus, buttons, and messages to your chosen language; the transcription language field sets a default ISO 639-1 code that the recognition service uses to optimise accuracy when auto-detect is too slow or ambiguous; and the preferred output language controls the language of titles, summaries, and chat responses regardless of the source audio's language. Leaving the transcription language on **Auto-detect** is the right default for multilingual content.
 
+The interface language also applies to the notices shown after account actions, such as signing in, saving settings or changing a password, and to the email verification and password reset messages. Error messages returned by the API are still in English. Text without a translation for the selected language is shown in English. Dates, times, numbers and file sizes are formatted for the interface language, independent of the browser language: month and weekday names, the decimal separator and the 12- or 24-hour clock all follow the selected language. File sizes in exported Markdown follow it as well.
+
 These settings used to live on the Account Information tab. They moved here so all preferences that affect your day-to-day Speakr experience live in one place.
+
+### Timezone
+
+Dates in generated titles, such as the `{{date}}` and `{{time}}` variables of a naming template, are written in your timezone. The same timezone is used for dates in exported files and for the dates the AI is given when it writes summaries and extracts events, so "tomorrow" in a meeting is counted from your calendar day.
+
+With **Automatic (this device)**, the default, your timezone is taken from the browser you use and updated when it changes, for example after travelling. To keep one timezone regardless of the device, choose it from the list. Dates shown on pages, such as the meeting date in the sidebar, always follow the device you are using. If no browser has reported a timezone for you yet (for example, for recordings created only through the API or the watch folder), the administrator's default timezone is used.
+
+### Meeting Date from Filename
+
+Voice recorders and phone apps commonly encode the recording date in the filename (`20260716_meeting.mp3`, `260716_1102.m4a`). When **Parse meeting date from filename** is enabled, Speakr extracts that date at upload time and uses it as the recording's meeting date, taking precedence over the file's timestamps and embedded metadata. This is especially useful for batch uploads of older recordings, where the meeting date would otherwise default to the upload time.
+
+The **Filename date format** dropdown offers preset patterns — `YYYYMMDD`, `YYYYMMDD_HHMM`, `YYYY-MM-DD`, `YYMMDD_HHMM`, `YYMMDD` — plus an **Auto** mode that tries the common formats, and a **Custom pattern** option that accepts a regular expression with named groups (`(?P<year>...)`, `(?P<month>...)`, `(?P<day>...)`; `hour` and `minute` are optional). Auto mode deliberately skips the bare six-digit `YYMMDD` form, since any six digits in a filename would qualify; select that preset explicitly if your recorder uses it.
+
+The setting is off by default. A file whose name contains no matching date keeps the existing behaviour (file timestamps, then upload time) without failing the upload, and the parsed date remains editable afterwards from the recording's details. Dates parsed from filenames are wall-clock times: browser uploads send your timezone so the stored date displays correctly everywhere, and date-only matches are anchored so the calendar date never shifts between viewers. A time followed by `Z`, as in `recording-2026-10-25T11-43-00-000Z.webm` from the browser recorder, is read as UTC. The setting also applies to files dropped into the automated processing folder.
+
+This setting is not the same as **Naming Templates** (Account → Templates), which generate a recording's *title* from template variables and can also extract text from filenames with their own patterns. The two are independent — naming templates never change the meeting date, and this setting never changes the title — but they work together: a naming template's `{{date}}`, `{{year}}`, `{{month}}` and `{{day}}` variables render the recording's meeting date, so with filename parsing enabled, a file named `20260716_call.mp3` and the "Date Prefix" naming template produces a title dated July 16, 2026 rather than the day you uploaded it.
 
 ### Transcript Display
 
 **Show timestamps in simple view.** When enabled, a compact `mm:ss` (or `h:mm:ss` for long recordings) timestamp appears next to each speaker label in the simple transcript view, making it easier to navigate long meetings. The bubble view is unaffected. Off by default to keep the existing aesthetic for users who prefer a clean read.
+
+### Notifications
+
+**Email me when a transcription finishes.** When enabled, Speakr sends a message to your account email address as each recording finishes transcribing, and again if one fails permanently. The message names the recording, its length and how long transcription took, and links straight to it. Summaries do not send mail, since a summary follows a transcript you have already been told about.
+
+Off by default. It is most useful for long recordings you would rather not sit and wait for; less so if you upload many files at once, because each one sends its own message.
+
+The setting only appears when your administrator has configured email delivery and your account has an address Speakr can reach. Accounts created through single sign-on whose provider did not supply an email address do not see it, because there is nowhere to deliver to.
 
 ### Transcript Editor
 
@@ -122,19 +169,19 @@ These settings used to live on the Account Information tab. They moved here so a
 
 **Audio player position (desktop only).** Choose whether the persistent audio player sits at the **bottom** of the recording detail surface (default — spans the transcription + right rail with a single-row layout) or at the **top** (above the metadata and content area). The setting is saved on your account and takes effect on every recording. Mobile is unaffected; the mobile audio player always sits between the content area and the bottom navigation.
 
+**Recordings list sort.** Choose whether the recordings list opens sorted and grouped by **Date added** (the default) or by **Meeting date**. The setting is saved on your account. It is the starting point for any browser that has not picked a sort yet: choosing a sort from the Sort menu in the list overrides it, and that choice is remembered per browser.
+
 ## Shared Transcripts Tab
 
-![Shared Transcripts](../assets/images/screenshots/settings shared transcripts.png)
+![Shared Transcripts](../assets/images/screenshots/settings-shared-transcripts.png)
 
-The Shared Transcripts tab provides complete visibility and control over every recording you've shared.
+The Shared Transcripts tab, also opened from **Shared Transcripts** in the user menu, lists everything you have shared and everything shared with you, in three sections:
 
-### Initial State
+- **Public links**: each recording with a public link, when you created it, whether it includes the summary and notes, and the link itself.
+- **People and groups**: each recording you have shared with other users, with each person's permissions (view, edit, share). A share made through a group tag or group folder is marked as such. It lasts until the tag or folder is removed from the recording, so it has no revoke button here.
+- **Shared with me**: recordings other users have shared with you, with the owner, your permissions and a link to open each one.
 
-When first accessing this tab, you'll see "You have not shared any transcripts yet" - this changes once you create your first share link from any recording.
-
-### Share Information Display
-
-Once you've shared recordings, each entry displays the recording title, when you created the share link, what information you included (summary and/or notes), and the complete URL for access. The interface matches what you see in the sharing modal, maintaining consistency across the application.
+The last two sections appear when internal sharing is enabled. In the user menu dialog they are split into two tabs, **Shared by me** and **Shared with me**.
 
 ### Managing Share Settings
 
@@ -144,7 +191,9 @@ You can modify these settings anytime without generating new links. Toggle summa
 
 ### Revoking Access
 
-The delete button (trash icon) immediately revokes access. Once deleted, anyone trying to access that link sees an error message. This instant revocation provides security when you've accidentally shared with wrong parties or when access is no longer appropriate. Remember that deletion can't retrieve information already viewed or downloaded by recipients.
+To change what a person may do, click **Change permissions**, check or clear **Allow editing** and **Allow re-sharing**, and click **Save**. To remove a person's access, click **Revoke** and then **Confirm**. Any shares that person passed on are removed too, unless the recipients also have access through another share.
+
+For a public link, click the delete button (trash icon) to revoke access immediately. Once deleted, anyone trying to access that link sees an error message. This instant revocation provides security when you've accidentally shared with wrong parties or when access is no longer appropriate. Remember that deletion can't retrieve information already viewed or downloaded by recipients.
 
 ## Speakers Management Tab
 
@@ -166,7 +215,8 @@ Each speaker card displays essential information in a clean, scannable format. T
 For speakers with voice recognition data, each card displays additional information:
 
 - **Voice Profile Badge**: Shows confidence level (high/medium/low) based on the number and quality of voice samples collected
-- **Sample Count**: Number of voice embeddings collected from different recordings, helping assess profile strength
+- **Sample Count**: Number of voice samples the profile is built from, and how many voice variants they form (for example the same person on a phone and in a room)
+- **Voice Profile**: Lists every sample with its recording, speaker label, speech time and whether it was confirmed or auto-labelled. Remove a sample that belongs to someone else and the profile is rebuilt without it
 - **Voice Samples Button**: Click to hear representative audio clips of this speaker's voice for verification
 - **Profile Strength Indicator**: Visual feedback showing how well the system can recognize this speaker in future recordings
 
@@ -266,7 +316,7 @@ The API Tokens tab enables programmatic access to your Speakr instance through p
 
 ### Creating Tokens
 
-Click the **Create Token** button to generate a new token. You'll provide a descriptive name (like "n8n automation" or "CLI scripts") and optionally set an expiration period. The token value is shown only once after creation - copy it immediately and store it securely.
+Click the **Create Token** button to generate a new token. You'll provide a descriptive name (like "n8n automation" or "CLI scripts") and choose an expiration period, which is set to 90 days by default (**Never expires** can still be selected). The token value is shown only once after creation - copy it immediately and store it securely.
 
 !!! warning "Token Security"
     Treat API tokens like passwords. They provide full access to your account. Never share tokens publicly, commit them to version control, or expose them in client-side code.
@@ -292,9 +342,11 @@ curl -H "Authorization: Bearer YOUR_TOKEN" https://speakr.example.com/api/record
 # X-API-Token header
 curl -H "X-API-Token: YOUR_TOKEN" https://speakr.example.com/api/recordings
 
-# Query parameter (less secure)
+# Query parameter (deprecated; GET requests only)
 curl "https://speakr.example.com/api/recordings?token=YOUR_TOKEN"
 ```
+
+The Authorization header is the preferred form. The `?token=` query parameter is deprecated and is accepted only on `GET` requests; a request with any other method that carries the token only in the query string gets `401`.
 
 ### Revoking Tokens
 
@@ -303,7 +355,7 @@ Click the trash icon on any token card to revoke it immediately. Revoked tokens 
 ### Best Practices
 
 - Use descriptive names to track each token's purpose
-- Set expiration dates for temporary integrations
+- Set an expiration date on every token
 - Revoke tokens you no longer need
 - Create separate tokens for different integrations
 - Never share tokens between users - each person should create their own
@@ -318,7 +370,7 @@ For the full event list, payload formats, and signature verification details, se
 
 ## About Tab
 
-![About](../assets/images/screenshots/settings about page.png)
+![About](../assets/images/screenshots/settings-about.png)
 
 The About tab presents a comprehensive overview of your Speakr installation, combining version information, system configuration, feature highlights, and quick access to resources.
 

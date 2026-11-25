@@ -19,7 +19,9 @@ export function useBulkOperations({
     startReprocessingPoll,
     t,
     finalizeRecordingMerge,
-    fetchRecordingsPage
+    fetchRecordingsPage,
+    searchQuery,
+    showArchivedRecordings
 }) {
     const _t = (k, fallback) => (typeof t === 'function' ? t(k) : (fallback || k));
     // Modal state
@@ -35,7 +37,11 @@ export function useBulkOperations({
     // Merge state
     const mergeOrderedList = ref([]);   // ordered array of recording objects
     const mergeTitle = ref('');
-    const mergeDeleteOriginals = ref(false);
+    // What happens to the sources after a merge: 'keep', 'remove_audio' (keep
+    // them without their audio, which frees the space, #413) or 'delete'.
+    const mergeOriginals = ref('keep');
+    // Set when the server refused to keep a second copy for the storage quota.
+    const mergeStorageNotice = ref('');
     const mergeInProgress = ref(false);
     // 'bulk' = merge existing recordings (POST /api/recordings/merge).
     // 'recording' = merge a just-recorded clip into existing ones; the list
@@ -171,7 +177,7 @@ export function useBulkOperations({
             const data = await response.json();
 
             if (!response.ok) {
-                throw new Error(data.error || 'Failed to delete recordings');
+                throw new Error(data.error || t('errors.deleteRecordingsFailed'));
             }
 
             // Remove deleted recordings from local state
@@ -187,10 +193,10 @@ export function useBulkOperations({
             deletedIds.forEach(id => selectedRecordingIds.value.delete(id));
 
             const count = deletedIds.size;
-            showToast(`${count} recording${count !== 1 ? 's' : ''} deleted`, 'fa-trash', 3000, 'success');
+            showToast(t(count === 1 ? 'messages.recordingsDeleted' : 'messages.recordingsDeletedPlural', { count }), 'fa-trash', 3000, 'success');
         } catch (error) {
             console.error('Bulk delete error:', error);
-            setGlobalError(`Failed to delete recordings: ${error.message}`);
+            setGlobalError(t('errors.deleteRecordingsFailedDetail', { error: error.message }));
         } finally {
             bulkActionInProgress.value = false;
         }
@@ -246,7 +252,7 @@ export function useBulkOperations({
             const data = await response.json();
 
             if (!response.ok) {
-                throw new Error(data.error || `Failed to ${action} tag`);
+                throw new Error(data.error || (action === 'add' ? t('errors.addTagFailed') : t('errors.removeTagFailed')));
             }
 
             // Update local state
@@ -284,11 +290,11 @@ export function useBulkOperations({
             }
 
             const count = data.affected_ids?.length || ids.length;
-            const actionText = action === 'add' ? 'added to' : 'removed from';
-            showToast(`Tag ${actionText} ${count} recording${count !== 1 ? 's' : ''}`, 'fa-tags', 3000, 'success');
+            const tagToastKey = action === 'add' ? 'messages.tagAddedToRecordings' : 'messages.tagRemovedFromRecordings';
+            showToast(t(count === 1 ? tagToastKey : `${tagToastKey}Plural`, { count }), 'fa-tags', 3000, 'success');
         } catch (error) {
             console.error('Bulk tag error:', error);
-            setGlobalError(`Failed to ${action} tag: ${error.message}`);
+            setGlobalError(action === 'add' ? t('errors.addTagFailedDetail', { error: error.message }) : t('errors.removeTagFailedDetail', { error: error.message }));
         } finally {
             bulkActionInProgress.value = false;
         }
@@ -330,7 +336,7 @@ export function useBulkOperations({
             const data = await response.json();
 
             if (!response.ok) {
-                throw new Error(data.error || 'Failed to queue reprocessing');
+                throw new Error(data.error || t('errors.queueReprocessingFailed'));
             }
 
             // Update status for queued recordings
@@ -352,11 +358,14 @@ export function useBulkOperations({
             }
 
             const count = queuedIds.size;
-            const typeText = bulkReprocessType.value === 'transcription' ? 'Transcription' : 'Summary';
-            showToast(`${typeText} reprocessing queued for ${count} recording${count !== 1 ? 's' : ''}`, 'fa-sync-alt', 3000, 'success');
+            const baseKey = bulkReprocessType.value === 'summary'
+                ? 'bulkReprocessModal.queuedSummaryToast'
+                : 'bulkReprocessModal.queuedTranscriptionToast';
+            const toastKey = count === 1 ? baseKey : `${baseKey}Plural`;
+            showToast(t(toastKey, { count }), 'fa-sync-alt', 3000, 'success');
         } catch (error) {
             console.error('Bulk reprocess error:', error);
-            setGlobalError(`Failed to queue reprocessing: ${error.message}`);
+            setGlobalError(t('errors.queueReprocessingFailedDetail', { error: error.message }));
         } finally {
             bulkActionInProgress.value = false;
         }
@@ -372,7 +381,8 @@ export function useBulkOperations({
         mergeMode.value = 'bulk';
         mergeOrderedList.value = selectedRecordings.value.slice();
         mergeTitle.value = '';
-        mergeDeleteOriginals.value = false;
+        mergeOriginals.value = 'keep';
+        mergeStorageNotice.value = '';
         mergeNotesSourceId.value = null;
         mergeAddPickerOpen.value = false;
         mergeAddSearch.value = '';
@@ -392,7 +402,8 @@ export function useBulkOperations({
             notes: clipNotes || '',
         }];
         mergeTitle.value = '';
-        mergeDeleteOriginals.value = true;
+        mergeOriginals.value = 'delete';
+        mergeStorageNotice.value = '';
         mergeNotesSourceId.value = null;
         mergeAddPickerOpen.value = false;
         mergeAddSearch.value = '';
@@ -412,7 +423,8 @@ export function useBulkOperations({
         mergeMode.value = 'bulk';
         mergeOrderedList.value = (seedRecordings || []).slice();
         mergeTitle.value = title || '';
-        mergeDeleteOriginals.value = !!deleteOriginals;
+        mergeOriginals.value = deleteOriginals ? 'delete' : 'keep';
+        mergeStorageNotice.value = '';
         mergeNotesSourceId.value = null;
         mergeAddPickerOpen.value = false;
         mergeAddSearch.value = '';
@@ -469,15 +481,16 @@ export function useBulkOperations({
             const hasExisting = orderedSpec.some(x => x !== '__self__');
             if (!hasExisting || typeof finalizeRecordingMerge !== 'function') return;
             const title = mergeTitle.value.trim() || undefined;
-            const deleteOriginals = mergeDeleteOriginals.value;
+            const deleteOriginals = mergeOriginals.value === 'delete';
+            const removeOriginalAudio = mergeOriginals.value === 'remove_audio';
             // notes source: 'none' -> keep none (null); else the id or '__self__'.
             const notesSource = mergeNotesSourceId.value === 'none' ? null : mergeNotesSourceId.value;
             closeBulkMergeModal();
             try {
-                await finalizeRecordingMerge(orderedSpec, { deleteOriginals, title, notesSource });
+                await finalizeRecordingMerge(orderedSpec, { deleteOriginals, removeOriginalAudio, title, notesSource });
             } catch (error) {
                 console.error('Recording merge finalize error:', error);
-                setGlobalError(`Failed to start merge: ${error.message}`);
+                setGlobalError(t('errors.startMergeFailedDetail', { error: error.message }));
             }
             return;
         }
@@ -498,7 +511,8 @@ export function useBulkOperations({
                 body: JSON.stringify({
                     recording_ids: orderedIds,
                     title: mergeTitle.value.trim() || undefined,
-                    delete_originals: mergeDeleteOriginals.value,
+                    delete_originals: mergeOriginals.value === 'delete',
+                    remove_original_audio: mergeOriginals.value === 'remove_audio',
                     // 'none' -> keep no notes (null); otherwise the chosen source id.
                     notes_source_id: mergeNotesSourceId.value === 'none' ? null : mergeNotesSourceId.value
                 })
@@ -506,8 +520,16 @@ export function useBulkOperations({
 
             const data = await response.json();
 
+            // Not enough room to keep a second copy (#413): keep the dialog
+            // open, explain, and preselect keeping the originals without audio.
+            if (response.status === 507 && data.code === 'storage_quota_exceeded') {
+                mergeStorageNotice.value = _t('mergeRecordings.storageNotice', 'There is not enough storage to keep the originals with their audio. Keep them without their audio, or delete them.');
+                mergeOriginals.value = 'remove_audio';
+                return;
+            }
+
             if (!response.ok) {
-                throw new Error(data.error || 'Failed to merge recordings');
+                throw new Error(data.error || t('errors.mergeRecordingsFailed'));
             }
 
             // Show the merged recording immediately (in PROCESSING) for instant
@@ -525,10 +547,10 @@ export function useBulkOperations({
             if (exitSelectionMode) exitSelectionMode();
 
             const count = orderedIds.length;
-            showToast(`Merging ${count} recordings — the combined recording is processing`, 'fa-object-group', 4000, 'success');
+            showToast(t('mergeRecordings.mergingToast', { count }), 'fa-object-group', 4000, 'success');
         } catch (error) {
             console.error('Merge error:', error);
-            setGlobalError(`Failed to merge recordings: ${error.message}`);
+            setGlobalError(t('errors.mergeRecordingsFailedDetail', { error: error.message }));
         } finally {
             mergeInProgress.value = false;
             bulkActionInProgress.value = false;
@@ -568,7 +590,7 @@ export function useBulkOperations({
             const data = await response.json();
 
             if (!response.ok) {
-                throw new Error(data.error || 'Failed to update inbox status');
+                throw new Error(data.error || t('errors.updateInboxStatusFailed'));
             }
 
             // Update local state
@@ -584,11 +606,49 @@ export function useBulkOperations({
             }
 
             const count = affectedIds.size;
-            const actionText = value ? 'added to' : 'removed from';
-            showToast(`${count} recording${count !== 1 ? 's' : ''} ${actionText} inbox`, 'fa-inbox', 3000, 'success');
+            const inboxToastKey = value ? 'messages.recordingsAddedToInbox' : 'messages.recordingsRemovedFromInbox';
+            showToast(t(count === 1 ? inboxToastKey : `${inboxToastKey}Plural`, { count }), 'fa-inbox', 3000, 'success');
         } catch (error) {
             console.error('Bulk toggle inbox error:', error);
-            setGlobalError(`Failed to update inbox status: ${error.message}`);
+            setGlobalError(t('errors.updateInboxStatusFailedDetail', { error: error.message }));
+        } finally {
+            bulkActionInProgress.value = false;
+        }
+    };
+
+    // Archive for many recordings at once (#394). Archiving a majority
+    // unarchived selection archives it; otherwise it unarchives.
+    const bulkToggleArchive = async (value = null) => {
+        const ids = getSelectedIds();
+        if (ids.length === 0) return;
+        const tc = (key, n, params) => (window.i18n ? window.i18n.tc(key, n, params) : key);
+        if (value === null) {
+            const archivedCount = selectedRecordings.value.filter(r => r.is_archived).length;
+            value = archivedCount < ids.length / 2;
+        }
+        bulkActionInProgress.value = true;
+        try {
+            const response = await fetch('/api/recordings/bulk-toggle', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCsrfToken() },
+                body: JSON.stringify({ recording_ids: ids, field: 'archive', value })
+            });
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || t('errors.archiveStatusFailed'));
+            const affected = new Set(data.affected_ids || ids);
+            // They leave the current view unless a search is showing both.
+            if (!searchQuery.value && value !== showArchivedRecordings.value) {
+                recordings.value = recordings.value.filter(r => !affected.has(r.id));
+            } else {
+                recordings.value.forEach(r => { if (affected.has(r.id)) r.is_archived = value; });
+            }
+            if (selectedRecording.value && affected.has(selectedRecording.value.id)) {
+                selectedRecording.value.is_archived = value;
+            }
+            showToast(tc(value ? 'archive.bulkArchived' : 'archive.bulkUnarchived', affected.size, { count: affected.size }), 'fa-box-archive', 3000, 'success');
+        } catch (error) {
+            console.error('Bulk archive error:', error);
+            setGlobalError(error.message);
         } finally {
             bulkActionInProgress.value = false;
         }
@@ -623,7 +683,7 @@ export function useBulkOperations({
             const data = await response.json();
 
             if (!response.ok) {
-                throw new Error(data.error || 'Failed to update highlight status');
+                throw new Error(data.error || t('errors.updateHighlightStatusFailed'));
             }
 
             // Update local state
@@ -639,11 +699,11 @@ export function useBulkOperations({
             }
 
             const count = affectedIds.size;
-            const actionText = value ? 'highlighted' : 'unhighlighted';
-            showToast(`${count} recording${count !== 1 ? 's' : ''} ${actionText}`, 'fa-star', 3000, 'success');
+            const starToastKey = value ? 'messages.recordingsHighlighted' : 'messages.recordingsUnhighlighted';
+            showToast(t(count === 1 ? starToastKey : `${starToastKey}Plural`, { count }), 'fa-star', 3000, 'success');
         } catch (error) {
             console.error('Bulk toggle highlight error:', error);
-            setGlobalError(`Failed to update highlight status: ${error.message}`);
+            setGlobalError(t('errors.updateHighlightStatusFailedDetail', { error: error.message }));
         } finally {
             bulkActionInProgress.value = false;
         }
@@ -676,7 +736,7 @@ export function useBulkOperations({
             const data = await response.json();
 
             if (!response.ok) {
-                throw new Error(data.error || 'Failed to update folders');
+                throw new Error(data.error || t('errors.updateFoldersFailed'));
             }
 
             // Update local state
@@ -704,13 +764,13 @@ export function useBulkOperations({
 
             const count = data.updated_count || ids.length;
             if (folderId) {
-                showToast(`${count} recording${count !== 1 ? 's' : ''} moved to "${folder?.name || 'folder'}"`, 'fa-folder', 3000, 'success');
+                showToast(t(count === 1 ? 'messages.recordingsMovedToFolder' : 'messages.recordingsMovedToFolderPlural', { count, name: folder?.name || t('form.folder') }), 'fa-folder', 3000, 'success');
             } else {
-                showToast(`${count} recording${count !== 1 ? 's' : ''} removed from folder`, 'fa-folder-minus', 3000, 'success');
+                showToast(t(count === 1 ? 'messages.recordingsRemovedFromFolder' : 'messages.recordingsRemovedFromFolderPlural', { count }), 'fa-folder-minus', 3000, 'success');
             }
         } catch (error) {
             console.error('Bulk folder assignment error:', error);
-            setGlobalError(`Failed to update folders: ${error.message}`);
+            setGlobalError(t('errors.updateFoldersFailedDetail', { error: error.message }));
         } finally {
             bulkActionInProgress.value = false;
         }
@@ -728,7 +788,8 @@ export function useBulkOperations({
         bulkReprocessType,
         mergeOrderedList,
         mergeTitle,
-        mergeDeleteOriginals,
+        mergeOriginals,
+        mergeStorageNotice,
         mergeInProgress,
         mergeAddPickerOpen,
         mergeAddSearch,
@@ -768,6 +829,7 @@ export function useBulkOperations({
         // Bulk Toggle
         bulkToggleInbox,
         bulkToggleHighlight,
+        bulkToggleArchive,
 
         // Bulk Folder
         bulkAssignFolder

@@ -75,6 +75,9 @@ class RecordingTag(db.Model):
     added_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=True)
     order = db.Column(db.Integer, nullable=False, default=0)
 
+    # The primary key starts with recording_id; tag counts read by tag (D#483)
+    __table_args__ = (db.Index('ix_recording_tags_tag_id', 'tag_id'),)
+
     # Relationships
     recording = db.relationship('Recording', back_populates='tag_associations')
     tag = db.relationship('Tag', back_populates='recording_associations')
@@ -91,6 +94,7 @@ class Folder(db.Model):
 
     # Custom settings for this folder
     custom_prompt = db.Column(db.Text, nullable=True)  # Custom summarization prompt
+    title_prompt = db.Column(db.Text, nullable=True)  # Instructions for AI titles (#400)
     default_language = db.Column(db.String(10), nullable=True)  # Default transcription language
     default_min_speakers = db.Column(db.Integer, nullable=True)  # Default min speakers for ASR
     default_max_speakers = db.Column(db.Integer, nullable=True)  # Default max speakers for ASR
@@ -125,16 +129,31 @@ class Folder(db.Model):
     # One-to-many relationship with recordings
     recordings = db.relationship('Recording', back_populates='folder', lazy=True)
 
-    # Unique constraint: folder name must be unique per user
-    __table_args__ = (db.UniqueConstraint('name', 'user_id', name='_user_folder_uc'),)
+    # Unique constraint: folder name must be unique per user. A group folder
+    # name is also unique within its group, whoever created it (#513); the
+    # startup migration 0006 adds that index to existing databases.
+    __table_args__ = (
+        db.UniqueConstraint('name', 'user_id', name='_user_folder_uc'),
+        db.Index(
+            'uq_folder_group_name', 'name', 'group_id', unique=True,
+            sqlite_where=db.text('group_id IS NOT NULL'),
+            postgresql_where=db.text('group_id IS NOT NULL'),
+        ),
+    )
 
     @property
     def is_group_folder(self):
         """Check if this is a group-scoped folder."""
         return self.group_id is not None
 
-    def to_dict(self):
-        """Convert model to dictionary representation."""
+    def to_dict(self, recording_count=None):
+        """Convert model to dictionary representation.
+
+        recording_count: the folder's recording count when the caller has
+        counted it already (list pages count all their folders at once).
+        """
+        if recording_count is None:
+            recording_count = len(self.recordings) if self.recordings else 0
         return {
             'id': self.id,
             'name': self.name,
@@ -143,6 +162,7 @@ class Folder(db.Model):
             'is_group_folder': self.is_group_folder,
             'group_name': self.group.name if self.group else None,
             'custom_prompt': self.custom_prompt,
+            'title_prompt': self.title_prompt,
             'default_language': self.default_language,
             'default_min_speakers': self.default_min_speakers,
             'default_max_speakers': self.default_max_speakers,
@@ -158,7 +178,7 @@ class Folder(db.Model):
             'export_template_id': self.export_template_id,
             'export_template_name': self.export_template.name if self.export_template else None,
             'created_at': self.created_at.isoformat() if self.created_at else None,
-            'recording_count': len(self.recordings) if self.recordings else 0
+            'recording_count': recording_count
         }
 
 
@@ -173,6 +193,7 @@ class Tag(db.Model):
 
     # Custom settings for this tag
     custom_prompt = db.Column(db.Text, nullable=True)  # Custom summarization prompt
+    title_prompt = db.Column(db.Text, nullable=True)  # Instructions for AI titles (#400)
     default_language = db.Column(db.String(10), nullable=True)  # Default transcription language
     default_min_speakers = db.Column(db.Integer, nullable=True)  # Default min speakers for ASR
     default_max_speakers = db.Column(db.Integer, nullable=True)  # Default max speakers for ASR
@@ -219,8 +240,14 @@ class Tag(db.Model):
         """Check if this is a group-scoped tag."""
         return self.group_id is not None
 
-    def to_dict(self):
-        """Convert model to dictionary representation."""
+    def to_dict(self, recording_count=None):
+        """Convert model to dictionary representation.
+
+        recording_count: the tag's recording count when the caller has
+        counted it already (list pages count all their tags at once).
+        """
+        if recording_count is None:
+            recording_count = len(self.recording_associations)
         return {
             'id': self.id,
             'name': self.name,
@@ -229,6 +256,7 @@ class Tag(db.Model):
             'is_group_tag': self.is_group_tag,
             'group_name': self.group.name if self.group else None,
             'custom_prompt': self.custom_prompt,
+            'title_prompt': self.title_prompt,
             'default_language': self.default_language,
             'default_min_speakers': self.default_min_speakers,
             'default_max_speakers': self.default_max_speakers,
@@ -246,5 +274,5 @@ class Tag(db.Model):
             'is_auto_process': self.is_auto_process or False,
             'auto_process_folder_name': self.auto_process_folder_name,
             'created_at': self.created_at.isoformat() if self.created_at else None,
-            'recording_count': len(self.recording_associations)
+            'recording_count': recording_count
         }

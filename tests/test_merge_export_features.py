@@ -31,7 +31,7 @@ app.config["WTF_CSRF_ENABLED"] = False
 
 def _mk_user(prefix="mx"):
     suffix = uuid.uuid4().hex[:8]
-    user = User(username=f"{prefix}_{suffix}", email=f"{prefix}_{suffix}@local.test", password="x")
+    user = User(username=f"{prefix[:11]}_{suffix}", email=f"{prefix}_{suffix}@local.test", password="x")
     db.session.add(user)
     db.session.commit()
     return user
@@ -363,6 +363,54 @@ def test_run_merge_job_delete_originals_removes_sources_after_concat():
         assert db.session.get(Recording, r2.id) is None
         # Merged recording itself survives
         assert db.session.get(Recording, merged.id) is not None
+
+
+def test_run_merge_job_can_keep_the_originals_without_their_audio():
+    """#413: the sources stay with their transcripts; their audio is removed
+    only after the merged file is stored, so the audio is never lost."""
+    from src.services.recording_merge import create_merge_recording, run_merge_job
+    with app.app_context():
+        user = _mk_user()
+        r1 = _mk_recording(user, title="A")
+        r2 = _mk_recording(user, title="B")
+        r1.transcription = "kept words"
+        db.session.commit()
+        with _endpoint_mocks() as enqueue:
+            merged = create_merge_recording(user, [r1.id, r2.id], remove_original_audio=True)
+        assert enqueue.call_args.kwargs["params"]["remove_original_audio"] is True
+
+        params = {"source_ids": [r1.id, r2.id], "remove_original_audio": True}
+        removed = []
+        fake_retention_storage = MagicMock()
+        fake_retention_storage.exists.return_value = True
+        fake_retention_storage.delete.side_effect = lambda path, **kw: removed.append(path)
+        with _worker_mocks(), patch("src.services.retention.get_storage_service", return_value=fake_retention_storage):
+            run_merge_job(merged, params)
+
+        for rid in (r1.id, r2.id):
+            rec = db.session.get(Recording, rid)
+            assert rec is not None and rec.audio_deleted_at is not None
+        assert db.session.get(Recording, r1.id).transcription == "kept words"
+        assert len(removed) == 2
+        assert db.session.get(Recording, merged.id).audio_path.startswith("local://")
+
+
+def test_a_failed_merge_leaves_the_originals_audio():
+    from src.services.recording_merge import create_merge_recording, run_merge_job, MergeError
+    import pytest
+    with app.app_context():
+        user = _mk_user()
+        r1 = _mk_recording(user, title="A")
+        r2 = _mk_recording(user, title="B")
+        with _endpoint_mocks():
+            merged = create_merge_recording(user, [r1.id, r2.id], remove_original_audio=True)
+        params = {"source_ids": [r1.id, r2.id], "remove_original_audio": True}
+        with _worker_mocks() as (storage, _enqueue):
+            storage.upload_local_file = MagicMock(side_effect=OSError("disk full"))
+            with pytest.raises(MergeError):
+                run_merge_job(merged, params)
+        for rid in (r1.id, r2.id):
+            assert db.session.get(Recording, rid).audio_deleted_at is None
 
 
 def test_run_merge_job_empty_output_raises():

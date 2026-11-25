@@ -4,6 +4,8 @@
     <meta charset="UTF-8">
     <!-- interactive-widget=resizes-content: keyboard resizes layout (Android). -->
     <meta name="viewport" content="width=device-width, initial-scale=1.0, interactive-widget=resizes-content">
+    {% include 'includes/theme_account.html' %}
+    {% include 'includes/theme_bootstrap.html' %}
     <script>
       // Keyboard-safe viewport (see index.html for rationale): mirror the
       // visible viewport height into --app-height so the keyboard never pushes
@@ -20,36 +22,17 @@
     <meta name="robots" content="noindex, nofollow, noarchive, nosnippet, noimageindex">
     <title>Inquire Mode - Speakr</title>
         <!-- All dependencies bundled locally for offline support -->
-<script src="{{ url_for('static', filename='vendor/js/tailwind.min.js') }}"></script>
         <!-- All dependencies bundled locally for offline support -->
-<script src="{{ url_for('static', filename='vendor/js/vue.global.js') }}"></script>
         <!-- All dependencies bundled locally for offline support -->
-<script src="{{ url_for('static', filename='vendor/js/marked.min.js') }}"></script>
         <!-- All dependencies bundled locally for offline support -->
 <link rel="stylesheet" href="{{ url_for('static', filename='vendor/css/fontawesome.min.css') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/primitives.css') }}">
-    <script src="{{ url_for('static', filename='js/i18n.js') }}"></script>
     <link rel="icon" href="{{ url_for('static', filename='img/favicon.ico') }}">
     <link rel="icon" type="image/png" sizes="32x32" href="{{ url_for('static', filename='img/icon-32x32.png') }}">
 
     <!-- Loading overlay to prevent FOUC -->
-    {% include 'includes/loading_overlay.html' %}
 
-    <script>
-        tailwind.config = {
-            darkMode: 'class',
-            theme: {
-                extend: {
-                    colors: {
-                        primary: 'var(--bg-primary)',
-                        secondary: 'var(--bg-secondary)',
-                        accent: 'var(--bg-accent)'
-                    }
-                }
-            }
-        }
-    </script>
     <style>
         /* Custom checkbox styling for better visual feedback */
         .filter-checkbox {
@@ -138,14 +121,100 @@
             border-radius: 3px;
             font-size: 0.9em;
         }
+
+        /* Citation chips: the agent cites sources as markdown links to
+           /recordings/<id>; style them like small tag chips so they read
+           as references rather than inline hyperlinks. */
+        .chat-message .prose a[href^="/recordings/"] {
+            display: inline-block;
+            /* Theme accent tint (same pairing as selected options/highlights)
+               so the chip contrasts slightly with the bubble in every color
+               scheme, light and dark. */
+            background-color: var(--bg-accent);
+            color: var(--text-accent);
+            border: 1px solid var(--border-accent, var(--border-secondary));
+            border-radius: 9999px;
+            padding: 0 0.55em;
+            font-size: 0.78em;
+            line-height: 1.55;
+            text-decoration: none;
+            /* Sit on the text line instead of riding above it: an
+               inline-block chip aligned to baseline extends mostly upward
+               because of its padding, so nudge it down to visually centre
+               against the surrounding line. */
+            vertical-align: -0.35em;
+            margin: 0 0.1em;
+            max-width: 100%;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .chat-message .prose a[href^="/recordings/"]:hover {
+            border-color: var(--border-focus);
+        }
+
+        /* Sources footer: numbered list mapping citation numbers to
+           recording titles. Links here render as plain links, not chips. */
+        .chat-message .citation-refs {
+            margin-top: 1em;
+            padding-top: 0.6em;
+            border-top: 1px solid var(--border-primary);
+        }
+        .chat-message .citation-refs__label {
+            font-size: 0.72em;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: var(--text-muted);
+            margin-bottom: 0.3em;
+        }
+        .chat-message .citation-refs ol {
+            margin: 0;
+            padding-left: 1.4em;
+            font-size: 0.85em;
+        }
+        .chat-message .citation-refs li {
+            margin: 0.15em 0;
+            color: var(--text-secondary);
+        }
+        .chat-message .prose .citation-refs a[href^="/recordings/"] {
+            display: inline;
+            background: none;
+            border: none;
+            border-radius: 0;
+            padding: 0;
+            font-size: 1em;
+            vertical-align: baseline;
+            margin: 0;
+            white-space: normal;
+            color: var(--text-accent);
+            text-decoration: none;
+        }
+        .chat-message .prose .citation-refs a[href^="/recordings/"]:hover {
+            text-decoration: underline;
+        }
     </style>
+    <!-- Tailwind utilities, compiled at build time (scripts/build_css.sh). Last in
+         <head> so that, as with the former runtime build, they follow the page's
+         own stylesheets in the cascade. -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/tailwind.css') }}">
+    <!-- Scripts after every stylesheet, so that no page is painted while a
+         script blocks the parser before the stylesheets are known. -->
+    <script src="{{ url_for('static', filename='vendor/js/vue.global.js') }}"></script>
+    <script src="{{ url_for('static', filename='vendor/js/marked.min.js') }}"></script>
+    <script src="{{ url_for('static', filename='vendor/js/purify.min.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/markdown-safe.js') }}"></script>
+    {% include 'includes/i18n_bootstrap.html' %}
+    <script src="{{ url_for('static', filename='js/i18n.js') }}"></script>
+    {% include 'includes/loading_overlay.html' %}
+    <script src="{{ url_for('static', filename='js/timezone-sync.js') }}" defer></script>
 </head>
 <body class="h-full bg-[var(--bg-primary)] text-[var(--text-primary)] transition-colors duration-300">
     <div id="inquire-app" v-cloak class="h-full flex flex-col"
          data-current-user-name="{{ (current_user.name or current_user.username) if current_user.is_authenticated else '' }}">
         
         <!-- Header -->
-        <header class="bg-[var(--bg-secondary)] border-b border-[var(--border-primary)] px-3 sm:px-4 py-3 flex items-center justify-between flex-shrink-0 z-50">
+        <header class="bg-[var(--bg-secondary)] border-b border-[var(--border-primary)] px-3 sm:px-4 py-2 flex items-center justify-between flex-shrink-0 z-50 gap-3" style="min-height: 56px;">
             <!-- Left side: Menu and logo -->
             <div class="flex items-center gap-2 sm:gap-4 min-w-0 flex-shrink">
                 <!-- Mobile Sidebar Toggle — uses the design system
@@ -158,81 +227,17 @@
                 
                 <!-- Logo and Title (clickable to go back) -->
                 <a href="/" class="flex items-center gap-2 sm:gap-3 min-w-0 hover:opacity-80 transition-opacity">
-                    <img src="{{ url_for('static', filename='img/icon-32x32.png') }}" alt="Speakr" class="app-logo w-6 h-6 sm:w-8 sm:h-8 flex-shrink-0">
+                    <img src="{{ url_for('static', filename='img/icon-64.png') }}" srcset="{{ url_for('static', filename='img/icon-64.png') }} 1x, {{ url_for('static', filename='img/icon-128.png') }} 2x" alt="Speakr" class="app-logo w-6 h-6 sm:w-8 sm:h-8 flex-shrink-0">
                     <h1 class="text-lg sm:text-xl font-bold text-[var(--text-primary)] truncate">Speakr</h1>
-                    <span class="text-xs sm:text-sm text-[var(--text-muted)] hidden sm:inline">• Inquire Mode</span>
                 </a>
+                <span class="text-[var(--text-muted)] hidden sm:inline" aria-hidden="true">/</span>
+                <span class="t-meta hidden sm:inline" v-text="t('inquire.title')"></span>
             </div>
 
-            <!-- Right side: User menu -->
-            <div class="flex items-center gap-2 sm:gap-3">
-                {% include 'components/token_budget_indicator.html' %}
-
-                <!-- New Recording Button.
-                     Inquire mode is a separate Vue app that can't
-                     embed the main app's upload modal directly. We
-                     redirect to "/" with ?upload=1 — the main app
-                     reads that query param on mount and opens the
-                     upload modal automatically (then clears the
-                     param via history.replaceState so a refresh
-                     doesn't re-trigger). Click is the same single
-                     action the user expected. -->
-                <a href="/?upload=1"
-                   class="btn btn--sm btn--primary">
-                    <i class="fas fa-plus"></i>
-                    <span class="hidden sm:inline">${ t('nav.newRecording') }</span>
-                </a>
-
-                <!-- User menu -->
-                {% if current_user.is_authenticated %}
-                <div class="relative">
-                    <button @click="isUserMenuOpen = !isUserMenuOpen"
-                            data-user-menu-toggle
-                            class="btn btn--ghost btn--sm flex-shrink-0"
-                            :title="t('admin.userMenu')">
-                        <i class="fas fa-user-circle"></i>
-                        <span class="hidden lg:inline">{{ (current_user.name or current_user.username) if current_user.is_authenticated else 'User' }}</span>
-                        <i class="fas fa-chevron-down text-xs hidden sm:inline"></i>
-                    </button>
-
-                    <!-- User dropdown -->
-                    <div v-if="isUserMenuOpen"
-                         data-user-menu-dropdown
-                         class="absolute right-0 mt-2 w-56 bg-[var(--bg-secondary)] border border-[var(--border-primary)] rounded-lg shadow-lg z-50">
-                        <a href="/" class="block px-4 py-2 hover:bg-[var(--bg-tertiary)] transition-colors">
-                            <i class="fas fa-home mr-2 w-4 text-center"></i><span v-text="t('nav.home')"></span>
-                        </a>
-                        <a href="/account" class="block px-4 py-2 hover:bg-[var(--bg-tertiary)] transition-colors">
-                            <i class="fas fa-cog mr-2 w-4 text-center"></i><span v-text="t('nav.settings')"></span>
-                        </a>
-                        <a href="/account#tags" class="block px-4 py-2 hover:bg-[var(--bg-tertiary)] transition-colors">
-                            <i class="fas fa-tags mr-2 w-4 text-center"></i><span v-text="t('help.tagManagement')"></span>
-                        </a>
-                        <button @click="openSharesList" class="w-full text-left px-4 py-2 hover:bg-[var(--bg-tertiary)] transition-colors flex items-center">
-                            <i class="fas fa-share-alt mr-2 w-4 text-center"></i><span v-text="t('modal.sharedTranscripts')"></span>
-                        </button>
-                        {% if current_user.is_admin or is_group_admin %}
-                        <a href="/admin" class="block px-4 py-2 hover:bg-[var(--bg-tertiary)] transition-colors">
-                            <i class="fas fa-{% if current_user.is_admin %}user-shield{% else %}users-cog{% endif %} mr-2 w-4 text-center"></i>
-                            <span v-text="{% if current_user.is_admin %}t('admin.title'){% else %}t('nav.groupManagement'){% endif %}"></span>
-                        </a>
-                        {% endif %}
-                        <div class="border-t border-[var(--border-primary)] my-1"></div>
-                        <button @click="toggleDarkMode" class="w-full text-left px-4 py-2 hover:bg-[var(--bg-tertiary)] transition-colors flex items-center">
-                            <i :class="isDarkMode ? 'fas fa-sun' : 'fas fa-moon'" class="mr-2 w-4 text-center"></i>
-                            <span v-text="isDarkMode ? t('nav.lightMode') : t('nav.darkMode')"></span>
-                        </button>
-                        <button @click="openColorSchemeModal" class="w-full text-left px-4 py-2 hover:bg-[var(--bg-tertiary)] transition-colors flex items-center">
-                            <i class="fas fa-palette mr-2 w-4 text-center"></i>
-                            <span v-text="t('modal.colorScheme')"></span>
-                        </button>
-                        <div class="border-t border-[var(--border-primary)] my-1"></div>
-                        <a href="/logout" class="block px-4 py-2 hover:bg-[var(--bg-tertiary)] transition-colors">
-                            <i class="fas fa-sign-out-alt mr-2 w-4 text-center"></i><span v-text="t('nav.signOut')"></span>
-                        </a>
-                    </div>
-                </div>
-                {% endif %}
+            <!-- Right side: the same controls as every other page
+                 (components/header-controls.html). -->
+            <div class="flex items-center gap-1 sm:gap-2 flex-shrink-0">
+                {% include 'components/header-controls.html' %}
             </div>
         </header>
 
@@ -291,6 +296,27 @@
                                 <span class="ml-2 text-sm font-medium flex-1" :style="{ color: tag.color }">${ tag.name }</span>
                                 <span class="text-xs px-1.5 py-0.5 rounded-full"
                                       style="background: var(--bg-tertiary); color: var(--text-muted);">${ tag.recording_count }</span>
+                            </label>
+                        </div>
+                    </div>
+
+                    <!-- Folder Filters (#428), shown when folders are enabled -->
+                    <div v-if="availableFilters.folders.length > 0" class="rounded-md border p-3"
+                         style="background: var(--bg-primary); border-color: var(--border-secondary);">
+                        <h3 class="t-body-strong mb-2 flex items-center">
+                            <i class="fas fa-folder mr-2" style="color: var(--text-accent);"></i>${ t('inquire.folders') }
+                        </h3>
+                        <input type="text" v-model="folderSearchQuery" :placeholder="t('form.searchFolders')"
+                               class="field mb-2"
+                               style="font-size: var(--fs-meta);">
+                        <div class="space-y-0.5 max-h-40 overflow-y-auto custom-scrollbar">
+                            <label v-for="folder in filteredFolders" :key="folder.id"
+                                   class="flex items-center cursor-pointer p-1.5 rounded transition-colors hover:bg-[var(--bg-tertiary)]">
+                                <input type="checkbox" :value="folder.id" v-model="inquireFilters.selectedFolders"
+                                       class="filter-checkbox">
+                                <span class="ml-2 text-sm font-medium flex-1" :style="{ color: folder.color }">${ folder.name }</span>
+                                <span class="text-xs px-1.5 py-0.5 rounded-full"
+                                      style="background: var(--bg-tertiary); color: var(--text-muted);">${ folder.recording_count }</span>
                             </label>
                         </div>
                     </div>
@@ -374,6 +400,12 @@
                                 <i class="fas fa-tags"></i>
                                 <span>${ inquireFilters.selectedTags.length } ${ t('inquire.tagsCount') }</span>
                             </span>
+                            <span v-if="inquireFilters.selectedFolders.length"
+                                  class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px]"
+                                  style="background: var(--bg-accent); color: var(--text-accent);">
+                                <i class="fas fa-folder"></i>
+                                <span>${ inquireFilters.selectedFolders.length } ${ t('inquire.foldersCount') }</span>
+                            </span>
                             <span v-if="inquireFilters.selectedSpeakers.length"
                                   class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px]"
                                   style="background: var(--bg-accent); color: var(--text-accent);">
@@ -446,29 +478,93 @@
                          markdown renders consistently. Both bubbles
                          use rounded-lg (instead of rounded-xl) so the
                          shape matches the rest of the design system. -->
-                    <div v-for="(message, index) in inquireChatMessages" :key="index"
-                         :class="['flex', message.role === 'user' ? 'justify-end' : 'justify-start']">
-                        <div class="max-w-3xl chat-message"
-                             :class="message.role === 'user' ? 'message user-message' : 'message ai-message'">
-                            <div v-if="message.html || message.content"
-                                 class="prose prose-sm max-w-none"
-                                 :class="message.role === 'user' ? 'prose-invert' : ''"
-                                 v-html="message.html || message.content">
+                    <template v-for="(message, index) in inquireChatMessages" :key="index">
+                        <!-- Compaction divider: older turns above this point were
+                             folded into a memory summary the assistant still sees.
+                             Click to inspect exactly what it remembers. -->
+                        <div v-if="index === memoryState.dividerIndex && memoryState.memory" class="my-2">
+                            <button @click="memoryState.showMemory = !memoryState.showMemory"
+                                    class="w-full flex items-center gap-3 text-xs"
+                                    style="color: var(--text-muted);">
+                                <span class="flex-1 border-t" style="border-color: var(--border-primary);"></span>
+                                <span class="flex items-center gap-1.5 whitespace-nowrap">
+                                    <i class="fas fa-layer-group"></i>
+                                    <span>${ t('inquire.earlierSummarized') }</span>
+                                    <i :class="['fas text-[10px]', memoryState.showMemory ? 'fa-chevron-up' : 'fa-chevron-down']"></i>
+                                </span>
+                                <span class="flex-1 border-t" style="border-color: var(--border-primary);"></span>
+                            </button>
+                            <div v-if="memoryState.showMemory"
+                                 class="surface-raised mt-2 text-xs whitespace-pre-wrap"
+                                 style="padding: var(--sp-3); color: var(--text-secondary);"
+                                 v-text="memoryState.memory">
                             </div>
                         </div>
-                    </div>
+
+                        <div :class="['flex', message.role === 'user' ? 'justify-end' : 'justify-start']">
+                            <div class="max-w-3xl chat-message"
+                                 :class="message.role === 'user' ? 'message user-message' : 'message ai-message'">
+                                <!-- Persistent provenance: the agent's collapsed
+                                     activity line, expandable to the full timeline. -->
+                                <div v-if="message.role === 'assistant' && message.activitySummary"
+                                     class="mb-2 pb-2 border-b" style="border-color: var(--border-primary);">
+                                    <button @click="message.showSteps = !message.showSteps"
+                                            class="flex items-center gap-2 text-xs" style="color: var(--text-muted);">
+                                        <i class="fas fa-list-check"></i>
+                                        <span v-text="message.agentStepCount + (message.agentStepCount === 1 ? ' step · ' : ' steps · ') + message.activitySummary"></span>
+                                        <i :class="['fas text-[10px]', message.showSteps ? 'fa-chevron-up' : 'fa-chevron-down']"></i>
+                                    </button>
+                                    <div v-if="message.showSteps && message.steps && message.steps.length" class="mt-2 space-y-1">
+                                        <div v-for="step in message.steps" :key="step.id"
+                                             class="flex items-start gap-2 text-xs" style="color: var(--text-secondary);">
+                                            <i :class="['fas mt-0.5 w-4 text-center', step.icon]" style="color: var(--text-muted);"></i>
+                                            <span class="min-w-0">
+                                                <span v-text="step.label"></span>
+                                                <span v-if="step.detail" style="color: var(--text-muted);" v-text="' — ' + step.detail"></span>
+                                            </span>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div v-if="message.html || message.content"
+                                     class="prose prose-sm max-w-none"
+                                     :class="message.role === 'user' ? 'prose-invert' : ''"
+                                     v-html="message.html">
+                                </div>
+                            </div>
+                        </div>
+                    </template>
 
                     <!-- Loading indicator — uses the .ai-message
                          primitive for visual consistency with normal
                          assistant messages, plus a clear step indicator
                          row so the user sees progress through the
                          analysis pipeline. -->
-                    <div v-if="isInquireChatLoading" class="flex justify-start">
-                        <div class="ai-message message max-w-md">
+                    <div v-if="isInquireChatLoading && !answerStarted" class="flex justify-start">
+                        <div class="ai-message message max-w-md" style="min-width: 260px;">
                             <div class="flex items-center gap-2">
                                 <div class="spinner flex-shrink-0"></div>
-                                <span class="t-meta" v-if="showProcessingStatus">${ chatProcessingStatus }</span>
-                                <span class="t-meta" v-else>Analyzing transcriptions...</span>
+                                <span class="t-meta flex-1" v-if="showProcessingStatus">${ chatProcessingStatus }</span>
+                                <span class="t-meta flex-1" v-else-if="agentSteps.length">${ t('inquire.workingOnIt') }</span>
+                                <span class="t-meta flex-1" v-else>${ t('inquire.analyzing') }</span>
+                                <button @click="stopInquireChat" class="btn btn--ghost btn--sm flex-shrink-0" :title="t('inquire.stop')">
+                                    <i class="fas fa-stop text-xs"></i>
+                                </button>
+                            </div>
+                            <!-- Agent activity timeline: one row per tool step,
+                                 spinner while running, muted check when done.
+                                 Empty results and tool errors render calmly
+                                 (they are a normal part of searching). -->
+                            <div v-if="agentSteps.length" class="mt-2 space-y-1.5">
+                                <div v-for="step in agentSteps" :key="step.id"
+                                     class="flex items-start gap-2 text-xs" style="color: var(--text-secondary);">
+                                    <i v-if="step.status === 'running'" class="fas fa-circle-notch fa-spin mt-0.5 w-4 text-center" style="color: var(--text-accent);"></i>
+                                    <i v-else-if="step.status === 'done'" class="fas fa-check mt-0.5 w-4 text-center" style="color: var(--text-muted);"></i>
+                                    <i v-else :class="['fas mt-0.5 w-4 text-center', step.status === 'error' ? 'fa-circle-exclamation' : 'fa-minus']" style="color: var(--text-muted);"></i>
+                                    <span class="min-w-0">
+                                        <span v-text="step.label"></span>
+                                        <span v-if="step.detail" style="color: var(--text-muted);" v-text="' — ' + step.detail"></span>
+                                    </span>
+                                </div>
                             </div>
                             <div v-if="showProcessingStatus" class="mt-2 flex gap-1">
                                 <div class="h-1 w-4 rounded transition-colors"
@@ -509,8 +605,22 @@
                     </div>
                     <div class="t-meta mt-2 flex items-center justify-between">
                         <span>${t('inquire.sendHint')}</span>
-                        <span v-if="hasActiveFilters" style="color: var(--text-accent);">
-                            <i class="fas fa-filter mr-1"></i>${t('inquire.filtersActive')}
+                        <span class="flex items-center gap-3">
+                            <!-- Context meter: invisible below 50% to avoid
+                                 clutter; past that it shows how full the
+                                 conversation context is, so compaction never
+                                 feels like silent memory loss. -->
+                            <span v-if="contextUsage >= 50" class="flex items-center gap-1.5"
+                                  :title="'Conversation context: ' + formatPercent(contextUsage) + ' — older messages are summarized when it fills up'">
+                                <span class="inline-block w-16 h-1 rounded-full overflow-hidden" style="background: var(--bg-tertiary);">
+                                    <span class="block h-full rounded-full"
+                                          :style="{ width: contextUsage + '%', background: 'var(--bg-accent)' }"></span>
+                                </span>
+                                <span v-text="formatPercent(contextUsage)"></span>
+                            </span>
+                            <span v-if="hasActiveFilters" style="color: var(--text-accent);">
+                                <i class="fas fa-filter mr-1"></i>${t('inquire.filtersActive')}
+                            </span>
                         </span>
                     </div>
                 </div>
@@ -581,42 +691,6 @@
             </div>
         </div>
 
-        <!-- Shares List Modal -->
-        <div v-if="showSharesListModal" class="modal-overlay">
-            <div class="modal-panel modal-panel--lg">
-                <div class="modal-header">
-                    <h3 class="modal-title" v-text="t('modal.sharedTranscripts')"></h3>
-                    <button @click="closeSharesList" class="modal-close" title="Close">
-                        <i class="fas fa-times"></i>
-                    </button>
-                </div>
-                <div class="modal-body space-y-4">
-                    <div v-if="isLoadingShares" class="text-center">
-                        <i class="fas fa-spinner fa-spin text-2xl text-[var(--text-muted)]"></i>
-                    </div>
-                    <div v-else-if="userShares.length === 0" class="text-center text-[var(--text-muted)]">
-                        <span v-text="t('sharedTranscripts.noSharedTranscripts')"></span>
-                    </div>
-                    <div v-else class="space-y-3">
-                        <div v-for="share in userShares" :key="share.id" class="bg-[var(--bg-tertiary)] p-4 rounded-lg border border-[var(--border-primary)]">
-                            <div class="flex justify-between items-start">
-                                <div>
-                                    <p class="font-semibold">${share.recording_title}</p>
-                                    <p class="text-sm text-[var(--text-muted)]">${ t('help.sharedOn') }: ${ formatInstant(share.created_at) }</p>
-                                </div>
-                                <button @click="deleteShare(share.id)" class="text-[var(--text-danger)] hover:opacity-80 p-1"><i class="fas fa-trash"></i></button>
-                            </div>
-                            <div class="mt-4">
-                                <input :value="'{{ request.url_root }}share/' + share.public_id" readonly class="w-full px-3 py-2 bg-[var(--bg-input)] border border-[var(--border-secondary)] rounded-lg text-sm">
-                                <button @click="copyShareLink(share.public_id)" class="mt-2 px-3 py-1 bg-[var(--bg-button)] text-[var(--text-button)] rounded-lg text-sm hover:bg-[var(--bg-button-hover)]">
-                                    <i class="fas fa-copy mr-2"></i>Copy Link
-                                </button>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
     </div>
 
     <!-- CSRF Token Management -->
@@ -646,6 +720,8 @@
 
         document.addEventListener('DOMContentLoaded', async () => {
             await initializeI18n();
+            // Notifications for the shared header's user menu.
+            const { useNotifications } = await import('/static/js/modules/composables/notifications.js');
             
             const csrfToken = ref(document.querySelector('meta[name="csrf-token"]')?.getAttribute('content'));
             const i18nInstance = window.i18n;
@@ -655,6 +731,7 @@
                     // --- State ---
                     const inquireFilters = reactive({
                         selectedTags: [],
+                        selectedFolders: [],
                         selectedSpeakers: [],
                         selectedRecordings: [],
                         dateFrom: null,
@@ -663,6 +740,7 @@
                     
                     // Search queries for filters
                     const tagSearchQuery = ref('');
+                    const folderSearchQuery = ref('');
                     const speakerSearchQuery = ref('');
                     
                     // Use shared components
@@ -692,6 +770,7 @@
                     
                     const availableFilters = reactive({
                         tags: [],
+                        folders: [],
                         speakers: [],
                         recordings: []
                     });
@@ -701,6 +780,19 @@
                     const isInquireChatLoading = ref(false);
                     const chatProcessingStatus = ref('');
                     const showProcessingStatus = ref(false);
+                    // --- Agentic Inquire state (ENABLE_INQUIRE_AGENT beta) ---
+                    // Live tool activity for the in-flight turn; moved onto the
+                    // finished message so provenance persists in the history.
+                    const agentSteps = ref([]);
+                    const answerStarted = ref(false);
+                    // Context accounting: 0-100 estimate from the server, and
+                    // the compaction state. `memory` is the server-produced
+                    // summary of folded turns; `fromIndex` is where verbatim
+                    // history starts in inquireChatMessages; `dividerIndex`
+                    // marks where the "summarized" divider renders.
+                    const contextUsage = ref(0);
+                    const memoryState = reactive({ memory: '', fromIndex: 0, dividerIndex: -1, showMemory: false });
+                    const inquireAbort = ref(null);
                     const inquireMessagesRef = ref(null);
                     const globalError = ref(null);
                     const shouldAutoScroll = ref(true); // Track if we should auto-scroll
@@ -714,6 +806,7 @@
                     // --- Computed ---
                     const hasActiveFilters = computed(() => {
                         return inquireFilters.selectedTags.length > 0 ||
+                               inquireFilters.selectedFolders.length > 0 ||
                                inquireFilters.selectedSpeakers.length > 0 ||
                                inquireFilters.selectedRecordings.length > 0 ||
                                inquireFilters.dateFrom ||
@@ -727,6 +820,13 @@
                         );
                     });
                     
+                    const filteredFolders = computed(() => {
+                        if (!folderSearchQuery.value) return availableFilters.folders;
+                        return availableFilters.folders.filter(folder =>
+                            folder.name.toLowerCase().includes(folderSearchQuery.value.toLowerCase())
+                        );
+                    });
+
                     const filteredSpeakers = computed(() => {
                         if (!speakerSearchQuery.value) return availableFilters.speakers;
                         return availableFilters.speakers.filter(speaker => 
@@ -759,6 +859,7 @@
                             if (response.ok) {
                                 const data = await response.json();
                                 availableFilters.tags = data.tags;
+                                availableFilters.folders = data.folders || [];
                                 availableFilters.speakers = data.speakers;
                                 availableFilters.recordings = data.recordings;
                             }
@@ -767,21 +868,164 @@
                         }
                     };
 
+                    // A typed question is shown as text, never as HTML (#439).
+                    const escapeHtml = (text) => {
+                        const div = document.createElement('div');
+                        div.textContent = text;
+                        return div.innerHTML;
+                    };
+
+                    // Rewrite citation links into numbered chips plus a
+                    // trailing Sources list. The model emits
+                    // [Title @ m:ss](/recordings/<id>?t=s); repeating the full
+                    // title on every chip is noisy, so chips become
+                    // "<n> @ m:ss" (full title on hover), numbered by first
+                    // appearance per unique recording, with one Sources entry
+                    // per recording at the end. Deterministic here rather than
+                    // trusting the model to number consistently.
+                    const decorateCitations = (html, message) => {
+                        try {
+                            const tpl = document.createElement('template');
+                            tpl.innerHTML = html;
+                            const links = [...tpl.content.querySelectorAll('a[href^="/recordings/"]')];
+                            if (!links.length) return html;
+                            const fmtSeconds = (s) => {
+                                s = Math.max(0, Math.floor(s));
+                                const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+                                return h > 0
+                                    ? h + ':' + String(m).padStart(2, '0') + ':' + String(sec).padStart(2, '0')
+                                    : m + ':' + String(sec).padStart(2, '0');
+                            };
+                            const refs = new Map(); // recording id -> {n, title, href}
+                            for (const a of links) {
+                                const href = a.getAttribute('href') || '';
+                                const m = href.match(/^\/recordings\/(\d+)/);
+                                if (!m) continue;
+                                const recId = m[1];
+                                const raw = (a.textContent || '').trim();
+                                // Timestamp truth is the href's seek param; the
+                                // link text is only a fallback (the model
+                                // sometimes writes raw seconds like "@ 1317"
+                                // instead of the formatted time).
+                                const tm = raw.match(/@\s*(\d+(?::\d{1,2}){0,2})\s*$/);
+                                let seconds = null;
+                                const th = href.match(/[?&]t=(\d+)/);
+                                if (th) {
+                                    seconds = parseInt(th[1], 10);
+                                } else if (tm) {
+                                    const parts = tm[1].split(':').map(Number);
+                                    seconds = parts.reduce((acc, p) => acc * 60 + p, 0);
+                                }
+                                const title = (tm ? raw.slice(0, tm.index) : raw).trim() || ('Recording ' + recId);
+                                if (!refs.has(recId)) {
+                                    refs.set(recId, { n: refs.size + 1, title: title, href: '/recordings/' + recId });
+                                }
+                                const entry = refs.get(recId);
+                                if (title.length > entry.title.length) entry.title = title;
+                                a.textContent = seconds !== null ? (entry.n + ' @ ' + fmtSeconds(seconds)) : String(entry.n);
+                                a.setAttribute('title', entry.title);
+                            }
+                            if (message) {
+                                // Persist the displayed numbering so follow-up
+                                // turns can resolve "tell me more about 5":
+                                // this mapping is sent back with the history.
+                                message.sources = [...refs.entries()].map(([id, e]) => ({ n: e.n, recording_id: Number(id), title: e.title }));
+                            }
+                            // Backstop: strip leaked system-record notes if the
+                            // model ever echoes them ("[citations in this answer
+                            // were displayed...]", "[research performed...]").
+                            [...tpl.content.querySelectorAll('p')].forEach(p => {
+                                const txt = p.textContent.trim();
+                                if (/^\[(citations in this answer|research performed|note about the assistant)/i.test(txt) && txt.endsWith(']')) {
+                                    p.remove();
+                                }
+                            });
+                            // Strip a model-written trailing Sources/References
+                            // section (the interface appends its own). Removed
+                            // ONLY when everything after the heading is bare
+                            // citation links — real prose is never dropped.
+                            const topNodes = [...tpl.content.children];
+                            for (let i = topNodes.length - 1; i >= 0; i--) {
+                                const el = topNodes[i];
+                                const headingish = /^H[1-6]$/.test(el.tagName) ||
+                                    (el.tagName === 'P' && el.children.length === 1 &&
+                                     el.firstElementChild && el.firstElementChild.tagName === 'STRONG' &&
+                                     el.firstElementChild.textContent.trim() === el.textContent.trim());
+                                if (!headingish) continue;
+                                if (!/^(sources?|references?|quellen|fuentes|fontes|источники|来源)\s*:?$/i.test(el.textContent.trim())) continue;
+                                const tail = topNodes.slice(i + 1);
+                                const onlyCitations = tail.every(node => {
+                                    const clone = node.cloneNode(true);
+                                    clone.querySelectorAll('a[href^="/recordings/"]').forEach(a => a.remove());
+                                    return clone.textContent.replace(/[\d\s.,;:()\[\]@–—-]+/g, '') === '';
+                                });
+                                if (onlyCitations) {
+                                    tail.forEach(node => node.remove());
+                                    el.remove();
+                                }
+                                break;
+                            }
+                            if (refs.size) {
+                                const wrap = document.createElement('div');
+                                wrap.className = 'citation-refs';
+                                const label = document.createElement('div');
+                                label.className = 'citation-refs__label';
+                                const tSources = t('inquire.sources');
+                                label.textContent = tSources !== 'inquire.sources' ? tSources : 'Sources';
+                                wrap.appendChild(label);
+                                const ol = document.createElement('ol');
+                                for (const entry of refs.values()) {
+                                    const li = document.createElement('li');
+                                    const link = document.createElement('a');
+                                    link.href = entry.href;
+                                    link.textContent = entry.title;
+                                    li.appendChild(link);
+                                    ol.appendChild(li);
+                                }
+                                wrap.appendChild(ol);
+                                tpl.content.appendChild(wrap);
+                            }
+                            return tpl.innerHTML;
+                        } catch (e) {
+                            return html;
+                        }
+                    };
+
+                    const stopInquireChat = () => {
+                        // Aborting the fetch closes the SSE stream; the server
+                        // agent loop stops between steps when the client goes away.
+                        if (inquireAbort.value) inquireAbort.value.abort();
+                    };
+
                     const sendInquireChatMessage = async () => {
                         if (!inquireChatInput.value.trim() || isInquireChatLoading.value) return;
-                        
+
                         const userMessage = inquireChatInput.value.trim();
-                        inquireChatMessages.value.push({ role: 'user', content: userMessage, html: userMessage });
+                        inquireChatMessages.value.push({ role: 'user', content: userMessage, html: escapeHtml(userMessage) });
                         inquireChatInput.value = '';
                         isInquireChatLoading.value = true;
                         showProcessingStatus.value = true;
                         chatProcessingStatus.value = 'Initializing...';
-                        
+                        agentSteps.value = [];
+                        answerStarted.value = false;
+
                         // Always scroll to bottom when user sends a message
                         shouldAutoScroll.value = true;
                         await nextTick();
                         scrollToBottom();
-                        
+
+                        // Verbatim history starts at fromIndex (earlier turns
+                        // live in memoryState.memory after compaction). The
+                        // sent length is needed to map the server's keep_last
+                        // back to an index in the full message list.
+                        const sentHistory = inquireChatMessages.value
+                            .slice(memoryState.fromIndex, -1)
+                            .filter(m => m.role === 'user' || m.role === 'assistant')
+                            .map(m => ({ role: m.role, content: m.content, activity: m.activitySummary || undefined, sources: (m.sources && m.sources.length) ? m.sources : undefined }));
+                        const sentFromIndex = memoryState.fromIndex;
+                        const controller = new AbortController();
+                        inquireAbort.value = controller;
+
                         try {
                             const response = await fetch('/api/inquire/chat', {
                                 method: 'POST',
@@ -789,10 +1033,13 @@
                                     'Content-Type': 'application/json',
                                     'X-CSRFToken': csrfToken.value
                                 },
+                                signal: controller.signal,
                                 body: JSON.stringify({
                                     message: userMessage,
-                                    message_history: inquireChatMessages.value.slice(0, -1),
+                                    message_history: sentHistory,
+                                    conversation_memory: memoryState.memory || undefined,
                                     filter_tags: inquireFilters.selectedTags,
+                                    filter_folders: inquireFilters.selectedFolders,
                                     filter_speakers: inquireFilters.selectedSpeakers,
                                     filter_recording_ids: inquireFilters.selectedRecordings,
                                     filter_date_from: inquireFilters.dateFrom,
@@ -800,24 +1047,25 @@
                                     context_chunks: 8
                                 })
                             });
-                            
+
                             if (!response.ok) {
-                                throw new Error('Chat request failed');
+                                const tFailed = t('errors.requestFailed', { status: response.status });
+                                throw new Error(tFailed !== 'errors.requestFailed' ? tFailed : 'Chat request failed');
                             }
-                            
+
                             // Handle streaming response
                             const reader = response.body.getReader();
                             const decoder = new TextDecoder();
-                            let assistantMessage = reactive({ role: 'assistant', content: '', html: '' });
+                            let assistantMessage = reactive({ role: 'assistant', content: '', html: '', steps: [], activitySummary: '', showSteps: false });
                             let messageAdded = false;
-                            
+
                             while (true) {
                                 const { done, value } = await reader.read();
                                 if (done) break;
-                                
+
                                 const chunk = decoder.decode(value, { stream: true });
                                 const lines = chunk.split('\n');
-                                
+
                                 for (const line of lines) {
                                     if (line.startsWith('data: ')) {
                                         try {
@@ -825,19 +1073,59 @@
                                             if (data.status && data.message) {
                                                 // Update processing status
                                                 chatProcessingStatus.value = data.message;
+                                            } else if (data.agent_step) {
+                                                // Upsert by id: 'running' first, then the
+                                                // completion state with the result detail.
+                                                const step = data.agent_step;
+                                                const existing = agentSteps.value.find(s => s.id === step.id);
+                                                if (existing) Object.assign(existing, step);
+                                                else agentSteps.value.push(step);
+                                                showProcessingStatus.value = false;
+                                                await nextTick();
+                                                scrollToBottom();
+                                            } else if (data.context_usage !== undefined) {
+                                                contextUsage.value = data.context_usage;
+                                            } else if (data.context_compacted) {
+                                                // Older turns were folded into a memory block.
+                                                // Verbatim history now starts keep_last messages
+                                                // from the end of what we sent.
+                                                const kept = data.context_compacted.keep_last || 0;
+                                                memoryState.memory = data.context_compacted.memory || '';
+                                                const newFrom = Math.max(sentFromIndex, inquireChatMessages.value.length - 1 - kept);
+                                                memoryState.fromIndex = newFrom;
+                                                memoryState.dividerIndex = newFrom;
+                                            } else if (data.conversation_memory) {
+                                                memoryState.memory = data.conversation_memory;
+                                            } else if (data.agent_summary) {
+                                                assistantMessage.activitySummary = data.agent_summary.line || '';
+                                                assistantMessage.agentStepCount = data.agent_summary.steps || 0;
+                                            } else if (data.thinking) {
+                                                // Surfaced reasoning: keep the latest status text
+                                                // visible but do not render into the answer.
+                                                chatProcessingStatus.value = 'Thinking...';
                                             } else if (data.delta) {
                                                 // Hide status and start showing response
                                                 if (!messageAdded) {
                                                     inquireChatMessages.value.push(assistantMessage);
                                                     messageAdded = true;
                                                     showProcessingStatus.value = false;
+                                                    answerStarted.value = true;
+                                                    // Attach the activity timeline to the message
+                                                    // so provenance persists after the turn.
+                                                    assistantMessage.steps = agentSteps.value;
                                                 }
                                                 assistantMessage.content += data.delta;
-                                                assistantMessage.html = marked.parse(assistantMessage.content);
+                                                assistantMessage.html = decorateCitations(window.renderMarkdownSafe(assistantMessage.content), assistantMessage);
                                                 // Smart scroll during streaming
                                                 await nextTick();
                                                 scrollToBottom();
                                             } else if (data.end_of_stream) {
+                                                // Flag output-token-limit truncation instead of
+                                                // presenting the partial answer as complete (issue #349).
+                                                if (data.truncated && messageAdded && assistantMessage.content) {
+                                                    assistantMessage.content += `\n\n_⚠️ ${t('chat.responseTruncated')}_`;
+                                                    assistantMessage.html = decorateCitations(window.renderMarkdownSafe(assistantMessage.content), assistantMessage);
+                                                }
                                                 return;
                                             } else if (data.error) {
                                                 if (data.budget_exceeded) {
@@ -846,17 +1134,29 @@
                                                 throw new Error(data.error);
                                             }
                                         } catch (parseError) {
-                                            console.warn('Failed to parse SSE data:', line);
+                                            if (parseError instanceof SyntaxError) {
+                                                console.warn('Failed to parse SSE data:', line);
+                                            } else {
+                                                throw parseError;
+                                            }
                                         }
                                     }
                                 }
                             }
                         } catch (error) {
-                            console.error('Error in inquire chat:', error);
-                            setGlobalError(error.message || 'Chat failed. Please try again.', 10000);
+                            if (error && error.name === 'AbortError') {
+                                // User pressed Stop: keep whatever streamed so far.
+                                console.info('Inquire chat stopped by user');
+                            } else {
+                                console.error('Error in inquire chat:', error);
+                                const tChatFailed = t('inquire.chatFailed');
+                                setGlobalError(error.message || (tChatFailed !== 'inquire.chatFailed' ? tChatFailed : 'Chat failed. Please try again.'), 10000);
+                            }
                         } finally {
                             isInquireChatLoading.value = false;
                             showProcessingStatus.value = false;
+                            inquireAbort.value = null;
+                            agentSteps.value = [];
                             loadTokenBudget(); // Refresh token usage after chat
                             await nextTick();
                             scrollToBottom(); // Use smart scrolling
@@ -876,11 +1176,18 @@
 
                     const clearInquireFilters = () => {
                         inquireFilters.selectedTags = [];
+                        inquireFilters.selectedFolders = [];
                         inquireFilters.selectedSpeakers = [];
                         inquireFilters.selectedRecordings = [];
                         inquireFilters.dateFrom = null;
                         inquireFilters.dateTo = null;
                         inquireChatMessages.value = [];
+                        // New conversation: drop the agent's memory/compaction state.
+                        memoryState.memory = '';
+                        memoryState.fromIndex = 0;
+                        memoryState.dividerIndex = -1;
+                        memoryState.showMemory = false;
+                        contextUsage.value = 0;
                     };
                     
                     const formatDate = (dateString) => {
@@ -892,7 +1199,7 @@
                             s = s.replace(' ', 'T') + 'Z';
                         }
                         const date = new Date(s);
-                        return date.toLocaleDateString();
+                        return date.toLocaleDateString(window.i18n?.getIntlLocale?.());
                     };
 
                     // For INSTANT timestamps (e.g. share created_at): backend sends
@@ -904,7 +1211,7 @@
                             s = s.replace(' ', 'T') + 'Z';
                         }
                         const date = new Date(s);
-                        return date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                        return date.toLocaleDateString(window.i18n?.getIntlLocale?.()) + ' ' + date.toLocaleTimeString(window.i18n?.getIntlLocale?.(), { hour: '2-digit', minute: '2-digit' });
                     };
 
                     // Smart scrolling functions
@@ -1000,9 +1307,24 @@
                         }
                     });
 
+                    const headerNotifications = useNotifications({}, {
+                        t: (key, params) => i18nInstance ? i18nInstance.t(key, params) : key,
+                    });
+                    onMounted(() => headerNotifications.startNotificationPolling());
+
                     return {
                         // i18n - bind to i18n instance to maintain context
                         t: (key, params) => i18nInstance ? i18nInstance.t(key, params) : key,
+                        // components/header-controls.html formats numbers with this (#480)
+                        uiLocale: () => window.i18n?.getIntlLocale?.(),
+                        formatPercent: (pct, options) => (window.i18n?.formatPercent ? window.i18n.formatPercent(pct, options) : `${Math.round((Number(pct) || 0) * 10) / 10}%`),
+
+                        // Shared header controls (components/header-controls.html)
+                        ...headerNotifications,
+                        switchToUploadView: () => { window.location.href = '/?upload=1'; },
+                        showInstallButton: false,
+                        isPWAInstalled: true,
+                        promptInstall: () => {},
                         
                         // State
                         inquireFilters,
@@ -1010,6 +1332,11 @@
                         inquireChatMessages,
                         inquireChatInput,
                         isInquireChatLoading,
+                        agentSteps,
+                        answerStarted,
+                        contextUsage,
+                        memoryState,
+                        stopInquireChat,
                         inquireMessagesRef,
                         globalError,
                         tokenBudget,
@@ -1018,6 +1345,7 @@
                         chatProcessingStatus,
                         showProcessingStatus,
                         tagSearchQuery,
+                        folderSearchQuery,
                         speakerSearchQuery,
                         
                         // Dark Mode
@@ -1045,6 +1373,7 @@
                         // Computed
                         hasActiveFilters,
                         filteredTags,
+                        filteredFolders,
                         filteredSpeakers,
                         
                         // Functions

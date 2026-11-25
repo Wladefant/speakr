@@ -7,6 +7,7 @@ from flask import current_app
 
 from src.database import db
 from src.models import User
+from src.utils.localization import translate
 
 # Keep a single OAuth client instance
 _oauth: Optional[OAuth] = None
@@ -45,10 +46,12 @@ def get_sso_config() -> Dict[str, Optional[str]]:
         "disable_password_login": _str_to_bool(os.environ.get("SSO_DISABLE_PASSWORD_LOGIN", "false")),
         # When true, an SSO login whose email claim is not marked verified is
         # refused before that email is used to link to (or provision) a local
-        # account. Default false to preserve existing behaviour; enable it when
-        # your IdP reliably sends email_verified, to prevent a malicious or
-        # misconfigured IdP from taking over an account by asserting its email.
-        "require_verified_email": _str_to_bool(os.environ.get("SSO_REQUIRE_VERIFIED_EMAIL", "false")),
+        # account. Secure by default (true): otherwise a malicious or
+        # misconfigured IdP — or a public IdP where a user can set an arbitrary
+        # email claim — could take over a local account by asserting its email
+        # (GHSA-w4q5-3526-j82j). Set SSO_REQUIRE_VERIFIED_EMAIL=false ONLY for a
+        # trusted IdP that does not send an email_verified claim.
+        "require_verified_email": _str_to_bool(os.environ.get("SSO_REQUIRE_VERIFIED_EMAIL", "true")),
     }
 
 
@@ -73,6 +76,13 @@ def init_sso_client(app) -> Optional[OAuth]:
         return _oauth
 
     cfg = get_sso_config()
+    if not cfg["require_verified_email"]:
+        app.logger.warning(
+            "SSO_REQUIRE_VERIFIED_EMAIL=false: SSO logins are accepted even when the "
+            "IdP does not mark the email claim as verified. Use this only with a "
+            "trusted IdP that omits email_verified; otherwise a malicious or "
+            "misconfigured IdP can take over local accounts by asserting their email."
+        )
     oauth = OAuth(app)
     oauth.register(
         name="sso",
@@ -89,6 +99,41 @@ def init_sso_client(app) -> Optional[OAuth]:
 def get_sso_client() -> Optional[OAuth]:
     """Return initialized OAuth client or None."""
     return _oauth
+
+
+def resolve_userinfo(oauth, token) -> Dict:
+    """Resolve the full OIDC claim set for a login.
+
+    Authlib exposes the ID token claims as ``token['userinfo']``, but many
+    IdPs (Keycloak, Azure AD, LemonLDAP::NG) only publish ``email``, ``name``
+    and ``preferred_username`` at the UserInfo endpoint, not inside the ID
+    token. When any claim we consume is missing from the ID token, fetch the
+    endpoint and overlay its claims. Endpoint claims are discarded if their
+    ``sub`` does not match the ID token's (OIDC Core 5.3.2).
+    """
+    cfg = get_sso_config()
+    claims = dict(token.get("userinfo") or {})
+    wanted = ("email", cfg["username_claim"] or "preferred_username", cfg["name_claim"] or "name")
+    if claims and all(claims.get(c) for c in wanted):
+        return claims
+
+    try:
+        endpoint_claims = dict(oauth.sso.userinfo(token=token))
+    except Exception as e:
+        current_app.logger.warning(
+            "SSO UserInfo endpoint call failed, falling back to ID token claims: %s", e
+        )
+        return claims
+
+    if claims.get("sub") and endpoint_claims.get("sub") and claims["sub"] != endpoint_claims["sub"]:
+        current_app.logger.warning(
+            "SSO UserInfo 'sub' does not match ID token 'sub'; ignoring endpoint claims"
+        )
+        return claims
+
+    merged = dict(claims)
+    merged.update({k: v for k, v in endpoint_claims.items() if v is not None})
+    return merged
 
 
 def is_domain_allowed(email: Optional[str]) -> bool:
@@ -133,18 +178,18 @@ def create_or_update_sso_user(userinfo: Dict[str, str]) -> User:
     """Create or update a user from SSO (OIDC) claims."""
     cfg = get_sso_config()
     subject = userinfo.get("sub")
-    email = userinfo.get("email")
+    email = User.normalize_email(userinfo.get("email"))
     username_claim = cfg["username_claim"]
     name_claim = cfg["name_claim"]
 
     if not subject:
-        raise ValueError("SSO userinfo does not include 'sub'")
+        raise ValueError(translate('server.sso.missingSubject'))
 
     if not cfg["auto_register"] and not User.query.filter_by(sso_subject=subject).first():
-        raise PermissionError("SSO auto-registration is disabled")
+        raise PermissionError(translate('server.sso.autoRegistrationDisabled'))
 
     if email and not is_domain_allowed(email):
-        raise PermissionError("Email domain is not allowed for SSO sign-up")
+        raise PermissionError(translate('server.sso.domainNotAllowed'))
 
     # Existing by subject — already linked, so no email trust is involved.
     # This path is unaffected by require_verified_email (an already-linked user
@@ -160,11 +205,11 @@ def create_or_update_sso_user(userinfo: Dict[str, str]) -> User:
     # unverified email so a malicious/misconfigured IdP can't take over an
     # account (or provision under someone else's address) by asserting it.
     if email and cfg["require_verified_email"] and not _claim_is_truthy(userinfo.get("email_verified")):
-        raise PermissionError("SSO email address is not verified")
+        raise PermissionError(translate('server.sso.emailNotVerified'))
 
     # Existing by email: attach SSO
     if email:
-        existing_email_user = User.query.filter_by(email=email).first()
+        existing_email_user = User.find_by_email(email)
         if existing_email_user:
             existing_email_user.sso_provider = cfg["provider_name"]
             existing_email_user.sso_subject = subject
@@ -185,6 +230,8 @@ def create_or_update_sso_user(userinfo: Dict[str, str]) -> User:
         sso_subject=subject,
         name=name_value,
     )
+    from src.services.storage_quota import default_quota_mb
+    user.storage_quota_mb = default_quota_mb()
     db.session.add(user)
     db.session.commit()
     return user
@@ -193,7 +240,7 @@ def create_or_update_sso_user(userinfo: Dict[str, str]) -> User:
 def _update_profile_fields(user: User, userinfo: Dict[str, str], name_claim: Optional[str]) -> None:
     """Update optional profile fields from SSO claims."""
     if not user.email and userinfo.get("email"):
-        user.email = userinfo["email"]
+        user.email = User.normalize_email(userinfo["email"])
     if name_claim and userinfo.get(name_claim):
         user.name = userinfo[name_claim]
 

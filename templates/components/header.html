@@ -7,16 +7,20 @@
     <!-- Left side: Menu toggle + (logo OR recording title+meta+actions) -->
     <div class="flex items-center gap-2 sm:gap-3 min-w-0 flex-1">
         <!-- Menu Toggle Button -->
+        <!-- -mr-2 / sm:-mr-1.5: the button is a 40 / 36 px box around a 16 px
+             glyph, so its padding reads as extra space before the logo.
+             Pulling the logo in balances bars, logo and title (12 and 10 px
+             on phones, 16 and 14 px from sm up). -->
         <button @click="toggleSidebar"
-                class="btn btn--icon flex-shrink-0"
-                :title="isSidebarCollapsed ? 'Show sidebar' : 'Hide sidebar'">
+                class="btn btn--icon header-action flex-shrink-0 -mr-2 sm:-mr-1.5"
+                :title="isSidebarCollapsed ? t('tooltips.showSidebar') : t('tooltips.hideSidebar')">
             <i class="fas fa-bars text-lg"></i>
         </button>
 
         <!-- LIST VIEW (or any non-detail screen): Speakr logo + name -->
         <div v-if="currentView !== 'detail' || !selectedRecording"
-             class="flex items-center gap-2 sm:gap-3 min-w-0">
-            <img src="{{ url_for('static', filename='img/icon-32x32.png') }}" alt="Speakr" class="app-logo w-7 h-7 sm:w-8 sm:h-8 flex-shrink-0">
+             class="flex items-center gap-2.5 sm:gap-3.5 min-w-0">
+            <img src="{{ url_for('static', filename='img/icon-64.png') }}" srcset="{{ url_for('static', filename='img/icon-64.png') }} 1x, {{ url_for('static', filename='img/icon-128.png') }} 2x" alt="Speakr" class="app-logo w-7 h-7 sm:w-8 sm:h-8 flex-shrink-0">
             <h1 class="text-lg sm:text-xl font-bold text-[var(--text-primary)] truncate">Speakr</h1>
         </div>
 
@@ -32,8 +36,8 @@
                  content, which made the input collapse to a few dozen
                  pixels in edit mode. -->
             <div class="flex items-center gap-2 min-w-0 flex-1">
-                <a href="/" class="flex-shrink-0 hidden sm:block" :title="'Back to Speakr'">
-                    <img src="{{ url_for('static', filename='img/icon-32x32.png') }}" alt="Speakr" class="app-logo w-7 h-7">
+                <a href="/" class="flex-shrink-0 hidden sm:block sm:mr-1.5" :title="t('tooltips.backToHome')">
+                    <img src="{{ url_for('static', filename='img/icon-64.png') }}" srcset="{{ url_for('static', filename='img/icon-64.png') }} 1x, {{ url_for('static', filename='img/icon-128.png') }} 2x" alt="Speakr" class="app-logo w-7 h-7">
                 </a>
                 <h1 v-if="!editingTitle"
                     @dblclick="selectedRecording.can_edit !== false ? toggleEditTitle() : null"
@@ -42,8 +46,9 @@
                         selectedRecording.is_shared ? 'text-[var(--text-accent)]' : 'text-[var(--text-primary)]',
                         selectedRecording.can_edit !== false ? 'cursor-text hover:opacity-80' : ''
                     ]"
-                    :title="selectedRecording.title || 'Untitled Recording'">
-                    ${selectedRecording.title || 'Untitled Recording'}
+                    dir="auto"
+                    :title="selectedRecording.title || t('help.untitled')">
+                    ${selectedRecording.title || t('help.untitled')}
                 </h1>
                 <input v-else
                        v-model="selectedRecording.title"
@@ -52,7 +57,7 @@
                        @keyup.esc="cancelEditTitle"
                        ref="titleInput"
                        class="text-base sm:text-lg font-semibold bg-transparent border-b border-[var(--border-focus)] focus:outline-none text-[var(--text-primary)] flex-1 px-1 min-w-0"
-                       placeholder="Untitled Recording">
+                       :placeholder="t('help.untitled')">
                 <button v-if="!editingTitle && selectedRecording.can_edit !== false"
                         @click="toggleEditTitle"
                         class="btn btn--icon btn--sm flex-shrink-0"
@@ -88,6 +93,26 @@
              on narrow screens; mobile-header.html surfaces them in the
              expanded meta panel. -->
         <template v-if="currentView === 'detail' && selectedRecording && !selectedRecording.incognito">
+            <!-- Action groups (#394): organize (inbox, star, archive), then
+                 place (folder, tags), then process (a Reprocess menu and
+                 speakers), then share and a More menu holding both deletes. -->
+            <button @click="toggleInbox(selectedRecording)" class="btn btn--icon hidden md:inline-flex"
+                    :style="selectedRecording.is_inbox ? 'color: #3b82f6;' : ''"
+                    :title="selectedRecording.is_inbox ? t('tooltips.markAsRead') : t('tooltips.moveToInbox')">
+                <i class="fas fa-inbox"></i>
+            </button>
+            <button @click="toggleHighlight(selectedRecording)" class="btn btn--icon hidden md:inline-flex"
+                    :style="selectedRecording.is_highlighted ? 'color: #eab308;' : ''"
+                    :title="selectedRecording.is_highlighted ? t('tooltips.removeHighlight') : t('tooltips.highlight')">
+                <i class="fas fa-star"></i>
+            </button>
+            <button @click="toggleArchive(selectedRecording)" class="btn btn--icon hidden md:inline-flex"
+                    :style="selectedRecording.is_archived ? 'color: var(--text-accent);' : ''"
+                    :aria-pressed="!!selectedRecording.is_archived"
+                    :title="selectedRecording.is_archived ? t('archive.unarchive') : t('archive.archive')">
+                <i class="fas fa-box-archive"></i>
+            </button>
+            <div class="hidden md:block w-px h-5 bg-[var(--border-primary)] mx-0.5"></div>
             <!-- Assign-folder dropdown. A custom themed menu, not a raw
                  <select> (whose OS-rendered option list ignored the app
                  theme — looked out of place against the dark UI). -->
@@ -119,135 +144,84 @@
                     </button>
                 </div>
             </div>
-            <button @click="toggleInbox(selectedRecording)" class="btn btn--icon hidden md:inline-flex"
-                    :style="selectedRecording.is_inbox ? 'color: #3b82f6;' : ''"
-                    :title="selectedRecording.is_inbox ? 'Mark as Read' : 'Move to Inbox'">
-                <i class="fas fa-inbox"></i>
-            </button>
-            <button @click="toggleHighlight(selectedRecording)" class="btn btn--icon hidden md:inline-flex"
-                    :style="selectedRecording.is_highlighted ? 'color: #eab308;' : ''"
-                    :title="selectedRecording.is_highlighted ? 'Remove Highlight' : 'Highlight'">
-                <i class="fas fa-star"></i>
-            </button>
             <button @click="editRecordingTags(selectedRecording)" class="btn btn--icon hidden md:inline-flex"
                     :title="t('buttons.editTags')">
                 <i class="fas fa-tags"></i>
             </button>
-            <button @click="confirmReprocess('transcription', selectedRecording)"
-                    v-if="selectedRecording && selectedRecording.can_edit !== false && (selectedRecording.status === 'COMPLETED' || selectedRecording.status === 'FAILED')"
-                    class="btn btn--icon hidden lg:inline-flex"
-                    :title="useAsrEndpoint ? 'Reprocess with ASR' : 'Reprocess transcription'">
-                <i class="fas fa-redo-alt"></i>
-            </button>
-            <button @click="confirmReprocess('summary', selectedRecording)"
-                    v-if="selectedRecording && selectedRecording.can_edit !== false && (selectedRecording.status === 'COMPLETED' || selectedRecording.status === 'FAILED')"
-                    class="btn btn--icon hidden lg:inline-flex"
-                    :title="t('buttons.reprocessSummary')">
-                <i class="fas fa-sync-alt"></i>
-            </button>
-            <button @click="confirmReset(selectedRecording)" v-if="['PENDING', 'PROCESSING', 'SUMMARIZING', 'FAILED'].includes(selectedRecording.status)"
-                    class="btn btn--icon hidden md:inline-flex" style="color: rgb(249, 115, 22);"
-                    :title="t('buttons.resetStuckProcessing')">
-                <i class="fas fa-undo"></i>
-            </button>
+            <div class="hidden md:block w-px h-5 bg-[var(--border-primary)] mx-0.5"></div>
+            <!-- Reprocess menu: transcription and summary for settled
+                 recordings, reset for stuck ones. Transcription needs the
+                 audio, so it is left out once the audio is removed. -->
+            <div v-if="(selectedRecording.can_edit !== false && (selectedRecording.status === 'COMPLETED' || selectedRecording.status === 'FAILED')) || ['PENDING', 'QUEUED', 'PROCESSING', 'SUMMARIZING', 'FAILED'].includes(selectedRecording.status)"
+                 class="relative hidden md:inline-flex" data-header-reprocess-menu>
+                <button @click.stop="showHeaderReprocessMenu = !showHeaderReprocessMenu; showHeaderMoreMenu = false"
+                        class="btn btn--icon" :aria-expanded="showHeaderReprocessMenu" aria-haspopup="menu"
+                        :style="['PENDING', 'PROCESSING', 'SUMMARIZING'].includes(selectedRecording.status) ? 'color: rgb(249, 115, 22);' : ''"
+                        :title="t('headerActions.reprocess')" :aria-label="t('headerActions.reprocess')">
+                    <i class="fas fa-redo-alt"></i>
+                    <i class="fas fa-caret-down text-[10px] ml-0.5"></i>
+                </button>
+                <div v-if="showHeaderReprocessMenu" role="menu" class="absolute right-0 top-full mt-2 min-w-[15rem] surface-raised z-50 py-1">
+                    <button v-if="selectedRecording.can_edit !== false && (selectedRecording.status === 'COMPLETED' || selectedRecording.status === 'FAILED') && !selectedRecording.audio_deleted_at"
+                            role="menuitem" @click="showHeaderReprocessMenu = false; confirmReprocess('transcription', selectedRecording)"
+                            class="w-full flex items-center gap-2 px-3 py-2 text-left text-sm hover:bg-[var(--bg-tertiary)] transition-colors whitespace-nowrap">
+                        <i class="fas fa-redo-alt w-4 text-center text-[var(--text-muted)]"></i>
+                        <span v-text="useAsrEndpoint ? t('tooltips.reprocessWithAsr') : t('tooltips.reprocessTranscription')"></span>
+                    </button>
+                    <button v-if="selectedRecording.can_edit !== false && (selectedRecording.status === 'COMPLETED' || selectedRecording.status === 'FAILED')"
+                            role="menuitem" @click="showHeaderReprocessMenu = false; confirmReprocess('summary', selectedRecording)"
+                            class="w-full flex items-center gap-2 px-3 py-2 text-left text-sm hover:bg-[var(--bg-tertiary)] transition-colors whitespace-nowrap">
+                        <i class="fas fa-sync-alt w-4 text-center text-[var(--text-muted)]"></i>
+                        <span v-text="t('buttons.reprocessSummary')"></span>
+                    </button>
+                    <button v-if="['PENDING', 'QUEUED', 'PROCESSING', 'SUMMARIZING', 'FAILED'].includes(selectedRecording.status)"
+                            role="menuitem" @click="showHeaderReprocessMenu = false; confirmReset(selectedRecording)"
+                            class="w-full flex items-center gap-2 px-3 py-2 text-left text-sm hover:bg-[var(--bg-tertiary)] transition-colors whitespace-nowrap" style="color: rgb(249, 115, 22);">
+                        <i class="fas fa-undo w-4 text-center"></i>
+                        <span v-text="t('buttons.resetStuckProcessing')"></span>
+                    </button>
+                </div>
+            </div>
             <button @click="openSpeakerModal" v-if="processedTranscription.hasDialogue"
-                    class="btn btn--icon hidden lg:inline-flex"
+                    class="btn btn--icon hidden md:inline-flex"
                     :title="t('buttons.identifySpeakers')">
                 <i class="fas fa-user-tag"></i>
             </button>
+            <div class="hidden md:block w-px h-5 bg-[var(--border-primary)] mx-0.5"></div>
             <button v-if="!selectedRecording.is_shared || (selectedRecording.share_info && selectedRecording.share_info.can_reshare)"
                     @click="openUnifiedShareModal(selectedRecording)"
                     class="btn btn--icon hidden md:inline-flex"
                     :title="t('buttons.shareRecording')">
                 <i class="fas fa-share-alt"></i>
             </button>
-            <button v-if="canDeleteRecordings && selectedRecording.can_delete !== false" @click="confirmDelete(selectedRecording)"
-                    class="btn btn--icon hidden md:inline-flex" style="color: var(--text-danger);">
-                <i class="fas fa-trash"></i>
-            </button>
+            <!-- More menu: the destructive actions, kept one click further away. -->
+            <div v-if="canDeleteRecordings && selectedRecording.can_delete !== false"
+                 class="relative hidden md:inline-flex" data-header-more-menu>
+                <button @click.stop="showHeaderMoreMenu = !showHeaderMoreMenu; showHeaderReprocessMenu = false"
+                        class="btn btn--icon" :aria-expanded="showHeaderMoreMenu" aria-haspopup="menu"
+                        :title="t('headerActions.more')" :aria-label="t('headerActions.more')">
+                    <i class="fas fa-ellipsis-vertical"></i>
+                </button>
+                <div v-if="showHeaderMoreMenu" role="menu" class="absolute right-0 top-full mt-2 min-w-[15rem] surface-raised z-50 py-1">
+                    <button v-if="!selectedRecording.audio_deleted_at && (selectedRecording.status === 'COMPLETED' || selectedRecording.status === 'FAILED')"
+                            role="menuitem" @click="showHeaderMoreMenu = false; confirmDeleteAudio(selectedRecording)"
+                            class="w-full flex items-center gap-2 px-3 py-2 text-left text-sm hover:bg-[var(--bg-tertiary)] transition-colors whitespace-nowrap">
+                        <i class="fas fa-volume-xmark w-4 text-center text-[var(--text-muted)]"></i>
+                        <span v-text="((selectedRecording.mime_type && selectedRecording.mime_type.startsWith('video/')) ? t('deleteAudio.actionVideo') : t('deleteAudio.action'))"></span>
+                    </button>
+                    <div v-if="!selectedRecording.audio_deleted_at && (selectedRecording.status === 'COMPLETED' || selectedRecording.status === 'FAILED')"
+                         class="my-1 border-t border-[var(--border-primary)]"></div>
+                    <button role="menuitem" @click="showHeaderMoreMenu = false; confirmDelete(selectedRecording)"
+                            class="w-full flex items-center gap-2 px-3 py-2 text-left text-sm hover:bg-[var(--bg-tertiary)] transition-colors whitespace-nowrap" style="color: var(--text-danger);">
+                        <i class="fas fa-trash w-4 text-center"></i>
+                        <span v-text="t('headerActions.deleteRecording')"></span>
+                    </button>
+                </div>
+            </div>
             <!-- Vertical divider between action icons and global controls -->
             <div class="hidden md:block w-px h-6 bg-[var(--border-primary)] mx-1"></div>
         </template>
 
-        {% include 'components/token_budget_indicator.html' %}
-
-        <!-- Inquire / Install PWA / New Recording header buttons.
-             All three use the .btn .btn--sm primitive so their height
-             + padding + font size are identical; only the colour
-             intent differs (Inquire = quiet/highlighted, PWA Install
-             = primary-success, New Recording = primary). -->
-        <!-- Inquire Mode Button -->
-        {% if inquire_mode_enabled %}
-        <a href="/inquire" class="btn btn--sm" style="background: var(--bg-accent); color: var(--text-accent); border-color: transparent;">
-            <i class="fas fa-search"></i>
-            <span class="hidden sm:inline" v-text="t('inquire.title')"></span>
-        </a>
-        {% endif %}
-
-        <!-- Install PWA Button -->
-        <button v-if="showInstallButton && !isPWAInstalled"
-                @click="promptInstall"
-                class="btn btn--sm"
-                style="background: #16a34a; color: #fff; border-color: transparent;"
-                :title="t('pwa.installApp')">
-            <i class="fas fa-download"></i>
-            <span class="hidden sm:inline" v-text="t('pwa.installApp')"></span>
-        </button>
-
-        <!-- New Recording Button -->
-        <button @click="switchToUploadView" class="btn btn--sm btn--primary">
-            <i class="fas fa-plus"></i><span class="hidden sm:inline" v-text="t('nav.newRecording')"></span>
-        </button>
-
-        <!-- User menu -->
-        {% if current_user.is_authenticated %}
-        <div class="relative">
-            <button @click="isUserMenuOpen = !isUserMenuOpen"
-                    data-user-menu-toggle
-                    class="btn btn--icon"
-                    :title="t('admin.userMenu')">
-                <i class="fas fa-user-circle text-lg"></i>
-            </button>
-
-            <!-- User dropdown -->
-            <div v-if="isUserMenuOpen"
-                 data-user-menu-dropdown
-                 class="absolute right-0 mt-2 w-56 surface-raised z-50">
-                <a href="/account" class="block px-4 py-2 hover:bg-[var(--bg-tertiary)] transition-colors">
-                    <i class="fas fa-cog mr-2 w-4 text-center"></i><span v-text="t('nav.settings')"></span>
-                </a>
-                <a href="/account#tags" class="block px-4 py-2 hover:bg-[var(--bg-tertiary)] transition-colors">
-                    <i class="fas fa-tags mr-2 w-4 text-center"></i><span v-text="t('help.tagManagement')"></span>
-                </a>
-                <button @click="openSharesList" class="w-full text-left px-4 py-2 hover:bg-[var(--bg-tertiary)] transition-colors flex items-center">
-                    <i class="fas fa-share-alt mr-2 w-4 text-center"></i><span v-text="t('modal.sharedTranscripts')"></span>
-                </button>
-                {% if current_user.is_admin %}
-                <a href="/admin" class="block px-4 py-2 hover:bg-[var(--bg-tertiary)] transition-colors">
-                    <i class="fas fa-user-shield mr-2 w-4 text-center"></i>
-                    <span v-text="t('admin.title')"></span>
-                </a>
-                {% elif is_group_admin %}
-                <a href="/group-management" class="block px-4 py-2 hover:bg-[var(--bg-tertiary)] transition-colors">
-                    <i class="fas fa-users-cog mr-2 w-4 text-center"></i>
-                    <span v-text="t('nav.groupManagement')"></span>
-                </a>
-                {% endif %}
-                <div class="border-t border-[var(--border-primary)] my-1"></div>
-                <button @click="toggleDarkMode" class="w-full text-left px-4 py-2 hover:bg-[var(--bg-tertiary)] transition-colors flex items-center">
-                    <i :class="isDarkMode ? 'fas fa-sun' : 'fas fa-moon'" class="mr-2 w-4 text-center"></i>
-                    <span v-text="isDarkMode ? t('nav.lightMode') : t('nav.darkMode')"></span>
-                </button>
-                <button @click="openColorSchemeModal" class="w-full text-left px-4 py-2 hover:bg-[var(--bg-tertiary)] transition-colors flex items-center">
-                    <i class="fas fa-palette mr-2 w-4 text-center"></i>
-                    <span v-text="t('modal.colorScheme')"></span>
-                </button>
-                <div class="border-t border-[var(--border-primary)] my-1"></div>
-                <a href="/logout" class="block px-4 py-2 hover:bg-[var(--bg-tertiary)] transition-colors">
-                    <i class="fas fa-sign-out-alt mr-2 w-4 text-center"></i><span v-text="t('nav.signOut')"></span>
-                </a>
-            </div>
-        </div>
-        {% endif %}
+        {% include 'components/header-controls.html' %}
     </div>
 </header>

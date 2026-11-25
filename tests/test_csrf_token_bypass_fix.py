@@ -47,7 +47,7 @@ from src.utils.token_auth import hash_token
 def _make_user(prefix, **overrides):
     suffix = uuid.uuid4().hex[:8]
     user = User(
-        username=f"{prefix}_{suffix}",
+        username=f"{prefix[:11]}_{suffix}",
         email=f"{prefix}_{suffix}@local.test",
         password=overrides.pop('password', 'placeholder-bcrypt-hash'),
         **overrides,
@@ -335,8 +335,12 @@ def test_sso_only_user_can_add_password_via_password_reset_flow():
 
             # Step 5: reset_password sets the first password.
             # Patch the token verifier so we do not need the real
-            # serializer round-trip for the test.
+            # serializer round-trip for the test. The real send step stores
+            # the token on the user; reset_password now binds to that stored
+            # value (single-use enforcement), so mirror that here.
             new_password = 'A_Strong_New_Password!1'
+            user.password_reset_token = 'fake-token-value'
+            db.session.commit()
             with patch('src.api.auth.verify_reset_token', return_value=user.id):
                 resp = client.post(
                     '/reset-password/fake-token-value',
@@ -400,11 +404,11 @@ def test_api_v1_blueprint_remains_csrf_exempt_for_all_token_methods():
         app.config['WTF_CSRF_ENABLED'] = saved
 
 
-def test_api_v1_post_with_query_string_token_still_works():
-    """Critical for backwards compatibility: a POST to /api/v1/* with
-    ``?token=...`` still succeeds, because the v1 blueprint is
-    blueprint-level CSRF-exempt. The fix only changed how non-v1
-    endpoints react to a query-string token, not the v1 surface."""
+def test_api_v1_post_with_query_string_token_is_refused():
+    """#500: ``?token=`` is deprecated and accepted only on GET and HEAD.
+    A POST to /api/v1/* that carries the token only in the query string
+    gets 401 query_token_read_only (never a 400 CSRF rejection), and the
+    view does not run."""
     saved = app.config.get('WTF_CSRF_ENABLED', True)
     app.config['WTF_CSRF_ENABLED'] = True
     try:
@@ -435,14 +439,10 @@ def test_api_v1_post_with_query_string_token_still_works():
                 resp = client.post(
                     f'/api/v1/recordings/{rec.id}/regenerate_title?token={plaintext}',
                 )
-            # Acceptable success codes (the route may 202 or 200)
-            assert resp.status_code in (200, 202, 404), (
-                f'/api/v1/* POST with ?token= regressed; got {resp.status_code}: {resp.data!r}'
-            )
-            # 404 is acceptable here if the endpoint requires more
-            # setup than we have (e.g. completed transcript); what we
-            # really care about is that it is NOT a 400 CSRF rejection.
-            assert resp.status_code != 400
+            assert resp.status_code == 401, (resp.status_code, resp.data)
+            assert resp.get_json()['code'] == 'query_token_read_only'
+            db.session.refresh(rec)
+            assert rec.title == 'for-test'
 
             db.session.delete(rec)
             for t in APIToken.query.filter_by(user_id=user.id).all():

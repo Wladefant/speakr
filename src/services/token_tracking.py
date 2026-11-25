@@ -11,6 +11,7 @@ from sqlalchemy import func, extract
 from src.database import db
 from src.models.token_usage import TokenUsage
 from src.models.user import User
+from src.utils.localization import format_percent, translate
 
 logger = logging.getLogger(__name__)
 
@@ -161,12 +162,17 @@ class TokenTracker:
             budget = user.monthly_token_budget
             percentage = (current_usage / budget) * 100
 
+            # In the user's interface language: the exceeded message is
+            # shown to them as the error of the blocked request.
+            language = user.ui_language
             if percentage >= 100:
-                return (False, percentage,
-                        f"Monthly token budget exceeded ({percentage:.1f}%). Contact admin for more tokens.")
+                return (False, percentage, translate(
+                    'server.budget.tokenExceeded', language,
+                    percent=format_percent(percentage, language)))
             elif percentage >= 80:
-                return (True, percentage,
-                        f"Warning: {percentage:.1f}% of monthly token budget used.")
+                return (True, percentage, translate(
+                    'server.budget.tokenWarning', language,
+                    percent=format_percent(percentage, language)))
             else:
                 return (True, percentage, None)
 
@@ -297,8 +303,20 @@ class TokenTracker:
                 buckets[key]['llm_tokens'] += tokens
                 buckets[key]['llm_cost'] += cost
 
-        ordered = [buckets[k] for k in sorted(buckets.keys())]
-        return ordered[-months:] if len(ordered) > months else ordered
+        # The last N calendar months up to this one, with zeros for months
+        # without usage, so charts keep an even axis and the last entry is
+        # always the current month (it used to be the last month WITH usage).
+        today = date.today()
+        out = []
+        y, m = today.year, today.month
+        for _ in range(max(months, 1)):
+            out.append(buckets.get((y, m)) or {
+                'year': y, 'month': m, 'tokens': 0, 'cost': 0.0,
+                'llm_tokens': 0, 'llm_cost': 0.0, 'embedding_tokens': 0, 'embedding_cost': 0.0,
+                'cached_tokens': 0, 'cache_write_tokens': 0,
+            })
+            y, m = (y, m - 1) if m > 1 else (y - 1, 12)
+        return list(reversed(out))
 
     def get_user_stats(self) -> List[Dict]:
         """Get per-user token usage breakdown for current month."""

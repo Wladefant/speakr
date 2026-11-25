@@ -30,7 +30,7 @@ services:
     #
     # 3. Edit the .env file to add your API keys:
     #    - TRANSCRIPTION_API_KEY (for OpenAI) or ASR_BASE_URL (for self-hosted)
-    #    - TEXT_MODEL_API_KEY (REQUIRED for summaries, titles, and chat)
+    #    - TEXT_MODEL_API_KEY for summaries, titles, and chat (not needed for a local server without a key)
     #
     # 4. Start Speakr:
     #    docker compose up -d

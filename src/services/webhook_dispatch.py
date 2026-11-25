@@ -43,6 +43,10 @@ from typing import Iterable
 from urllib.parse import urlparse
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.poolmanager import PoolManager
+from urllib3.connection import HTTPConnection, HTTPSConnection
+from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
 
 from src.database import db
 from src.models import Webhook, WebhookDelivery, WEBHOOK_EVENT_TYPES
@@ -140,30 +144,164 @@ def _delay_for_attempt(attempt_count: int) -> int:
 
 # ---- URL safety / SSRF guard ----------------------------------------------
 
-def is_url_safe_for_webhook(url: str, allow_http: bool = False) -> tuple:
+def _is_blocked_ip(ip_str) -> bool:
+    """True if ``ip_str`` is a private/loopback/link-local/reserved/etc. address.
+
+    Fails closed: an unparseable value is treated as blocked. Shared by the
+    URL validation (below) and the connect-time peer check (SSRFGuardAdapter)
+    so the two can never disagree.
+    """
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return True
+    return (
+        ip.is_loopback or ip.is_private or ip.is_link_local
+        or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+        or (ip.version == 6 and ip.is_site_local)
+    )
+
+
+class _WebhookSSRFError(Exception):
+    """Raised at connect time when a webhook's real peer IP is a blocked address."""
+
+
+def _guard_peer(conn) -> None:
+    """Abort the connection if its actual peer IP is blocked.
+
+    Runs after ``connect()`` (TCP + TLS) but before any HTTP request bytes are
+    sent, so a rebound host is dropped before it can receive the payload or leak
+    a response. This closes the DNS-rebinding TOCTOU window that a separate
+    validate-then-``requests.post`` (two independent DNS lookups) leaves open
+    (GHSA-2m89-mxcv-gv93).
+    """
+    try:
+        peer_ip = conn.sock.getpeername()[0]
+    except Exception as e:  # pragma: no cover - defensive
+        _quiet_close(conn)
+        raise _WebhookSSRFError(f'could not determine peer address: {e}')
+    if _is_blocked_ip(peer_ip):
+        _quiet_close(conn)
+        raise _WebhookSSRFError(f'connection resolved to a blocked address ({peer_ip})')
+
+
+def _quiet_close(conn) -> None:
+    try:
+        conn.close()
+    except Exception:  # pragma: no cover
+        pass
+
+
+class _GuardedHTTPConnection(HTTPConnection):
+    def connect(self):
+        super().connect()
+        _guard_peer(self)
+
+
+class _GuardedHTTPSConnection(HTTPSConnection):
+    def connect(self):
+        super().connect()
+        _guard_peer(self)
+
+
+class _GuardedHTTPConnectionPool(HTTPConnectionPool):
+    ConnectionCls = _GuardedHTTPConnection
+
+
+class _GuardedHTTPSConnectionPool(HTTPSConnectionPool):
+    ConnectionCls = _GuardedHTTPSConnection
+
+
+class _SSRFGuardPoolManager(PoolManager):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.pool_classes_by_scheme = {
+            'http': _GuardedHTTPConnectionPool,
+            'https': _GuardedHTTPSConnectionPool,
+        }
+
+
+class SSRFGuardAdapter(HTTPAdapter):
+    """requests adapter that verifies the socket's real peer IP after connect
+    and aborts on a private/loopback/etc. address (see _guard_peer)."""
+
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        self.poolmanager = _SSRFGuardPoolManager(
+            num_pools=connections, maxsize=maxsize, block=block, **pool_kwargs
+        )
+
+
+def ssrf_guarded_session() -> requests.Session:
+    """A requests Session whose connections are peer-IP-verified. Retries are
+    disabled so a blocked connection fails fast rather than re-resolving."""
+    session = requests.Session()
+    adapter = SSRFGuardAdapter(max_retries=0)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    return session
+
+
+def _host_is_allowlisted(url: str) -> bool:
+    """True if the URL's host matches WEBHOOK_INTRANET_HOST_ALLOWLIST — an
+    operator opt-in that intentionally permits an internal host, so the
+    connect-time peer guard is relaxed for it (matching is_url_safe_for_webhook)."""
+    try:
+        host = (urlparse(url).hostname or '').lower()
+    except Exception:
+        return False
+    allowlist = _intranet_host_allowlist()
+    return bool(host and allowlist and allowlist.search(host))
+
+
+def _http_post(url, **kwargs):
+    """The single outbound-POST seam for webhook delivery.
+
+    Public hosts go through the SSRF-guard session, which verifies the real
+    connected peer IP and aborts on a private/loopback address (closing the
+    DNS-rebinding TOCTOU window). Explicitly allowlisted intranet hosts use the
+    plain client by operator choice. Tests patch this function.
+    """
+    if _host_is_allowlisted(url):
+        return requests.post(url, **kwargs)
+    return ssrf_guarded_session().post(url, **kwargs)
+
+
+def is_url_safe_for_webhook(url: str, allow_http: bool = False, language=None) -> tuple:
     """Validate a webhook URL.
 
     Returns ``(ok: bool, reason: str)``. ``ok`` is False when the URL
     points at a private/loopback/link-local IP (unless the
     ``WEBHOOK_INTRANET_HOST_ALLOWLIST`` regex matches the hostname), or
-    uses an unsupported scheme.
+    uses an unsupported scheme. ``reason`` is in ``language``, else the
+    interface language of the current request (#477).
     """
+    problem = webhook_url_problem(url, allow_http)
+    if problem is None:
+        return True, ''
+    from src.utils.localization import translate
+    code, params = problem
+    return False, translate(f'server.apiError.{code}', language, **params)
+
+
+def webhook_url_problem(url: str, allow_http: bool = False):
+    """The check behind is_url_safe_for_webhook: None for a safe URL, else
+    (server.apiError code, placeholder values)."""
     if not url:
-        return False, 'URL is required'
+        return 'url_required', {}
     try:
         parsed = urlparse(url)
     except Exception:
-        return False, 'URL could not be parsed'
+        return 'webhook_url_unparseable', {}
 
     scheme = (parsed.scheme or '').lower()
     if scheme not in ('http', 'https'):
-        return False, 'Scheme must be http or https'
+        return 'webhook_url_bad_scheme', {}
     if scheme == 'http' and not allow_http:
-        return False, 'http:// URLs require allow_http=true'
+        return 'webhook_url_http_not_allowed', {}
 
     host = parsed.hostname
     if not host:
-        return False, 'URL is missing a host'
+        return 'webhook_url_missing_host', {}
 
     # Always resolve and inspect every address the hostname maps to,
     # THEN decide whether the allowlist permits a private/loopback IP.
@@ -176,7 +314,7 @@ def is_url_safe_for_webhook(url: str, allow_http: bool = False) -> tuple:
     try:
         addrinfos = socket.getaddrinfo(host, None)
     except socket.gaierror:
-        return False, f'DNS resolution failed for {host!r}'
+        return 'webhook_dns_failed', {'host': host}
 
     allowlist = _intranet_host_allowlist()
     host_lower = host.lower()
@@ -185,24 +323,13 @@ def is_url_safe_for_webhook(url: str, allow_http: bool = False) -> tuple:
     for _af, _stype, _proto, _name, sockaddr in addrinfos:
         ip_str = sockaddr[0]
         try:
-            ip = ipaddress.ip_address(ip_str)
+            ipaddress.ip_address(ip_str)
         except ValueError:
             continue
-        is_private_ip = (
-            ip.is_loopback or ip.is_private or ip.is_link_local
-            or ip.is_reserved or ip.is_multicast
-            or (ip.version == 6 and ip.is_site_local)
-        )
-        if is_private_ip and not allowlist_matches:
-            return False, (
-                f'URL resolves to a private/loopback address ({ip_str}); '
-                'set WEBHOOK_INTRANET_HOST_ALLOWLIST to permit this host '
-                'explicitly, or use a public URL. The allowlist regex '
-                'should be anchored (e.g. r"^(localhost|.*\\.intra)$") '
-                'so it cannot be tricked by lookalike hostnames.'
-            )
+        if _is_blocked_ip(ip_str) and not allowlist_matches:
+            return 'webhook_url_private_address', {'ip': ip_str}
 
-    return True, ''
+    return None
 
 
 # ---- Signing & headers -----------------------------------------------------
@@ -213,11 +340,33 @@ def sign_payload(secret: str, body: bytes) -> str:
     return f'sha256={mac.hexdigest()}'
 
 
+def sign_payload_v2(secret: str, t: int, body: bytes) -> str:
+    """One v1= value of Speakr-Signature-V2: HMAC-SHA256 over "<t>." + body.
+
+    The send time t is inside the signature, so a receiver can check
+    freshness on every attempt while the body stays byte-identical.
+    """
+    mac = hmac.new(secret.encode('utf-8'), f'{t}.'.encode('utf-8') + body, hashlib.sha256)
+    return mac.hexdigest()
+
+
+def signature_v2_header(webhook, t: int, body: bytes) -> str:
+    """t=<unix seconds>,v1=<new secret>[,v1=<previous secret during the rotation grace>]."""
+    parts = [f't={t}', f'v1={sign_payload_v2(webhook.secret, t, body)}']
+    previous = getattr(webhook, 'previous_secret', None)
+    expires = getattr(webhook, 'previous_secret_expires_at', None)
+    if isinstance(previous, str) and previous and isinstance(expires, datetime) and expires > datetime.utcnow():
+        parts.append(f'v1={sign_payload_v2(previous, t, body)}')
+    return ','.join(parts)
+
+
 def _build_envelope(event_id: str, event_type: str, user_id: int, data: dict):
+    now = datetime.utcnow().isoformat() + 'Z'
     return {
         'id': event_id,
         'type': event_type,
-        'timestamp': datetime.utcnow().isoformat() + 'Z',
+        'timestamp': now,
+        'occurred_at': now,
         'user_id': user_id,
         'data': data or {},
     }
@@ -256,39 +405,115 @@ def emit_webhook_event(user_id: int, event_type: str, data: dict, *, app=None) -
         return 0
 
     def _do_enqueue():
-        # Find enabled, non-paused webhooks for the user that subscribe to this event.
-        subscriptions = (
-            Webhook.query
-            .filter_by(user_id=user_id, enabled=True)
-            .all()
-        )
-        matched = [w for w in subscriptions if event_type in w.event_list]
-        if not matched:
-            return 0
-
-        event_id = str(uuid.uuid4())
-        first_attempt_at = datetime.utcnow()
-        created = 0
-        for wh in matched:
-            envelope = _build_envelope(event_id, event_type, user_id, data)
-            delivery = WebhookDelivery(
-                webhook_id=wh.id,
-                event_id=event_id,
-                event_type=event_type,
-                payload=serialize_envelope(envelope),
-                status='pending',
-                next_retry_at=first_attempt_at,
-            )
-            db.session.add(delivery)
-            created += 1
-        if created:
-            db.session.commit()
-        return created
+        return enqueue_event(db.session, user_id, event_type, data)
 
     if app is not None:
         with app.app_context():
             return _do_enqueue()
     return _do_enqueue()
+
+
+def _with_updated_at(session, event_type, data, user_id=None):
+    """data of a recording.* event carries the recording's updated_at (spec W4)."""
+    data = dict(data or {})
+    if event_type.startswith('recording.') and 'updated_at' not in data and data.get('recording_id'):
+        from src.models import Recording
+        rec = session.get(Recording, data['recording_id'])
+        if rec is not None:
+            data['updated_at'] = rec.updated_at_z()
+    if event_type.startswith('recording.') and event_type != 'recording.deleted' and data.get('recording_id') \
+            and 'external_refs' not in data:
+        from src.models import RecordingExternalRef
+        data['external_refs'] = [r.to_dict() for r in session.query(RecordingExternalRef).filter_by(
+            recording_id=data['recording_id'], user_id=user_id).order_by(RecordingExternalRef.id)]
+    return data
+
+
+def _merge_pending_update(session, webhook_id, data):
+    """Fold a recording.updated into a not-yet-attempted delivery for the same
+    recording and fields (autosave bursts give one delivery). Returns True when
+    merged."""
+    candidates = (session.query(WebhookDelivery)
+                  .filter_by(webhook_id=webhook_id, event_type='recording.updated',
+                             status='pending', attempt_count=0)
+                  .order_by(WebhookDelivery.id.desc()).limit(20).all())
+    for delivery in candidates:
+        try:
+            envelope = json.loads(delivery.payload)
+        except (TypeError, ValueError):
+            continue
+        old = envelope.get('data') or {}
+        if (old.get('recording_id') == data.get('recording_id')
+                and sorted(old.get('fields_changed') or []) == sorted(data.get('fields_changed') or [])):
+            envelope['data'] = data
+            delivery.payload = serialize_envelope(envelope)
+            return True
+    return False
+
+
+def _shared_targets(session, event_type, data):
+    """(webhook, recipient id) for recipients of a shared recording whose
+    webhook asks for shared recordings (spec W6)."""
+    rid = data.get('recording_id') if isinstance(data, dict) else None
+    if not event_type.startswith('recording.') or not rid:
+        return []
+    from src import app as app_module
+    if not getattr(app_module, 'ENABLE_INTERNAL_SHARING', False):
+        return []
+    from src.models import InternalShare, Recording
+    recording = session.get(Recording, rid)
+    if recording is None or recording.status != 'COMPLETED':
+        return []
+    recipients = [uid for (uid,) in session.query(InternalShare.shared_with_user_id)
+                  .filter(InternalShare.recording_id == rid)]
+    if not recipients:
+        return []
+    hooks = (session.query(Webhook)
+             .filter(Webhook.user_id.in_(recipients), Webhook.enabled.is_(True), Webhook.include_shared.is_(True))
+             .all())
+    return [(wh, wh.user_id) for wh in hooks if event_type in wh.event_list]
+
+
+def enqueue_event(session, user_id, event_type, data):
+    """Write one pending delivery per subscribed webhook through ``session``
+    and commit it: the owner's webhooks, and recipients' webhooks that ask for
+    shared recordings. Returns the number of deliveries written or merged."""
+    subscriptions = session.query(Webhook).filter_by(user_id=user_id, enabled=True).all()
+    targets = [(w, user_id) for w in subscriptions if event_type in w.event_list]
+    targets += _shared_targets(session, event_type, data)
+    if not targets:
+        return 0
+    event_id = str(uuid.uuid4())
+    first_attempt_at = datetime.utcnow()
+    created = 0
+    per_user = {}
+    for wh, viewer in targets:
+        if viewer not in per_user:
+            viewer_data = _with_updated_at(session, event_type, data, viewer)
+            if viewer != user_id:
+                viewer_data = dict(viewer_data, owner_user_id=user_id)
+            per_user[viewer] = viewer_data
+        if _deliver_one(session, wh, viewer, event_type, per_user[viewer], event_id, first_attempt_at):
+            created += 1
+    if created:
+        session.commit()
+    return created
+
+
+def _deliver_one(session, wh, viewer, event_type, data, event_id, first_attempt_at):
+    """Queue (or merge) one delivery; True when a delivery was written or merged."""
+    if event_type == 'recording.updated' and _merge_pending_update(session, wh.id, data):
+        return True
+    envelope = _build_envelope(event_id, event_type, viewer, data)
+    session.add(WebhookDelivery(
+        webhook_id=wh.id,
+        event_id=event_id,
+        event_type=event_type,
+        payload=serialize_envelope(envelope),
+        status='pending',
+        next_retry_at=first_attempt_at,
+    ))
+    return True
 
 
 # ---- Dispatcher: one pass over due deliveries -----------------------------
@@ -309,21 +534,31 @@ def _post_delivery(delivery: WebhookDelivery, webhook: Webhook) -> tuple:
     # an internal target would otherwise be an exfiltration channel). A transient
     # DNS failure is NOT treated as a block — no resolution means no connection
     # and thus no SSRF; we let requests surface it as a normal network error.
-    safe, reason = is_url_safe_for_webhook(webhook.url, allow_http=bool(webhook.allow_http))
+    # English: the reason goes into the stored delivery log, and the check
+    # below matches its text.
+    safe, reason = is_url_safe_for_webhook(webhook.url, allow_http=bool(webhook.allow_http), language='en')
     if not safe and 'resolves to a private' in reason:
         return None, None, f'blocked at delivery: {reason}'[:500]
 
     signature = sign_payload(webhook.secret, body_bytes)
+    import time as _time
+    sent_at = int(_time.time())
     headers = {
         'Content-Type': 'application/json',
         'User-Agent': f'Speakr-Webhook/1.0',
         'Speakr-Signature': signature,
+        'Speakr-Signature-V2': signature_v2_header(webhook, sent_at, body_bytes),
+        'Speakr-Attempt': str((delivery.attempt_count or 0) + 1),
         'Speakr-Delivery-Id': delivery.event_id,
         'Speakr-Event': delivery.event_type,
         'Speakr-Timestamp': datetime.utcnow().isoformat() + 'Z',
     }
+    # Delivery goes through _http_post, which verifies the ACTUAL connected peer
+    # IP (not a fresh, separate DNS lookup) and aborts on a private/loopback
+    # address — closing the rebinding window left by the resolve-and-block check
+    # above. Allowlisted intranet hosts are exempt by operator choice.
     try:
-        resp = requests.post(
+        resp = _http_post(
             webhook.url,
             data=body_bytes,
             headers=headers,
@@ -332,8 +567,14 @@ def _post_delivery(delivery: WebhookDelivery, webhook: Webhook) -> tuple:
         )
         preview = (resp.text or '')[:2000]
         return resp.status_code, preview, None
+    except _WebhookSSRFError as e:
+        return None, None, f'blocked at delivery: {e}'[:500]
     except requests.RequestException as e:
-        return None, None, str(e)[:500]
+        # urllib3 may surface the connect-time abort wrapped as a ConnectionError.
+        msg = str(e)
+        if 'blocked address' in msg or 'peer address' in msg:
+            return None, None, f'blocked at delivery: {msg}'[:500]
+        return None, None, msg[:500]
 
 
 def _is_retryable_status(status_code) -> bool:
@@ -548,3 +789,53 @@ def start_dispatcher_thread(app):
         t.start()
         _dispatcher_thread_started = True
         app.logger.info("✅ Webhook dispatcher thread initialized")
+
+
+def emit_recording_created(recording):
+    """recording.created, from every path that creates a recording (#412 audit P11).
+
+    Upload, upload join, API v1 and integration uploads, the share target, the
+    watch folder, merges and recording-session finalize all call this, so a
+    subscriber hears about every new recording. Best-effort: never raises.
+    """
+    try:
+        emit_webhook_event(
+            user_id=recording.user_id,
+            event_type='recording.created',
+            data={
+                'recording_id': recording.id,
+                'title': recording.title,
+                'file_size': recording.file_size,
+                'original_filename': recording.original_filename,
+            },
+        )
+    except Exception as e:
+        logger.warning(f"Webhook emit (recording.created) failed for {getattr(recording, 'id', None)}: {e}")
+
+
+def emit_summary_result(recording, ok, error=None):
+    """recording.summary.completed / .failed from the summary step itself (#412 audit P12).
+
+    The job queue used to infer these from the job type: the first summary of
+    an upload (run inside the transcription job) never fired, a summary that
+    failed inside its job fired "completed", and "failed" never fired.
+    Best-effort: never raises.
+    """
+    try:
+        if ok:
+            data = {
+                'recording_id': recording.id,
+                'title': recording.title,
+                'language': recording.transcription_language,
+                'audio_duration_seconds': recording.audio_duration_seconds,
+                'transcription_duration_seconds': recording.transcription_duration_seconds,
+                'summarization_duration_seconds': recording.summarization_duration_seconds,
+            }
+            emit_webhook_event(user_id=recording.user_id, event_type='recording.summary.completed',
+                               data={k: v for k, v in data.items() if v is not None})
+        else:
+            emit_webhook_event(user_id=recording.user_id, event_type='recording.summary.failed',
+                               data={'recording_id': recording.id, 'title': recording.title,
+                                     'error': (error or '')[:500]})
+    except Exception as e:
+        logger.warning(f"Webhook emit (summary result) failed for {getattr(recording, 'id', None)}: {e}")

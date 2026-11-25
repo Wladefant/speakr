@@ -5,6 +5,8 @@
     <!-- interactive-widget=resizes-content: on Android Chrome the on-screen
          keyboard resizes the layout so the UI fits the space above it. -->
     <meta name="viewport" content="width=device-width, initial-scale=1.0, interactive-widget=resizes-content">
+    {% include 'includes/theme_account.html' %}
+    {% include 'includes/theme_bootstrap.html' %}
     <script>
       // Keyboard-safe viewport. The on-screen keyboard shrinks the VISUAL
       // viewport but not the LAYOUT viewport, so a 100vh/100% shell overflows
@@ -56,15 +58,11 @@
       })();
     </script>
     <meta name="csrf-token" content="{{ csrf_token() }}">
+    <meta name="app-version" content="{{ app_version }}">
     <meta name="robots" content="noindex, nofollow, noarchive, nosnippet, noimageindex">
     <title>Speakr - Audio Transcription & Summarization</title>
-    {% include 'includes/loading_overlay.html' %}
     <!-- All dependencies bundled locally for offline support -->
-    <script src="{{ url_for('static', filename='vendor/js/tailwind.min.js') }}"></script>
-    <script src="{{ url_for('static', filename='vendor/js/vue.global.js') }}"></script>
-    <script src="{{ url_for('static', filename='vendor/js/marked.min.js') }}"></script>
     <link rel="stylesheet" href="{{ url_for('static', filename='vendor/css/easymde.min.css') }}">
-    <script src="{{ url_for('static', filename='vendor/js/easymde.min.js') }}"></script>
     <link rel="stylesheet" href="{{ url_for('static', filename='vendor/css/fontawesome.min.css') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/primitives.css') }}">
@@ -74,42 +72,37 @@
     <link rel="apple-touch-icon" sizes="180x180" href="{{ url_for('static', filename='img/icon-180x180.png') }}">
     <link rel="manifest" href="{{ url_for('static', filename='manifest.json') }}">
     <meta name="theme-color" content="#2563eb">
-    <script>
-        tailwind.config = {
-            darkMode: 'class',
-            theme: {
-                extend: {
-                    maxHeight: {
-                        '85vh': '85vh',
-                        '90vh': '90vh'
-                    },
-                    colors: {
-                        primary: 'var(--bg-primary)',
-                        secondary: 'var(--bg-secondary)',
-                        accent: 'var(--bg-accent)'
-                    }
-                }
-            }
-        }
-    </script>
+    <!-- Tailwind utilities, compiled at build time (scripts/build_css.sh). Last in
+         <head> so that, as with the former runtime build, they follow the page's
+         own stylesheets in the cascade. -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/tailwind.css') }}">
+    <!-- Scripts after every stylesheet, so that no page is painted while a
+         script blocks the parser before the stylesheets are known. -->
+    {% include 'includes/loading_overlay.html' %}
+    <script src="{{ url_for('static', filename='vendor/js/vue.global.js') }}"></script>
+    <script src="{{ url_for('static', filename='vendor/js/marked.min.js') }}"></script>
+    <script src="{{ url_for('static', filename='vendor/js/purify.min.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/markdown-safe.js') }}"></script>
+    <script src="{{ url_for('static', filename='vendor/js/easymde.min.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/timezone-sync.js') }}" defer></script>
 </head>
 <body class="h-full bg-[var(--bg-primary)] text-[var(--text-primary)] transition-colors duration-300">
-    <div id="loader" class="fixed inset-0 bg-gray-800 flex items-center justify-center z-50">
-        <div class="text-white text-lg">Loading...</div>
-    </div>
     <div id="app" v-cloak
          data-use-asr-endpoint="{{ use_asr_endpoint }}"
          data-connector-supports-diarization="{{ connector_supports_diarization }}"
          data-connector-supports-speaker-count="{{ connector_supports_speaker_count }}"
+         data-connector-supports-exact-speaker-count="{{ connector_supports_exact_speaker_count }}"
+         data-speaker-count-mode="{{ current_user.speaker_count_mode or 'range' if current_user.is_authenticated else 'range' }}"
          data-connector-supports-hotwords="{{ connector_supports_hotwords }}"
          data-connector-supports-initial-prompt="{{ connector_supports_initial_prompt }}"
-         data-enable-archive-toggle="{{ enable_archive_toggle }}"
+         data-enable-audio-removed-filter="{{ enable_audio_removed_filter }}"
          data-enable-internal-sharing="{{ enable_internal_sharing }}"
          data-current-user-name="{{ (current_user.name or current_user.username) if current_user.is_authenticated else '' }}"
          data-user-language="{{ user_language }}"
          data-show-timestamps-simple-view="{{ 'True' if (current_user.is_authenticated and current_user.show_timestamps_simple_view) else 'False' }}"
          data-editor-autosave="{{ 'True' if (current_user.is_authenticated and current_user.editor_autosave) else 'False' }}"
          data-audio-player-position="{{ (current_user.audio_player_position or 'bottom') if current_user.is_authenticated else 'bottom' }}"
+         data-default-recording-sort="{{ (current_user.default_recording_sort or 'created_at') if current_user.is_authenticated else 'created_at' }}"
          data-server-recording-chunks="{{ 'True' if server_recording_chunks_enabled else 'False' }}"
          data-recording-max-hours="{{ recording_max_hours }}"
          data-recording-chunk-seconds="{{ recording_chunk_seconds }}"
@@ -120,13 +113,7 @@
         {% include 'components/header.html' %}
 
         <div class="flex-1 flex overflow-hidden relative">
-            <!-- Mobile Sidebar Backdrop -->
-            <div v-if="!isSidebarCollapsed && isMobileScreen"
-                 @click="toggleSidebar"
-                 class="fixed inset-0 bg-black bg-opacity-50 z-40 lg:hidden">
-            </div>
-
-            <!-- Sidebar -->
+            <!-- Sidebar (renders its own mobile backdrop as its first element) -->
             {% include 'components/sidebar.html' %}
 
             <!-- Main Content Area -->
@@ -154,6 +141,7 @@
         <!-- Modals -->
         {% include 'modals/edit-modal.html' %}
         {% include 'modals/delete-modal.html' %}
+        {% include 'modals/delete-audio-modal.html' %}
         {% include 'modals/edit-tags-modal.html' %}
         {% include 'modals/datetime-picker-modal.html' %}
         {% include 'modals/shares-list-modal.html' %}
@@ -185,10 +173,14 @@
         {% include 'modals/bulk-merge-modal.html' %}
     </div>
 
+    <!-- Shared tag/folder editor modals (outside the Vue root; driven by organizer-modals.js) -->
+    {% include 'includes/organizer_modals.html' %}
+
     <!-- CSRF Token Management -->
     <script src="{{ url_for('static', filename='js/csrf-refresh.js') }}"></script>
 
     <!-- i18n System -->
+    {% include 'includes/i18n_bootstrap.html' %}
     <script src="{{ url_for('static', filename='js/i18n.js') }}"></script>
 
     <!-- Initialize i18n immediately with fallback -->
@@ -227,6 +219,12 @@
     </script>
 
     <!-- Service Worker Registration handled by app.modular.js -->
+
+    <!-- Shared ASR language list (feeds Vue dropdowns and the organizer modals) -->
+    <script src="{{ url_for('static', filename='js/asr-languages.js') }}"></script>
+
+    <!-- Shared tag/folder modal driver (standalone creation mode) -->
+    <script src="{{ url_for('static', filename='js/organizer-modals.js') }}"></script>
 
     <!-- Vue.js Application Script -->
     <script type="module" src="{{ url_for('static', filename='js/app.modular.js') }}"></script>

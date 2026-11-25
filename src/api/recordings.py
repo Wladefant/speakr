@@ -11,16 +11,21 @@ import mimetypes
 import time
 import threading
 import subprocess
-from datetime import datetime, timedelta, timezone
+import uuid
+from datetime import date, datetime, timedelta, timezone
+from src.services.llm_settings import get_temperature
 from src.services.job_queue import job_queue
 from flask import Blueprint, render_template, request, redirect, url_for, flash, jsonify, send_file, Response, current_app, make_response
 from flask_login import login_required, current_user
 from werkzeug.utils import secure_filename
 from werkzeug.exceptions import RequestEntityTooLarge
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from email.utils import encode_rfc2231
+from urllib.parse import quote
 
 from src.database import db
+from src.services.recording_deletion import delete_recording_completely, cleanup_orphaned_speakers_quietly
 from src.models import *
 from src.utils import *
 from src.config.app_config import ASR_MIN_SPEAKERS, ASR_MAX_SPEAKERS, ASR_DIARIZE, USE_NEW_TRANSCRIPTION_ARCHITECTURE
@@ -36,11 +41,13 @@ from src.services.transcription_defaults import (
 )
 from src.tasks.processing import format_transcription_for_llm, _resolve_timestamp_template_format
 from src.utils.dates import to_utc_naive
-from src.utils.ffmpeg_utils import FFmpegError, FFmpegNotFoundError
-from src.utils.titles import resolve_upload_title
-from src.services.speaker import update_speaker_usage, identify_unidentified_speakers_from_text
-from src.services.speaker_embedding_matcher import update_speaker_embedding
-from src.services.speaker_snippets import create_speaker_snippets
+from src.utils.ffmpeg_utils import (
+    FFmpegError, FFmpegNotFoundError, FFmpegTimeoutError,
+)
+from src.utils.titles import resolve_upload_title, upload_title_source
+from src.services.speaker import (
+    update_speaker_usage, apply_speaker_map, participants_from_segments, update_voice_profiles,
+)
 
 # Incognito mode - disabled by default, enable via environment variable
 ENABLE_INCOGNITO_MODE = os.environ.get('ENABLE_INCOGNITO_MODE', 'false').lower() == 'true'
@@ -48,10 +55,17 @@ from src.services.document import process_markdown_to_docx
 from src.services.llm import client, chat_client, call_llm_completion, call_chat_completion, process_streaming_with_thinking, TokenBudgetExceeded
 from src.services.embeddings import process_recording_chunks
 from src.file_exporter import export_recording, mark_export_as_deleted
-from src.utils.ffprobe import get_codec_info, get_creation_date, get_duration, FFProbeError
+from src.utils.mime import served_media_mime, sandbox_media_response
+from src.utils.filenames import shorten_filename
+from src.utils.search import LIKE_ESCAPE, contains_pattern, escape_like
+from src.utils.ffprobe import (
+    get_codec_info, get_creation_date, get_duration, try_repair_malformed_webm, FFProbeError,
+    has_audio_stream, probe_rejected_input,
+)
 from src.utils.audio_conversion import convert_if_needed
 from src.services.storage import get_storage_service
 from src.utils.file_hash import compute_file_sha256
+from src.utils.localization import api_error, format_number, translate
 
 # Create blueprint
 recordings_bp = Blueprint('recordings', __name__)
@@ -98,9 +112,7 @@ def _blank_column_condition(column):
 def _prefixed_column_condition(column, prefixes):
     # Escape LIKE metacharacters in the literal prefixes so a '_' or '%' in a
     # prefix (e.g. 'ERROR_JSON:') matches literally instead of as a wildcard.
-    def _esc(p):
-        return p.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
-    return db.or_(*[column.like(f'{_esc(prefix)}%', escape='\\') for prefix in prefixes])
+    return db.or_(*[column.like(f'{escape_like(prefix)}%', escape=LIKE_ESCAPE) for prefix in prefixes])
 
 
 def _transcription_error_condition():
@@ -170,6 +182,7 @@ def reindex_recording_chunks_async(recording_id):
 
 # Global helpers (will be injected from app)
 has_recording_access = None
+editable_recording_ids = None
 get_user_recording_status = None
 set_user_recording_status = None
 enrich_recording_dict_with_user_status = None
@@ -180,8 +193,9 @@ chunking_service = None
 
 def init_recordings_helpers(**kwargs):
     """Initialize helper functions and extensions from app."""
-    global has_recording_access, get_user_recording_status, set_user_recording_status, enrich_recording_dict_with_user_status, bcrypt, csrf, limiter, chunking_service
+    global has_recording_access, editable_recording_ids, get_user_recording_status, set_user_recording_status, enrich_recording_dict_with_user_status, bcrypt, csrf, limiter, chunking_service
     has_recording_access = kwargs.get('has_recording_access')
+    editable_recording_ids = kwargs.get('editable_recording_ids')
     get_user_recording_status = kwargs.get('get_user_recording_status')
     set_user_recording_status = kwargs.get('set_user_recording_status')
     enrich_recording_dict_with_user_status = kwargs.get('enrich_recording_dict_with_user_status')
@@ -202,14 +216,11 @@ def download_transcript_with_template(recording_id):
         from datetime import timedelta
 
         recording = db.session.get(Recording, recording_id)
-        if not recording:
-            return jsonify({'error': 'Recording not found'}), 404
-
-        if not has_recording_access(recording, current_user):
-            return jsonify({'error': 'You do not have permission to access this recording'}), 403
+        if not recording or not has_recording_access(recording, current_user):
+            return jsonify(api_error('recording_not_found')), 404
 
         if not recording.transcription:
-            return jsonify({'error': 'No transcription available for this recording'}), 400
+            return jsonify(api_error('no_transcription_for_recording')), 400
 
         # Get template ID from query params
         template_id = request.args.get('template_id', type=int)
@@ -327,15 +338,27 @@ def download_transcript_with_template(recording_id):
         else:
             # Plain text transcription
             filename = f"{recording.title or 'transcript'}.{ext}"
-        filename = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', filename)
+        # Strip only what is illegal in a filename; keep non-ASCII titles intact
+        # and advertise them through RFC 5987 filename* (same approach as the
+        # summary/chat/notes downloads below).
+        filename = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', filename)
+        filename = re.sub(r'\s+', ' ', filename).strip() or f'transcript-{recording_id}.{ext}'
         response.headers['Content-Type'] = content_type
-        response.headers['Content-Disposition'] = f'attachment; filename="{filename}"'
+        try:
+            filename.encode('ascii')
+            response.headers['Content-Disposition'] = f'attachment; filename="{filename}"'
+        except UnicodeEncodeError:
+            ascii_fallback = f'transcript-{recording_id}.{ext}'
+            response.headers['Content-Disposition'] = (
+                f'attachment; filename="{ascii_fallback}"; '
+                + "filename*=UTF-8''" + quote(filename, safe='')
+            )
 
         return response
 
     except Exception as e:
         current_app.logger.error(f"Error downloading transcript: {e}")
-        return jsonify({'error': 'Failed to generate transcript download'}), 500
+        return jsonify(api_error('transcript_download_failed')), 500
 
 
 
@@ -351,14 +374,11 @@ def download_summary_word(recording_id):
         from io import BytesIO
 
         recording = db.session.get(Recording, recording_id)
-        if not recording:
-            return jsonify({'error': 'Recording not found'}), 404
-
-        if not has_recording_access(recording, current_user):
-            return jsonify({'error': 'You do not have permission to access this recording'}), 403
+        if not recording or not has_recording_access(recording, current_user):
+            return jsonify(api_error('recording_not_found')), 404
 
         if not recording.summary:
-            return jsonify({'error': 'No summary available for this recording'}), 400
+            return jsonify(api_error('no_summary')), 400
 
         # Create Word document
         doc = Document()
@@ -391,9 +411,10 @@ def download_summary_word(recording_id):
             return p
 
         # Add metadata
-        add_unicode_paragraph(doc, f'Uploaded: {recording.created_at.strftime("%Y-%m-%d %H:%M")}')
+        from src.utils.timezones import to_user_local  # owner's local time (#412)
+        add_unicode_paragraph(doc, f'Uploaded: {to_user_local(recording.created_at, recording.owner).strftime("%Y-%m-%d %H:%M")}')
         if recording.meeting_date:
-            add_unicode_paragraph(doc, f'Recording Date: {recording.meeting_date.strftime("%Y-%m-%d")}')
+            add_unicode_paragraph(doc, f'Recording Date: {to_user_local(recording.meeting_date, recording.owner).strftime("%Y-%m-%d")}')
         if recording.participants:
             add_unicode_paragraph(doc, f'Participants: {recording.participants}')
         visible_tags = recording.get_visible_tags(current_user)
@@ -448,7 +469,7 @@ def download_summary_word(recording_id):
 
     except Exception as e:
         current_app.logger.error(f"Error generating summary Word document: {e}")
-        return jsonify({'error': 'Failed to generate Word document'}), 500
+        return jsonify(api_error('word_document_failed')), 500
 
 
 
@@ -463,20 +484,17 @@ def download_chat_word(recording_id):
         from io import BytesIO
 
         recording = db.session.get(Recording, recording_id)
-        if not recording:
-            return jsonify({'error': 'Recording not found'}), 404
-
-        if not has_recording_access(recording, current_user):
-            return jsonify({'error': 'You do not have permission to access this recording'}), 403
+        if not recording or not has_recording_access(recording, current_user):
+            return jsonify(api_error('recording_not_found')), 404
 
         # Get chat messages from request
         data = request.json
         if not data or 'messages' not in data:
-            return jsonify({'error': 'No messages provided'}), 400
+            return jsonify(api_error('no_messages_provided')), 400
 
         messages = data['messages']
         if not messages:
-            return jsonify({'error': 'No messages to download'}), 400
+            return jsonify(api_error('no_messages_to_download')), 400
 
         # Create Word document
         doc = Document()
@@ -508,8 +526,9 @@ def download_chat_word(recording_id):
             return p
 
         # Add metadata
-        add_unicode_paragraph(doc, f'Recording Date: {recording.created_at.strftime("%Y-%m-%d %H:%M")}')
-        add_unicode_paragraph(doc, f'Chat Export Date: {datetime.utcnow().strftime("%Y-%m-%d %H:%M")}')
+        from src.utils.timezones import to_user_local, now_local, user_timezone  # owner's local time (#412)
+        add_unicode_paragraph(doc, f'Recording Date: {to_user_local(recording.meeting_date or recording.created_at, recording.owner).strftime("%Y-%m-%d %H:%M")}')
+        add_unicode_paragraph(doc, f'Chat Export Date: {now_local(user_timezone(current_user)).strftime("%Y-%m-%d %H:%M")}')
         doc.add_paragraph('')  # Empty line
 
         # Add chat messages
@@ -588,7 +607,7 @@ def download_chat_word(recording_id):
 
     except Exception as e:
         current_app.logger.error(f"Error generating chat Word document: {e}")
-        return jsonify({'error': 'Failed to generate Word document'}), 500
+        return jsonify(api_error('word_document_failed')), 500
 
 
 
@@ -603,14 +622,11 @@ def download_notes_word(recording_id):
         from io import BytesIO
 
         recording = db.session.get(Recording, recording_id)
-        if not recording:
-            return jsonify({'error': 'Recording not found'}), 404
-
-        if not has_recording_access(recording, current_user):
-            return jsonify({'error': 'You do not have permission to access this recording'}), 403
+        if not recording or not has_recording_access(recording, current_user):
+            return jsonify(api_error('recording_not_found')), 404
 
         if not recording.notes:
-            return jsonify({'error': 'No notes available for this recording'}), 400
+            return jsonify(api_error('no_notes')), 400
 
         # Create Word document
         doc = Document()
@@ -642,9 +658,10 @@ def download_notes_word(recording_id):
             return p
 
         # Add metadata
-        add_unicode_paragraph(doc, f'Uploaded: {recording.created_at.strftime("%Y-%m-%d %H:%M")}')
+        from src.utils.timezones import to_user_local  # owner's local time (#412)
+        add_unicode_paragraph(doc, f'Uploaded: {to_user_local(recording.created_at, recording.owner).strftime("%Y-%m-%d %H:%M")}')
         if recording.meeting_date:
-            add_unicode_paragraph(doc, f'Recording Date: {recording.meeting_date.strftime("%Y-%m-%d")}')
+            add_unicode_paragraph(doc, f'Recording Date: {to_user_local(recording.meeting_date, recording.owner).strftime("%Y-%m-%d")}')
         if recording.participants:
             add_unicode_paragraph(doc, f'Participants: {recording.participants}')
         visible_tags = recording.get_visible_tags(current_user)
@@ -699,7 +716,7 @@ def download_notes_word(recording_id):
 
     except Exception as e:
         current_app.logger.error(f"Error generating notes Word document: {e}")
-        return jsonify({'error': 'Failed to generate Word document'}), 500
+        return jsonify(api_error('word_document_failed')), 500
 
 
 
@@ -717,7 +734,7 @@ def export_existing_recordings():
     from src.file_exporter import ENABLE_AUTO_EXPORT, export_recording
 
     if not ENABLE_AUTO_EXPORT:
-        return jsonify({'error': 'Auto-export is not enabled on this server'}), 400
+        return jsonify(api_error('auto_export_disabled')), 400
 
     try:
         # Candidate recordings: owned by the user and holding exportable content.
@@ -753,7 +770,7 @@ def export_existing_recordings():
 
     except Exception as e:
         current_app.logger.error(f"Error during bulk export: {e}")
-        return jsonify({'error': 'Failed to export recordings'}), 500
+        return jsonify(api_error('recordings_export_failed')), 500
 
 
 @recordings_bp.route('/api/recordings/merge', methods=['POST'])
@@ -767,6 +784,9 @@ def merge_recordings_endpoint():
       - title (str, optional): title for the merged recording.
       - delete_originals (bool, optional): delete the sources after a successful
         merge (default False).
+      - remove_original_audio (bool, optional): keep the sources but remove
+        their audio after a successful merge (#413); ignored with
+        delete_originals.
 
     Validation happens in-request; the audio concat runs later on a worker
     (job_type 'merge'), so a long merge never blocks the request. The merged
@@ -779,15 +799,16 @@ def merge_recordings_endpoint():
     raw_ids = data.get('recording_ids')
 
     if not isinstance(raw_ids, list) or len(raw_ids) < 2:
-        return jsonify({'error': 'Select at least two recordings to merge'}), 400
+        return jsonify(api_error('merge_needs_two')), 400
 
     try:
         recording_ids = [int(rid) for rid in raw_ids]
     except (ValueError, TypeError):
-        return jsonify({'error': 'Invalid recording ids'}), 400
+        return jsonify(api_error('invalid_recording_ids')), 400
 
     title = data.get('title')
     delete_originals = bool(data.get('delete_originals', False))
+    remove_original_audio = bool(data.get('remove_original_audio', False)) and not delete_originals
 
     # notes_source_id: which source's notes to keep on the merged recording.
     #   key absent      -> default to the first source
@@ -805,6 +826,21 @@ def merge_recordings_endpoint():
     else:
         notes_source_id = _UNSET
 
+    # Storage quota (#413): keeping the originals with their audio adds a copy.
+    # The answer names the two ways out the merge dialog offers.
+    if not delete_originals and not remove_original_audio:
+        from src.services.storage_quota import check_room, StorageQuotaExceeded
+        merged_bytes = db.session.query(db.func.coalesce(db.func.sum(Recording.file_size), 0)).filter(
+            Recording.id.in_([int(i) for i in recording_ids if str(i).isdigit()]),
+            Recording.user_id == current_user.id, Recording.audio_deleted_at.is_(None)).scalar() or 0
+        try:
+            check_room(current_user, int(merged_bytes))
+        except StorageQuotaExceeded as quota_error:
+            body, status = quota_error.response()
+            data_out = body.get_json()
+            data_out['merge_options'] = ['remove_original_audio', 'delete_originals']
+            return jsonify(data_out), status
+
     try:
         recording = create_merge_recording(
             current_user,
@@ -812,12 +848,13 @@ def merge_recordings_endpoint():
             title=title,
             delete_originals=delete_originals,
             notes_source_id=notes_source_id,
+            remove_original_audio=remove_original_audio,
         )
     except MergeError as e:
         return jsonify({'error': str(e)}), 400
     except Exception as e:
         current_app.logger.error(f"Error merging recordings: {e}")
-        return jsonify({'error': 'Failed to merge recordings'}), 500
+        return jsonify(api_error('merge_failed')), 500
 
     return jsonify({
         'success': True,
@@ -839,27 +876,27 @@ def generate_summary_endpoint(recording_id):
     """
     try:
         recording = db.session.get(Recording, recording_id)
-        if not recording:
-            return jsonify({'error': 'Recording not found'}), 404
+        if not recording or not has_recording_access(recording, current_user):
+            return jsonify(api_error('recording_not_found')), 404
 
         if not has_recording_access(recording, current_user, require_edit=True):
-            return jsonify({'error': 'You do not have permission to generate summary for this recording'}), 403
+            return jsonify(api_error('summary_generate_denied')), 403
 
         # Check if transcription exists
         if not recording.transcription or len(recording.transcription.strip()) < 10:
-            return jsonify({'error': 'No valid transcription available for summary generation'}), 400
+            return jsonify(api_error('no_transcription_for_summary')), 400
 
         # Check if transcription is an error message (not actual content)
         if is_transcription_error(recording.transcription):
-            return jsonify({'error': 'Cannot generate summary: transcription failed. Please reprocess the transcription first.'}), 400
+            return jsonify(api_error('summary_blocked_transcription_failed')), 400
 
         # Check if already processing
         if recording.status in ['PROCESSING', 'SUMMARIZING']:
-            return jsonify({'error': 'Recording is already being processed'}), 400
+            return jsonify(api_error('recording_already_processing')), 400
 
         # Check if OpenRouter client is available
         if client is None:
-            return jsonify({'error': 'Summary service is not available (OpenRouter client not configured)'}), 503
+            return jsonify(api_error('summary_openrouter_not_configured')), 503
 
         # Optional custom prompt + mode (issue / discussion #253)
         data = request.get_json(silent=True) or {}
@@ -890,7 +927,7 @@ def generate_summary_endpoint(recording_id):
 
         return jsonify({
             'success': True,
-            'message': 'Summary generation queued'
+            'message': translate('server.apiMessage.summaryGenerationQueued')
         })
 
     except Exception as e:
@@ -906,162 +943,30 @@ def update_speakers(recording_id):
     """Updates speaker labels in a transcription with provided names."""
     try:
         recording = db.session.get(Recording, recording_id)
-        if not recording:
-            return jsonify({'error': 'Recording not found'}), 404
+        if not recording or not has_recording_access(recording, current_user):
+            return jsonify(api_error('recording_not_found')), 404
 
         if not has_recording_access(recording, current_user, require_edit=True):
-            return jsonify({'error': 'You do not have permission to edit this recording'}), 403
+            return jsonify(api_error('recording_edit_denied')), 403
 
         data = request.json
         speaker_map = data.get('speaker_map')
         regenerate_summary = data.get('regenerate_summary', False)
 
         if speaker_map is None:
-            return jsonify({'error': 'No speaker map provided'}), 400
+            return jsonify(api_error('no_speaker_map')), 400
 
-        transcription_text = recording.transcription
-        is_json = False
-        try:
-            transcription_data = json.loads(transcription_text)
-            # Updated check for our new simplified JSON format (a list of segment objects)
-            is_json = isinstance(transcription_data, list)
-        except (json.JSONDecodeError, TypeError):
-            is_json = False
-
-        speaker_names_used = []
-
-        if is_json:
-            # Handle new simplified JSON transcript (list of segments)
-            for segment in transcription_data:
-                original_speaker_label = segment.get('speaker')
-                if original_speaker_label in speaker_map:
-                    new_name_info = speaker_map[original_speaker_label]
-                    new_name = new_name_info.get('name', '').strip()
-                    # If isMe is checked but no name provided, use current user's name
-                    if new_name_info.get('isMe') and not new_name:
-                        new_name = current_user.name or 'Me'
-
-                    if new_name:
-                        segment['speaker'] = new_name
-                        if new_name not in speaker_names_used:
-                            speaker_names_used.append(new_name)
-
-            recording.transcription = json.dumps(transcription_data)
-
-            # Update participants only from speakers that were actually given names (not default labels)
-            final_speakers = set()
-            for seg in transcription_data:
-                speaker = seg.get('speaker')
-                if speaker and str(speaker).strip():
-                    # Only include speakers that have been given actual names (not default labels like "SPEAKER_01", "SPEAKER_09", etc.)
-                    # Check if this speaker was updated with a real name (not a default label)
-                    if not re.match(r'^SPEAKER_\d+$', str(speaker), re.IGNORECASE):
-                        final_speakers.add(speaker)
-            recording.participants = ', '.join(sorted(list(final_speakers)))
-
-        else:
-            # Handle plain text transcript
-            new_participants = []
-            for speaker_label, new_name_info in speaker_map.items():
-                new_name = new_name_info.get('name', '').strip()
-                # If isMe is checked but no name provided, use current user's name
-                if new_name_info.get('isMe') and not new_name:
-                    new_name = current_user.name or 'Me'
-
-                if new_name:
-                    transcription_text = re.sub(r'\[\s*' + re.escape(speaker_label) + r'\s*\]', f'[{new_name}]', transcription_text, flags=re.IGNORECASE)
-                    if new_name not in new_participants:
-                        new_participants.append(new_name)
-
-            recording.transcription = transcription_text
-            if new_participants:
-                recording.participants = ', '.join(new_participants)
-            speaker_names_used = new_participants
-
-        # Update speaker usage statistics
-        if speaker_names_used:
-            update_speaker_usage(speaker_names_used)
-
-        # Update speaker voice embeddings if available
-        embeddings_updated = 0
-        snippets_created = 0
-        if recording.speaker_embeddings and speaker_map:
-            try:
-                # Parse embeddings from recording
-                embeddings_data = json.loads(recording.speaker_embeddings) if isinstance(recording.speaker_embeddings, str) else recording.speaker_embeddings
-
-                # Build reverse map: SPEAKER_XX -> actual name assigned
-                speaker_label_to_name = {}
-                for speaker_label, speaker_info in speaker_map.items():
-                    name = speaker_info.get('name', '').strip()
-                    # Handle isMe checkbox
-                    if speaker_info.get('isMe') and not name:
-                        name = current_user.name or 'Me'
-
-                    # Only include speakers that were given real names (not SPEAKER_XX)
-                    if name and not re.match(r'^SPEAKER_\d+$', name, re.IGNORECASE):
-                        speaker_label_to_name[speaker_label] = name
-
-                # Update embeddings for each identified speaker
-                for speaker_label, embedding in embeddings_data.items():
-                    if speaker_label in speaker_label_to_name and embedding and len(embedding) == 256:
-                        speaker_name = speaker_label_to_name[speaker_label]
-
-                        # Find or create the speaker
-                        speaker = Speaker.query.filter_by(
-                            user_id=current_user.id,
-                            name=speaker_name
-                        ).first()
-
-                        if speaker:
-                            # Update the speaker's voice embedding
-                            similarity = update_speaker_embedding(speaker, embedding, recording.id)
-                            embeddings_updated += 1
-
-                            if similarity is not None:
-                                current_app.logger.info(
-                                    f"Updated voice profile for '{speaker_name}' "
-                                    f"(similarity: {similarity*100:.1f}%)"
-                                )
-                            else:
-                                current_app.logger.info(
-                                    f"Created initial voice profile for '{speaker_name}'"
-                                )
-
-                # Create snippets for identified speakers
-                if speaker_label_to_name:
-                    snippets_created = create_speaker_snippets(recording.id, speaker_map)
-                    if snippets_created > 0:
-                        current_app.logger.info(f"Created {snippets_created} speaker snippets")
-
-            except Exception as e:
-                current_app.logger.error(f"Error updating speaker embeddings: {e}", exc_info=True)
-                # Don't fail the whole request if embedding update fails
-
-        db.session.commit()
-
-        # Speaker names changed the transcription text — rebuild the Inquire
-        # chunks so semantic search answers with the applied names, not the
-        # raw SPEAKER_XX labels. Background + best-effort.
-        reindex_recording_chunks_async(recording_id)
-
-        summary_queued = False
-        if regenerate_summary:
-            current_app.logger.info(f"Queueing summary regeneration for recording {recording_id} after speaker update.")
-            job_queue.enqueue(
-                user_id=current_user.id,
-                recording_id=recording.id,
-                job_type='summarize',
-                params={'user_id': current_user.id}
-            )
-            summary_queued = True
+        # Same rename and follow-up steps as API v1 /speakers/assign (#412).
+        from src.services.speaker_assignment import apply_speaker_names
+        result = apply_speaker_names(recording, current_user, speaker_map, regenerate_summary)
+        summary_queued = result['summary_queued']
 
         # Return recording with per-user status
         recording_dict = recording.to_dict(viewer_user=current_user)
         enrich_recording_dict_with_user_status(recording_dict, recording, current_user)
         return jsonify({
             'success': True,
-            'message': 'Speakers updated successfully.',
+            'message': translate('server.apiMessage.speakersUpdated'),
             'recording': recording_dict,
             'summary_queued': summary_queued
         })
@@ -1079,11 +984,11 @@ def update_transcript(recording_id):
     """Updates the complete transcript data including text edits and speaker changes."""
     try:
         recording = db.session.get(Recording, recording_id)
-        if not recording:
-            return jsonify({'error': 'Recording not found'}), 404
+        if not recording or not has_recording_access(recording, current_user):
+            return jsonify(api_error('recording_not_found')), 404
 
         if not has_recording_access(recording, current_user, require_edit=True):
-            return jsonify({'error': 'You do not have permission to edit this recording'}), 403
+            return jsonify(api_error('recording_edit_denied')), 403
 
         data = request.json
         transcript_data = data.get('transcript_data')
@@ -1091,41 +996,27 @@ def update_transcript(recording_id):
         regenerate_summary = data.get('regenerate_summary', False)
 
         if not transcript_data or not isinstance(transcript_data, list):
-            return jsonify({'error': 'Invalid transcript data provided'}), 400
+            return jsonify(api_error('invalid_transcript_data')), 400
 
-        # Update speaker names in the transcript data
-        speaker_names_used = []
-        for segment in transcript_data:
-            original_speaker_label = segment.get('speaker')
+        # Apply the names exactly as update_speakers does, including the voice
+        # profiles and snippets: this route saves the names whenever the user
+        # also staged a line edit in the speaker modal.
+        from src.services.voice_profiles import speech_seconds_by_label
+        seconds_by_key = speech_seconds_by_label(transcript_data)
+        speaker_names_used, label_to_name = apply_speaker_map(transcript_data, speaker_map, current_user)
 
-            # Apply speaker name mapping if provided
-            if original_speaker_label in speaker_map:
-                new_name_info = speaker_map[original_speaker_label]
-                new_name = new_name_info.get('name', '').strip()
-                if new_name_info.get('isMe'):
-                    new_name = current_user.name or 'Me'
-
-                if new_name:
-                    segment['speaker'] = new_name
-                    if new_name not in speaker_names_used:
-                        speaker_names_used.append(new_name)
+        # Saved speakers first (update_speaker_usage commits on its own), so
+        # the segments link to them in the same commit as the names.
+        if speaker_names_used:
+            update_speaker_usage(speaker_names_used)
+        from src.services.speaker_links import link_list
+        link_list(transcript_data, recording)
 
         # Save the updated transcript
         recording.transcription = json.dumps(transcript_data)
+        recording.participants = participants_from_segments(transcript_data)
 
-        # Update participants
-        final_speakers = set()
-        for seg in transcript_data:
-            speaker = seg.get('speaker')
-            if speaker and str(speaker).strip():
-                # Only include speakers with real names (not default labels)
-                if not re.match(r'^SPEAKER_\d+$', str(speaker), re.IGNORECASE):
-                    final_speakers.add(speaker)
-        recording.participants = ', '.join(sorted(list(final_speakers)))
-
-        # Update speaker usage statistics
-        if speaker_names_used:
-            update_speaker_usage(speaker_names_used)
+        update_voice_profiles(recording, label_to_name, current_user, seconds_by_key)
 
         db.session.commit()
 
@@ -1153,7 +1044,7 @@ def update_transcript(recording_id):
         enrich_recording_dict_with_user_status(recording_dict, recording, current_user)
         return jsonify({
             'success': True,
-            'message': 'Transcript updated successfully.',
+            'message': translate('server.apiMessage.transcriptUpdated'),
             'recording': recording_dict,
             'summary_queued': summary_queued
         })
@@ -1173,38 +1064,38 @@ def auto_identify_speakers(recording_id):
     Strips existing names and re-identifies all speakers from scratch.
     """
     from src.services.speaker_identification import identify_speakers_from_transcript
+    from src.services.llm import LLMNotConfiguredError
 
     try:
         recording = db.session.get(Recording, recording_id)
-        if not recording:
-            return jsonify({'error': 'Recording not found'}), 404
-
-        if not has_recording_access(recording, current_user):
-            return jsonify({'error': 'You do not have permission to modify this recording'}), 403
+        if not recording or not has_recording_access(recording, current_user):
+            return jsonify(api_error('recording_not_found')), 404
 
         if not recording.transcription:
-            return jsonify({'error': 'No transcription available for speaker identification'}), 400
+            return jsonify(api_error('no_transcription_for_identification')), 400
 
         try:
             transcription_data = json.loads(recording.transcription)
         except (json.JSONDecodeError, TypeError):
-            return jsonify({'error': 'Transcription format not supported for auto-identification'}), 400
+            return jsonify(api_error('transcription_format_unsupported_for_identification')), 400
 
         if not isinstance(transcription_data, list):
-            return jsonify({'error': 'Transcription format not supported for auto-identification'}), 400
+            return jsonify(api_error('transcription_format_unsupported_for_identification')), 400
 
         speaker_map = identify_speakers_from_transcript(transcription_data, current_user.id)
 
         if not speaker_map:
-            return jsonify({'error': 'No speakers found in transcription'}), 400
+            return jsonify(api_error('no_speakers_in_transcription')), 400
 
         return jsonify({'success': True, 'speaker_map': speaker_map})
 
+    except LLMNotConfiguredError:
+        return jsonify(api_error('text_model_not_configured')), 503
     except ValueError as ve:
         return jsonify({'error': str(ve)}), 503
     except Exception as e:
         current_app.logger.error(f"Error during auto speaker identification for recording {recording_id}: {e}", exc_info=True)
-        return jsonify({'error': f'An unexpected error occurred: {str(e)}'}), 500
+        return jsonify(api_error('unexpected_error_detail', detail=str(e))), 500
 
 # --- Chat with Transcription ---
 
@@ -1215,44 +1106,15 @@ def reprocess_transcription(recording_id):
     """Reprocess transcription for a given recording."""
     try:
         recording = db.session.get(Recording, recording_id)
-        if not recording:
-            return jsonify({'error': 'Recording not found'}), 404
+        if not recording or not has_recording_access(recording, current_user):
+            return jsonify(api_error('recording_not_found')), 404
 
         if not has_recording_access(recording, current_user, require_edit=True):
-            return jsonify({'error': 'You do not have permission to reprocess this recording'}), 403
+            return jsonify(api_error('recording_reprocess_denied')), 403
 
-        if not recording.audio_path or not get_storage_service().exists(recording.audio_path):
-            return jsonify({'error': 'Audio file not found for reprocessing'}), 404
-
-        if recording.status in ['QUEUED', 'PROCESSING', 'SUMMARIZING']:
-            return jsonify({'error': 'Recording is already being processed'}), 400
-
-        # File path and name for processing (conversion handled in background task if needed)
-        filepath = recording.audio_path
-        filename_for_asr = recording.original_filename or os.path.basename(filepath)
-
-        # --- Proceed with reprocessing ---
-        recording.transcription = None
-        recording.summary = None
-        recording.status = 'QUEUED'  # Will change to PROCESSING when job starts
-
-        # Clear existing events since they depend on the transcription
-        Event.query.filter_by(recording_id=recording_id).delete()
-
-        db.session.commit()
-
-        current_app.logger.info(f"Queueing transcription reprocessing for recording {recording_id}")
-
-        # Prepare job parameters
+        # Checks, clearing and settings are shared with every reprocess path (#412).
+        from src.services.reprocessing import queue_transcription_reprocess, ReprocessError
         data = request.json or {}
-        start_time = datetime.utcnow()
-        app_context = current_app._get_current_object().app_context()
-
-        # Resolve the full transcribe param set through the shared chain:
-        # per-request override > tag > folder > env > owner > admin default.
-        # The 'language' key is only forwarded when explicitly present so an
-        # empty string still means auto-detect and an absent key falls back to
-        # the owner's default (see resolve_transcription_params).
         overrides = {
             'min_speakers': data.get('min_speakers'),
             'max_speakers': data.get('max_speakers'),
@@ -1262,14 +1124,11 @@ def reprocess_transcription(recording_id):
         }
         if 'language' in data:
             overrides['language'] = data.get('language')
-        job_params = resolve_transcription_params(recording, overrides)
-
-        job_id = job_queue.enqueue(
-            user_id=current_user.id,
-            recording_id=recording.id,
-            job_type='reprocess_transcription',
-            params=job_params
-        )
+        try:
+            queue_transcription_reprocess(recording, current_user, overrides)
+        except ReprocessError as e:
+            return jsonify(api_error(e.code)), e.status
+        current_app.logger.info(f"Queued transcription reprocessing for recording {recording_id}")
 
         # Get queue position for response
         queue_position = job_queue.get_position_in_queue(recording.id)
@@ -1280,7 +1139,7 @@ def reprocess_transcription(recording_id):
         enrich_recording_dict_with_user_status(recording_dict, recording, current_user)
         return jsonify({
             'success': True,
-            'message': 'Transcription reprocessing queued',
+            'message': translate('server.apiMessage.transcriptionReprocessingQueued'),
             'recording': recording_dict,
             'queue_position': queue_position,
             'queue_status': queue_status
@@ -1300,75 +1159,24 @@ def reprocess_summary(recording_id):
     """Reprocess summary for a given recording (requires existing transcription)."""
     try:
         recording = db.session.get(Recording, recording_id)
-        if not recording:
-            return jsonify({'error': 'Recording not found'}), 404
+        if not recording or not has_recording_access(recording, current_user):
+            return jsonify(api_error('recording_not_found')), 404
 
         if not has_recording_access(recording, current_user, require_edit=True):
-            return jsonify({'error': 'You do not have permission to reprocess this recording'}), 403
+            return jsonify(api_error('recording_reprocess_denied')), 403
 
-        # Check if transcription exists
-        if not recording.transcription or len(recording.transcription.strip()) < 10:
-            return jsonify({'error': 'No valid transcription available for summary generation'}), 400
-
-        # Check if transcription is an error message (not actual content)
-        if is_transcription_error(recording.transcription):
-            return jsonify({'error': 'Cannot generate summary: transcription failed. Please reprocess the transcription first.'}), 400
-
-        # Check if already processing
-        if recording.status in ['PROCESSING', 'SUMMARIZING']:
-            return jsonify({'error': 'Recording is already being processed'}), 400
-
-        # Check if OpenRouter client is available
-        if client is None:
-            return jsonify({'error': 'Summary service is not available (OpenRouter client not configured)'}), 503
-
-        # Get custom prompt + mode from request if provided
+        # Checks, clearing and job parameters are shared with every reprocess
+        # path, including API v1 and the bulk action (#412).
+        from src.services.reprocessing import queue_summary_reprocess, ReprocessError
         data = request.get_json() or {}
-        custom_prompt = data.get('custom_prompt', '').strip() if data.get('custom_prompt') else None
-        prompt_mode = (data.get('prompt_mode') or 'replace').strip().lower()
-        if prompt_mode not in ('replace', 'append'):
-            prompt_mode = 'replace'
-        custom_prompt_append = bool(custom_prompt) and prompt_mode == 'append'
-
-        # Debug logging
-        if custom_prompt:
-            current_app.logger.info(
-                f"Received custom prompt override for recording {recording_id} "
-                f"(mode={prompt_mode}, length={len(custom_prompt)})"
-            )
-        else:
-            current_app.logger.info(f"No custom prompt override provided for recording {recording_id}, will use default priority")
-
-        # Per-recording prompt-template variables. Sanitised through the same
-        # helper used at upload time so reprocess can't bypass the caps.
-        from src.utils.prompt_variables import sanitize_variable_values
-        raw_prompt_variables = data.get('prompt_variables')
-        if raw_prompt_variables is not None:
-            recording.prompt_variables = sanitize_variable_values(raw_prompt_variables)
-
-        # Clear existing summary (status will be set to QUEUED by job_queue.enqueue)
-        recording.summary = None
-
-        # Clear existing events since they might be re-extracted during summary generation
-        Event.query.filter_by(recording_id=recording_id).delete()
-
-        db.session.commit()
-
-        current_app.logger.info(f"Queueing summary reprocessing for recording {recording_id}" +
-                       (f" with custom prompt (length: {len(custom_prompt)})" if custom_prompt else ""))
-
-        # Queue summary generation job
-        job_params = {
-            'custom_prompt': custom_prompt,
-            'custom_prompt_append': custom_prompt_append,
-            'user_id': current_user.id
-        }
-        job_queue.enqueue(
-            user_id=current_user.id,
-            recording_id=recording.id,
-            job_type='reprocess_summary',
-            params=job_params
-        )
+        try:
+            queue_summary_reprocess(recording, current_user,
+                                    custom_prompt=data.get('custom_prompt'),
+                                    prompt_mode=data.get('prompt_mode'),
+                                    prompt_variables=data.get('prompt_variables'))
+        except ReprocessError as e:
+            return jsonify(api_error(e.code)), e.status
+        current_app.logger.info(f"Queued summary reprocessing for recording {recording_id}")
 
         # Refresh recording to get updated status
         db.session.refresh(recording)
@@ -1378,7 +1186,7 @@ def reprocess_summary(recording_id):
         enrich_recording_dict_with_user_status(recording_dict, recording, current_user)
         return jsonify({
             'success': True,
-            'message': 'Summary reprocessing started',
+            'message': translate('server.apiMessage.summaryReprocessingStarted'),
             'recording': recording_dict
         })
 
@@ -1395,29 +1203,38 @@ def regenerate_title(recording_id):
     """Regenerate the AI title for a recording based on its existing transcription."""
     try:
         recording = db.session.get(Recording, recording_id)
-        if not recording:
-            return jsonify({'error': 'Recording not found'}), 404
+        if not recording or not has_recording_access(recording, current_user):
+            return jsonify(api_error('recording_not_found')), 404
 
         if not has_recording_access(recording, current_user, require_edit=True):
-            return jsonify({'error': 'You do not have permission to edit this recording'}), 403
+            return jsonify(api_error('recording_edit_denied')), 403
 
-        if not recording.transcription or len(recording.transcription.strip()) < 10:
-            return jsonify({'error': 'No valid transcription available for title generation'}), 400
+        # Same title step as processing (naming template, AI title, fallbacks), so
+        # regenerating gives the title the pipeline would give (#412). The checks
+        # below apply only when the title needs an LLM call.
+        from src.services.titling import compute_title, needs_ai_title
+        if needs_ai_title(recording):
+            if not recording.transcription or len(recording.transcription.strip()) < 10:
+                return jsonify(api_error('no_transcription_for_title')), 400
 
-        if is_transcription_error(recording.transcription):
-            return jsonify({'error': 'Cannot generate title: transcription failed. Please reprocess the transcription first.'}), 400
+            if is_transcription_error(recording.transcription):
+                return jsonify(api_error('title_blocked_transcription_failed')), 400
 
-        if client is None:
-            return jsonify({'error': 'Title generation service is not available (OpenRouter client not configured)'}), 503
+            if client is None:
+                return jsonify(api_error('title_openrouter_not_configured')), 503
 
-        from src.tasks.processing import _generate_ai_title
-
-        new_title = _generate_ai_title(recording)
+        new_title = compute_title(recording, raise_budget_errors=True)
         if not new_title:
-            return jsonify({'error': 'Failed to generate a title'}), 500
+            return jsonify(api_error('title_generation_failed')), 500
 
         recording.title = new_title
+        recording.title_source = 'auto'
         db.session.commit()
+        # Keep the exported file in step with the new title, as /save does.
+        try:
+            export_recording(recording.id)
+        except Exception as export_error:
+            current_app.logger.warning(f"Export after title regeneration failed for {recording.id}: {export_error}")
 
         recording_dict = recording.to_dict(viewer_user=current_user)
         enrich_recording_dict_with_user_status(recording_dict, recording, current_user)
@@ -1439,25 +1256,33 @@ def reset_status(recording_id):
     """Resets the status of a stuck or failed recording."""
     try:
         recording = db.session.get(Recording, recording_id)
-        if not recording:
-            return jsonify({'error': 'Recording not found'}), 404
+        if not recording or not has_recording_access(recording, current_user):
+            return jsonify(api_error('recording_not_found')), 404
 
         if not has_recording_access(recording, current_user, require_edit=True):
-            return jsonify({'error': 'You do not have permission to modify this recording'}), 403
+            return jsonify(api_error('recording_modify_denied')), 403
 
-        # Allow resetting if it's stuck or failed
-        if recording.status in ['PENDING', 'PROCESSING', 'SUMMARIZING', 'FAILED']:
+        # Allow resetting if it's stuck or failed. QUEUED is included for a
+        # recording whose job never ran: reprocess refuses it as "already
+        # being processed", so this is its only way out.
+        if recording.status in ['PENDING', 'QUEUED', 'PROCESSING', 'SUMMARIZING', 'FAILED']:
             recording.status = 'FAILED'
             recording.error_message = "Manually reset from stuck or failed state."
+            # A job still waiting in the queue would claim the recording
+            # later and overwrite the reset. A running job cannot be stopped
+            # from here; it finishes on its own and sets a final status.
+            ProcessingJob.query.filter_by(recording_id=recording.id, status='queued').update(
+                {'status': 'failed', 'error_message': 'Cancelled by manual reset.'},
+                synchronize_session=False)
             db.session.commit()
             current_app.logger.info(f"Manually reset status for recording {recording_id} to FAILED.")
 
             # Return recording with per-user status
             recording_dict = recording.to_dict(viewer_user=current_user)
             enrich_recording_dict_with_user_status(recording_dict, recording, current_user)
-            return jsonify({'success': True, 'message': 'Recording status has been reset.', 'recording': recording_dict})
+            return jsonify({'success': True, 'message': translate('server.apiMessage.recordingStatusReset'), 'recording': recording_dict})
         else:
-            return jsonify({'error': f'Recording is not in a state that can be reset. Current status: {recording.status}'}), 400
+            return jsonify(api_error('recording_not_resettable', status=recording.status)), 400
 
     except Exception as e:
         db.session.rollback()
@@ -1467,12 +1292,22 @@ def reset_status(recording_id):
 # --- Authentication Routes ---
 
 
+def _text_model_configured():
+    from src.services.llm import TEXT_MODEL_CONFIGURED
+    return TEXT_MODEL_CONFIGURED
+
+
 @recordings_bp.route('/')
 @recordings_bp.route('/recordings/<int:recording_id>')
+@recordings_bp.route('/label/<label_name>')
 @login_required
-def index(recording_id=None):
+def index(recording_id=None, label_name=None):
     # recording_id is a deep link (#301): the server just serves the SPA shell
     # here; the frontend reads it from the path and pre-selects the recording.
+    # label_name works the same way for /label/<name>: the shell is served and
+    # the frontend resolves the name against the viewer's own accessible tags
+    # and applies it as the tag filter, so one link points at a group of
+    # recordings. Neither value is used server-side.
     # Check if user is a group admin
     is_team_admin = GroupMembership.query.filter_by(
         user_id=current_user.id,
@@ -1482,13 +1317,15 @@ def index(recording_id=None):
     # Pass the ASR config, inquire mode config, and user language preference to the template
     user_language = current_user.ui_language if current_user.is_authenticated and current_user.ui_language else 'en'
 
-    # Calculate if archive toggle should be shown (only when audio-only deletion mode is active)
-    enable_archive_toggle = ENABLE_AUTO_DELETION and DELETION_MODE == 'audio_only'
+    # The "Audio removed" filter matters when retention removes audio; users
+    # who can delete recordings can also remove audio by hand.
+    enable_audio_removed_filter = (ENABLE_AUTO_DELETION and DELETION_MODE == 'audio_only') or USERS_CAN_DELETE or current_user.is_admin
 
     # Get connector capabilities (new architecture)
     # Defaults to USE_ASR_ENDPOINT for backwards compatibility
     connector_supports_diarization = USE_ASR_ENDPOINT
     connector_supports_speaker_count = USE_ASR_ENDPOINT  # ASR endpoint supports min/max speakers
+    connector_supports_exact_speaker_count = False  # Exact-N connectors (openasr) declare it (#362)
     connector_supports_hotwords = USE_ASR_ENDPOINT
     connector_supports_initial_prompt = USE_ASR_ENDPOINT
     if USE_NEW_TRANSCRIPTION_ARCHITECTURE:
@@ -1499,6 +1336,7 @@ def index(recording_id=None):
             if connector:
                 connector_supports_diarization = connector.supports_diarization
                 connector_supports_speaker_count = connector.supports_speaker_count_control
+                connector_supports_exact_speaker_count = connector.supports_exact_speaker_count
                 connector_supports_hotwords = connector.supports_hotwords
                 connector_supports_initial_prompt = connector.supports_initial_prompt
         except Exception as e:
@@ -1546,17 +1384,19 @@ def index(recording_id=None):
                          use_asr_endpoint=USE_ASR_ENDPOINT,  # Backwards compat
                          connector_supports_diarization=connector_supports_diarization,
                          connector_supports_speaker_count=connector_supports_speaker_count,
+                         connector_supports_exact_speaker_count=connector_supports_exact_speaker_count,
                          connector_supports_hotwords=connector_supports_hotwords,
                          connector_supports_initial_prompt=connector_supports_initial_prompt,
                          inquire_mode_enabled=ENABLE_INQUIRE_MODE,
-                         enable_archive_toggle=enable_archive_toggle,
+                         enable_audio_removed_filter=enable_audio_removed_filter,
                          enable_internal_sharing=ENABLE_INTERNAL_SHARING,
                          user_language=user_language,
                          is_team_admin=is_team_admin,
                          server_recording_chunks_enabled=server_recording_chunks_enabled,
                          recording_max_hours=recording_max_hours,
                          recording_chunk_seconds=recording_chunk_seconds,
-                         recording_video_kbps=recording_video_kbps)
+                         recording_video_kbps=recording_video_kbps,
+                         text_model_configured=_text_model_configured())
 
 
 
@@ -1600,13 +1440,15 @@ def get_recordings():
             return jsonify([])  # Return empty array if not logged in
 
         # Filter recordings by the current user
+        from src.services.recording_list import RecordingListBatch, full_load_options
         stmt = select(Recording).where(Recording.user_id == current_user.id).order_by(Recording.created_at.desc())
-        recordings = db.session.execute(stmt).scalars().all()
+        recordings = db.session.execute(stmt.options(*full_load_options())).scalars().all()
         # Pre-batch the duplicate-info groupings so we don't run a
         # per-row query inside each recording's to_dict() call.
         dup_map = Recording.get_duplicate_info_map(current_user.id)
+        batch = RecordingListBatch(recordings, current_user, duplicates=False)
         return jsonify([
-            recording.to_dict(viewer_user=current_user, duplicate_info_map=dup_map)
+            recording.to_dict(viewer_user=current_user, duplicate_info_map=dup_map, batch=batch)
             for recording in recordings
         ])
     except Exception as e:
@@ -1624,7 +1466,10 @@ def get_recordings_paginated():
         page = request.args.get('page', 1, type=int)
         per_page = min(request.args.get('per_page', 25, type=int), 100)  # Cap at 100 per page
         search_query = request.args.get('q', '').strip()
+        # 'archived' is the user's own archive (#394); 'audio_removed' is the
+        # state left when the media file was deleted and the transcript kept.
         show_archived = request.args.get('archived', '').lower() == 'true'
+        show_audio_removed = request.args.get('audio_removed', '').lower() == 'true'
         show_shared = request.args.get('shared', '').lower() == 'true'
         show_starred = request.args.get('starred', '').lower() == 'true'
         show_inbox = request.args.get('inbox', '').lower() == 'true'
@@ -1659,10 +1504,18 @@ def get_recordings_paginated():
         if status_filter:
             stmt = stmt.where(Recording.status == status_filter)
 
-        # Apply archived filter (AND with other filters)
-        if show_archived:
-            # Only show recordings where audio has been deleted
+        # Audio removed filter (AND with other filters)
+        if show_audio_removed:
             stmt = stmt.where(Recording.audio_deleted_at.is_not(None))
+
+        # Archive: the archived view shows only archived recordings; the main
+        # list hides them, except in search results, so archiving never makes
+        # a recording unfindable.
+        from src.services.recording_state import archived_condition
+        if show_archived:
+            stmt = stmt.where(archived_condition(Recording, current_user.id))
+        elif not search_query:
+            stmt = stmt.where(db.not_(archived_condition(Recording, current_user.id)))
 
         # Apply shared filter (AND with other filters)
         if show_shared:
@@ -1711,13 +1564,12 @@ def get_recordings_paginated():
             if folder_filter.lower() == 'none':
                 # Filter recordings with no folder
                 stmt = stmt.where(Recording.folder_id.is_(None))
+            elif folder_filter.isdecimal():
+                stmt = stmt.where(Recording.folder_id == int(folder_filter))
             else:
-                # Filter by specific folder_id
-                try:
-                    folder_id = int(folder_filter)
-                    stmt = stmt.where(Recording.folder_id == folder_id)
-                except ValueError:
-                    pass  # Invalid folder_id, ignore filter
+                # A bad value is refused, not ignored (#514).
+                return jsonify({'error': translate('server.apiError.invalid_folder_id'),
+                                'code': 'invalid_parameter'}), 400
 
         if needs_transcription:
             stmt = stmt.where(_needs_transcription_condition())
@@ -1744,158 +1596,78 @@ def get_recordings_paginated():
             text_query = re.sub(r'tag:\S+', '', text_query, flags=re.IGNORECASE)
             text_query = re.sub(r'speaker:\S+', '', text_query, flags=re.IGNORECASE).strip()
 
-            # Apply date filters
+            # Apply date filters (#412). Each filter is a range of local calendar
+            # days in the viewer's timezone (sent by the browser, else the account
+            # zone), converted to UTC because meeting_date / created_at are stored
+            # as naive UTC. Ranges are half-open [start, end): the last day is
+            # included up to midnight (date_to and lastmonth dropped it before).
+            from src.utils.timezones import local_day_start_utc, now_local, request_timezone
+            _zone = request_timezone(request.args.get('tz'), current_user)
+            _today = now_local(_zone).date()
+
+            def _days(first, after_last=None):
+                start_utc = local_day_start_utc(first, _zone)
+                end_utc = local_day_start_utc(after_last, _zone) if after_last else None
+                meeting = [Recording.meeting_date >= start_utc]
+                created = [Recording.created_at >= start_utc]
+                if end_utc is not None:
+                    meeting.append(Recording.meeting_date < end_utc)
+                    created.append(Recording.created_at < end_utc)
+                return db.or_(db.and_(*meeting),
+                              db.and_(Recording.meeting_date.is_(None), *created))
+
+            def _month_start(year, month):
+                return date(year, month, 1)
+
+            def _next_month(d):
+                return date(d.year + (d.month == 12), d.month % 12 + 1, 1)
+
             for date_filter in date_filters:
                 if date_filter == 'today':
-                    today = datetime.now().date()
-                    stmt = stmt.where(
-                        db.or_(
-                            db.func.date(Recording.meeting_date) == today,
-                            db.and_(
-                                Recording.meeting_date.is_(None),
-                                db.func.date(Recording.created_at) == today
-                            )
-                        )
-                    )
+                    stmt = stmt.where(_days(_today, _today + timedelta(days=1)))
                 elif date_filter == 'yesterday':
-                    yesterday = datetime.now().date() - timedelta(days=1)
-                    stmt = stmt.where(
-                        db.or_(
-                            db.func.date(Recording.meeting_date) == yesterday,
-                            db.and_(
-                                Recording.meeting_date.is_(None),
-                                db.func.date(Recording.created_at) == yesterday
-                            )
-                        )
-                    )
+                    stmt = stmt.where(_days(_today - timedelta(days=1), _today))
                 elif date_filter == 'thisweek':
-                    today = datetime.now().date()
-                    start_of_week = today - timedelta(days=today.weekday())
-                    stmt = stmt.where(
-                        db.or_(
-                            Recording.meeting_date >= start_of_week,
-                            db.and_(
-                                Recording.meeting_date.is_(None),
-                                db.func.date(Recording.created_at) >= start_of_week
-                            )
-                        )
-                    )
+                    stmt = stmt.where(_days(_today - timedelta(days=_today.weekday())))
                 elif date_filter == 'lastweek':
-                    today = datetime.now().date()
-                    end_of_last_week = today - timedelta(days=today.weekday())
-                    start_of_last_week = end_of_last_week - timedelta(days=7)
-                    stmt = stmt.where(
-                        db.or_(
-                            db.and_(
-                                Recording.meeting_date >= start_of_last_week,
-                                Recording.meeting_date < end_of_last_week
-                            ),
-                            db.and_(
-                                Recording.meeting_date.is_(None),
-                                db.func.date(Recording.created_at) >= start_of_last_week,
-                                db.func.date(Recording.created_at) < end_of_last_week
-                            )
-                        )
-                    )
+                    this_week = _today - timedelta(days=_today.weekday())
+                    stmt = stmt.where(_days(this_week - timedelta(days=7), this_week))
                 elif date_filter == 'thismonth':
-                    today = datetime.now().date()
-                    start_of_month = today.replace(day=1)
-                    stmt = stmt.where(
-                        db.or_(
-                            Recording.meeting_date >= start_of_month,
-                            db.and_(
-                                Recording.meeting_date.is_(None),
-                                db.func.date(Recording.created_at) >= start_of_month
-                            )
-                        )
-                    )
+                    stmt = stmt.where(_days(_today.replace(day=1)))
                 elif date_filter == 'lastmonth':
-                    today = datetime.now().date()
-                    first_day_this_month = today.replace(day=1)
-                    last_day_last_month = first_day_this_month - timedelta(days=1)
-                    first_day_last_month = last_day_last_month.replace(day=1)
-                    stmt = stmt.where(
-                        db.or_(
-                            db.and_(
-                                Recording.meeting_date >= first_day_last_month,
-                                Recording.meeting_date <= last_day_last_month
-                            ),
-                            db.and_(
-                                Recording.meeting_date.is_(None),
-                                db.func.date(Recording.created_at) >= first_day_last_month,
-                                db.func.date(Recording.created_at) <= last_day_last_month
-                            )
-                        )
-                    )
+                    this_month = _today.replace(day=1)
+                    last_month = (this_month - timedelta(days=1)).replace(day=1)
+                    stmt = stmt.where(_days(last_month, this_month))
                 elif re.match(r'^\d{4}-\d{2}-\d{2}$', date_filter):
-                    # Specific date format YYYY-MM-DD
-                    target_date = datetime.strptime(date_filter, '%Y-%m-%d').date()
-                    stmt = stmt.where(
-                        db.or_(
-                            db.func.date(Recording.meeting_date) == target_date,
-                            db.and_(
-                                Recording.meeting_date.is_(None),
-                                db.func.date(Recording.created_at) == target_date
-                            )
-                        )
-                    )
+                    try:
+                        target = datetime.strptime(date_filter, '%Y-%m-%d').date()
+                        stmt = stmt.where(_days(target, target + timedelta(days=1)))
+                    except ValueError:
+                        pass
                 elif re.match(r'^\d{4}-\d{2}$', date_filter):
-                    # Month format YYYY-MM
                     year, month = map(int, date_filter.split('-'))
-                    stmt = stmt.where(
-                        db.or_(
-                            db.and_(
-                                db.extract('year', Recording.meeting_date) == year,
-                                db.extract('month', Recording.meeting_date) == month
-                            ),
-                            db.and_(
-                                Recording.meeting_date.is_(None),
-                                db.extract('year', Recording.created_at) == year,
-                                db.extract('month', Recording.created_at) == month
-                            )
-                        )
-                    )
+                    if 1 <= month <= 12:
+                        first = _month_start(year, month)
+                        stmt = stmt.where(_days(first, _next_month(first)))
                 elif re.match(r'^\d{4}$', date_filter):
-                    # Year format YYYY
                     year = int(date_filter)
-                    stmt = stmt.where(
-                        db.or_(
-                            db.extract('year', Recording.meeting_date) == year,
-                            db.and_(
-                                Recording.meeting_date.is_(None),
-                                db.extract('year', Recording.created_at) == year
-                            )
-                        )
-                    )
+                    stmt = stmt.where(_days(date(year, 1, 1), date(year + 1, 1, 1)))
 
-            # Apply date range filters
+            # Apply date range filters (date_to includes that whole day)
             if date_from_filters and date_from_filters[0]:
                 try:
                     date_from = datetime.strptime(date_from_filters[0], '%Y-%m-%d').date()
-                    stmt = stmt.where(
-                        db.or_(
-                            Recording.meeting_date >= date_from,
-                            db.and_(
-                                Recording.meeting_date.is_(None),
-                                db.func.date(Recording.created_at) >= date_from
-                            )
-                        )
-                    )
+                    stmt = stmt.where(_days(date_from))
                 except ValueError:
                     pass  # Invalid date format, ignore
 
             if date_to_filters and date_to_filters[0]:
                 try:
                     date_to = datetime.strptime(date_to_filters[0], '%Y-%m-%d').date()
-                    stmt = stmt.where(
-                        db.or_(
-                            Recording.meeting_date <= date_to,
-                            db.and_(
-                                Recording.meeting_date.is_(None),
-                                db.func.date(Recording.created_at) <= date_to
-                            )
-                        )
-                    )
+                    end_utc = local_day_start_utc(date_to + timedelta(days=1), _zone)
+                    stmt = stmt.where(db.or_(
+                        Recording.meeting_date < end_utc,
+                        db.and_(Recording.meeting_date.is_(None), Recording.created_at < end_utc)))
                 except ValueError:
                     pass  # Invalid date format, ignore
 
@@ -1906,7 +1678,13 @@ def get_recordings_paginated():
                 for tag_filter in tag_filters:
                     # Replace underscores back to spaces for matching
                     tag_name = tag_filter.replace('_', ' ')
-                    tag_conditions.append(Tag.name.ilike(f'%{tag_name}%'))
+                    # Exact, case-insensitive: the filter is built from a tag
+                    # the user picked (sidebar chip, or a /label/<name> link),
+                    # so 'foo' must not also drag in 'foobar'. lower() == is
+                    # used over ilike so '%' and '_' in a tag name stay literal.
+                    tag_conditions.append(
+                        db.func.lower(Tag.name) == tag_name.lower()
+                    )
 
                 stmt = stmt.join(RecordingTag).join(Tag).where(db.or_(*tag_conditions))
 
@@ -1916,7 +1694,8 @@ def get_recordings_paginated():
                 for speaker_filter in speaker_filters:
                     # Replace underscores back to spaces for matching
                     speaker_name = speaker_filter.replace('_', ' ')
-                    speaker_conditions.append(Recording.participants.ilike(f'%{speaker_name}%'))
+                    speaker_conditions.append(Recording.participants.ilike(
+                        contains_pattern(speaker_name), escape=LIKE_ESCAPE))
                 stmt = stmt.where(db.or_(*speaker_conditions))
 
             # Apply text search
@@ -1927,14 +1706,16 @@ def get_recordings_paginated():
                 # - For owned recordings: search Recording.notes
                 # - For shared recordings: search SharedRecordingState.personal_notes
 
+                # Every character typed is matched literally (#485)
+                pattern = contains_pattern(text_query)
                 text_conditions = [
-                    Recording.title.ilike(f'%{text_query}%'),
-                    Recording.participants.ilike(f'%{text_query}%'),
-                    Recording.transcription.ilike(f'%{text_query}%'),
+                    Recording.title.ilike(pattern, escape=LIKE_ESCAPE),
+                    Recording.participants.ilike(pattern, escape=LIKE_ESCAPE),
+                    Recording.transcription.ilike(pattern, escape=LIKE_ESCAPE),
                     # Search owner's notes for owned recordings
                     db.and_(
                         Recording.user_id == current_user.id,
-                        Recording.notes.ilike(f'%{text_query}%')
+                        Recording.notes.ilike(pattern, escape=LIKE_ESCAPE)
                     )
                 ]
 
@@ -1943,7 +1724,7 @@ def get_recordings_paginated():
                 shared_notes_subq = select(SharedRecordingState.recording_id).where(
                     db.and_(
                         SharedRecordingState.user_id == current_user.id,
-                        SharedRecordingState.personal_notes.ilike(f'%{text_query}%')
+                        SharedRecordingState.personal_notes.ilike(pattern, escape=LIKE_ESCAPE)
                     )
                 ).scalar_subquery()
 
@@ -1965,16 +1746,19 @@ def get_recordings_paginated():
             # Default: sort by created_at (upload/processing date)
             stmt = stmt.order_by(Recording.created_at.desc())
 
-        # Get total count for pagination info
-        count_stmt = select(db.func.count()).select_from(stmt.subquery())
+        # Get total count for pagination info; the order does not change the
+        # count, so it is left out of the counting query (D#441)
+        count_stmt = select(db.func.count()).select_from(stmt.order_by(None).subquery())
         total_count = db.session.execute(count_stmt).scalar()
 
         # Apply pagination
         offset = (page - 1) * per_page
         stmt = stmt.offset(offset).limit(per_page)
 
-        # Execute query
-        recordings = db.session.execute(stmt).scalars().all()
+        # Execute query. Tags, folders and their names load for the whole
+        # page, and the long text columns the list never shows stay behind (D#483).
+        from src.services.recording_list import RecordingListBatch, list_load_options
+        recordings = db.session.execute(stmt.options(*list_load_options())).scalars().all()
 
         # Batch-load this viewer's shares for the page so serialization can resolve
         # the #314 share-reason tag/folder without an N+1 query.
@@ -1987,29 +1771,35 @@ def get_recordings_paginated():
             ).all():
                 share_map[s.recording_id] = s
 
+        # What the rows need beyond their own columns, read once for the page
+        # rather than per row (D#483)
+        batch = RecordingListBatch(recordings, current_user, share_map)
+        editable_ids = editable_recording_ids(recordings, current_user, share_map)
+
         # Enrich recordings with sharing metadata
         enriched_recordings = []
         for recording in recordings:
-            rec_dict = recording.to_list_dict(viewer_user=current_user, share_map=share_map)
+            rec_dict = recording.to_list_dict(viewer_user=current_user, share_map=share_map, batch=batch)
 
             # Add sharing metadata
             is_owner = recording.user_id == current_user.id
             rec_dict['is_owner'] = is_owner
 
             # Get per-user status (owner uses Recording fields, recipients use SharedRecordingState)
-            user_inbox, user_highlighted = get_user_recording_status(recording, current_user)
+            user_inbox, user_highlighted = batch.user_status(recording)
             rec_dict['is_inbox'] = user_inbox
             rec_dict['is_highlighted'] = user_highlighted
+            rec_dict['is_archived'] = batch.user_archived(recording)
 
-            # Add edit permission info (uses has_recording_access which checks group admin status)
-            rec_dict['can_edit'] = has_recording_access(recording, current_user, require_edit=True)
+            # Add edit permission info (has_recording_access rules, group admins included)
+            rec_dict['can_edit'] = recording.id in editable_ids
 
             # Add delete permission info (only owner can delete)
             rec_dict['can_delete'] = is_owner and (USERS_CAN_DELETE or current_user.is_admin)
 
             if not is_owner:
                 # This is a shared recording - get owner info and share permissions
-                owner = db.session.get(User, recording.user_id)
+                owner = batch.owners.get(recording.user_id)
                 rec_dict['owner_username'] = owner.username if owner else "Unknown"
                 rec_dict['is_shared'] = True
                 # Don't show outgoing share count for recordings you don't own
@@ -2037,8 +1827,7 @@ def get_recordings_paginated():
                 rec_dict['is_shared'] = False
 
             # Check if recording has group tags (among visible tags)
-            visible_tags = recording.get_visible_tags(current_user)
-            has_group_tags = any(tag.is_group_tag for tag in visible_tags)
+            has_group_tags = any(tag.is_group_tag for tag in batch.visible_tags(recording))
             rec_dict['has_group_tags'] = has_group_tags
 
             enriched_recordings.append(rec_dict)
@@ -2072,24 +1861,25 @@ def save_metadata():
     try:
         data = request.json
         if not data:
-            return jsonify({'error': 'No data provided'}), 400
+            return jsonify(api_error('no_data_provided')), 400
         recording_id = data.get('id')
         if not recording_id:
-            return jsonify({'error': 'No recording ID provided'}), 400
+            return jsonify(api_error('no_recording_id')), 400
 
         recording = db.session.get(Recording, recording_id)
-        if not recording:
-            return jsonify({'error': 'Recording not found'}), 404
-
         # Check if user has at least view access
-        if not has_recording_access(recording, current_user, require_edit=False):
-            return jsonify({'error': 'You do not have permission to access this recording'}), 403
+        if not recording or not has_recording_access(recording, current_user):
+            return jsonify(api_error('recording_not_found')), 404
 
         # Handle notes separately - no edit permission required (user-specific)
         if 'notes' in data:
             if recording.user_id == current_user.id:
                 # Owner saves to Recording.notes
-                recording.notes = sanitize_html(data['notes']) if data['notes'] else data['notes']
+                # Stored as written: notes and summaries are Markdown, and the
+                # HTML cleaner would turn "> quote" into "&gt; quote". They are
+                # cleaned when converted to HTML (md_to_html), the only form ever
+                # shown as HTML.
+                recording.notes = data['notes']
             else:
                 # Shared user saves to personal_notes (requires SharedRecordingState)
                 from src.models.sharing import SharedRecordingState
@@ -2108,7 +1898,7 @@ def save_metadata():
                     )
                     db.session.add(state)
 
-                state.personal_notes = sanitize_html(data['notes']) if data['notes'] else data['notes']
+                state.personal_notes = data['notes']
 
         # Determine if any fields requiring edit permission are being updated
         edit_fields = ['title', 'participants', 'summary', 'meeting_date']
@@ -2116,16 +1906,18 @@ def save_metadata():
 
         # If edit fields are present, check for edit permission
         if requires_edit and not has_recording_access(recording, current_user, require_edit=True):
-            return jsonify({'error': 'You do not have permission to edit this recording'}), 403
+            return jsonify(api_error('recording_edit_denied')), 403
 
         # Update fields requiring edit permission
         if requires_edit:
             if 'title' in data:
+                if data['title'] != recording.title:
+                    recording.title_source = 'user'
                 recording.title = data['title']
             if 'participants' in data:
                 recording.participants = data['participants']
             if 'summary' in data:
-                recording.summary = sanitize_html(data['summary']) if data['summary'] else data['summary']
+                recording.summary = data['summary']
             if 'meeting_date' in data:
                 try:
                     date_str = data['meeting_date']
@@ -2133,18 +1925,16 @@ def save_metadata():
                         # Try to parse as full ISO datetime first. meeting_date is
                         # stored as naive UTC (like created_at), so convert any
                         # zone-aware input to UTC before storing.
-                        try:
+                        if re.match(r'^\d{4}-\d{2}-\d{2}$', date_str.strip()):
+                            # Date only: keep the existing time of day, else noon UTC
+                            # so the calendar day reads the same in every timezone.
+                            # (Python 3.11 parses a bare date as midnight UTC, which
+                            # showed as the previous day west of UTC, #412 B5.)
+                            parsed_date = datetime.strptime(date_str.strip(), '%Y-%m-%d')
+                            existing_time = recording.meeting_date.time() if recording.meeting_date else datetime.min.time().replace(hour=12)
+                            recording.meeting_date = datetime.combine(parsed_date.date(), existing_time)
+                        else:
                             recording.meeting_date = to_utc_naive(datetime.fromisoformat(date_str.replace('Z', '+00:00')))
-                        except (ValueError, AttributeError):
-                            # Fall back to date-only format, preserve existing time if available
-                            parsed_date = datetime.strptime(date_str, '%Y-%m-%d')
-                            if recording.meeting_date:
-                                # Preserve existing time
-                                existing_time = recording.meeting_date.time()
-                                recording.meeting_date = datetime.combine(parsed_date.date(), existing_time)
-                            else:
-                                # No existing time, use the parsed date with midnight time
-                                recording.meeting_date = parsed_date
                     else:
                         recording.meeting_date = None
                 except (ValueError, TypeError) as e:
@@ -2158,6 +1948,9 @@ def save_metadata():
                 is_inbox=data.get('is_inbox'),
                 is_highlighted=data.get('is_highlighted')
             )
+        if 'is_archived' in data:
+            from src.services.recording_state import set_user_archived
+            set_user_archived(recording, current_user, data.get('is_archived'))
 
         db.session.commit()
 
@@ -2173,7 +1966,7 @@ def save_metadata():
     except Exception as e:
         db.session.rollback()
         current_app.logger.error(f"Error saving metadata for recording {data.get('id')}: {e}", exc_info=True)
-        return jsonify({'error': 'An unexpected error occurred while saving.'}), 500
+        return jsonify(api_error('unexpected_error_saving')), 500
 
 
 @recordings_bp.route('/recording/<int:recording_id>/update_transcription', methods=['POST'])
@@ -2182,17 +1975,17 @@ def update_transcription(recording_id):
     """Updates the transcription content for a recording."""
     try:
         recording = db.session.get(Recording, recording_id)
-        if not recording:
-            return jsonify({'error': 'Recording not found'}), 404
+        if not recording or not has_recording_access(recording, current_user):
+            return jsonify(api_error('recording_not_found')), 404
 
         if not has_recording_access(recording, current_user, require_edit=True):
-            return jsonify({'error': 'You do not have permission to edit this recording'}), 403
+            return jsonify(api_error('recording_edit_denied')), 403
 
         data = request.json
         new_transcription = data.get('transcription')
 
         if new_transcription is None:
-            return jsonify({'error': 'No transcription data provided'}), 400
+            return jsonify(api_error('no_transcription_data')), 400
 
         # The incoming data could be a JSON string (from ASR edit) or plain text
         recording.transcription = new_transcription
@@ -2209,12 +2002,12 @@ def update_transcription(recording_id):
         # Return recording with per-user status
         recording_dict = recording.to_dict(viewer_user=current_user)
         enrich_recording_dict_with_user_status(recording_dict, recording, current_user)
-        return jsonify({'success': True, 'message': 'Transcription updated successfully.', 'recording': recording_dict})
+        return jsonify({'success': True, 'message': translate('server.apiMessage.transcriptionUpdated'), 'recording': recording_dict})
 
     except Exception as e:
         db.session.rollback()
         current_app.logger.error(f"Error updating transcription for recording {recording_id}: {e}", exc_info=True)
-        return jsonify({'error': 'An unexpected error occurred while updating the transcription.'}), 500
+        return jsonify(api_error('unexpected_error_updating_transcription')), 500
 
 # Toggle inbox status endpoint
 
@@ -2224,12 +2017,9 @@ def update_transcription(recording_id):
 def toggle_inbox(recording_id):
     try:
         recording = db.session.get(Recording, recording_id)
-        if not recording:
-            return jsonify({'error': 'Recording not found'}), 404
-
         # Only require view access (not edit) - users can manage their own inbox status
-        if not has_recording_access(recording, current_user, require_edit=False):
-            return jsonify({'error': 'You do not have permission to view this recording'}), 403
+        if not recording or not has_recording_access(recording, current_user):
+            return jsonify(api_error('recording_not_found')), 404
 
         # Get current status and toggle it
         current_inbox, current_highlighted = get_user_recording_status(recording, current_user)
@@ -2239,7 +2029,7 @@ def toggle_inbox(recording_id):
     except Exception as e:
         db.session.rollback()
         current_app.logger.error(f"Error toggling inbox status for recording {recording_id}: {e}", exc_info=True)
-        return jsonify({'error': 'An unexpected error occurred.'}), 500
+        return jsonify(api_error('unexpected_error')), 500
 
 # Toggle highlighted status endpoint
 
@@ -2249,12 +2039,9 @@ def toggle_inbox(recording_id):
 def toggle_highlight(recording_id):
     try:
         recording = db.session.get(Recording, recording_id)
-        if not recording:
-            return jsonify({'error': 'Recording not found'}), 404
-
         # Only require view access (not edit) - users can manage their own highlight status
-        if not has_recording_access(recording, current_user, require_edit=False):
-            return jsonify({'error': 'You do not have permission to view this recording'}), 403
+        if not recording or not has_recording_access(recording, current_user):
+            return jsonify(api_error('recording_not_found')), 404
 
         # Get current status and toggle it
         current_inbox, current_highlighted = get_user_recording_status(recording, current_user)
@@ -2264,9 +2051,76 @@ def toggle_highlight(recording_id):
     except Exception as e:
         db.session.rollback()
         current_app.logger.error(f"Error toggling highlighted status for recording {recording_id}: {e}", exc_info=True)
-        return jsonify({'error': 'An unexpected error occurred.'}), 500
+        return jsonify(api_error('unexpected_error')), 500
 
 
+
+
+@recordings_bp.route('/recording/<int:recording_id>/toggle_archive', methods=['POST'])
+@login_required
+def toggle_archive(recording_id):
+    """Archive or unarchive a recording for the current user (#394)."""
+    try:
+        recording = db.session.get(Recording, recording_id)
+        # Like inbox and star, archiving is personal and needs only view access.
+        if not recording or not has_recording_access(recording, current_user):
+            return jsonify(api_error('recording_not_found')), 404
+        from src.services.recording_state import get_user_archived, set_user_archived
+        new_value = set_user_archived(recording, current_user, not get_user_archived(recording, current_user))
+        return jsonify({'success': True, 'is_archived': new_value})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"Error toggling archive for recording {recording_id}: {e}", exc_info=True)
+        return jsonify(api_error('unexpected_error')), 500
+
+
+@recordings_bp.route('/recording/<int:recording_id>/delete_audio', methods=['POST'])
+@login_required
+def delete_recording_audio(recording_id):
+    """Delete a recording's media file and keep the transcript, summary and notes.
+
+    Same permission as deleting the recording. The recording then shows as
+    "Audio removed", exactly like audio-only retention leaves it.
+    """
+    try:
+        recording = db.session.get(Recording, recording_id)
+        if not recording or (recording.user_id and not has_recording_access(recording, current_user)):
+            return jsonify(api_error('recording_not_found')), 404
+        if recording.user_id and recording.user_id != current_user.id:
+            return jsonify(api_error('recording_delete_denied')), 403
+        if not USERS_CAN_DELETE and not current_user.is_admin:
+            return jsonify(api_error('recording_delete_admin_only')), 403
+        if recording.audio_deleted_at:
+            return jsonify(api_error('audio_already_removed')), 409
+        if recording.status not in ('COMPLETED', 'FAILED'):
+            return jsonify(api_error('audio_remove_while_processing')), 409
+
+        from src.services.retention import remove_recording_audio
+        remove_recording_audio(recording)
+        current_app.logger.info(f"User {current_user.id} removed the audio of recording {recording_id}")
+
+        recording_dict = recording.to_dict(viewer_user=current_user)
+        enrich_recording_dict_with_user_status(recording_dict, recording, current_user)
+        return jsonify({'success': True, 'recording': recording_dict})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"Error removing audio for recording {recording_id}: {e}", exc_info=True)
+        return jsonify(api_error('unexpected_error')), 500
+
+
+# Shares per signed-in user (#435): a forced share from another page cannot
+# fill an account or queue paid transcriptions without bound.
+try:
+    from limits import parse as _parse_limit
+    SHARE_TARGET_LIMIT = _parse_limit(os.environ.get('SHARE_TARGET_RATE_LIMIT', '20 per hour'))
+except Exception:
+    SHARE_TARGET_LIMIT = None
+
+
+def _share_target_allowed(user_id):
+    if SHARE_TARGET_LIMIT is None or limiter is None or not getattr(limiter, 'enabled', True):
+        return True
+    return limiter.limiter.hit(SHARE_TARGET_LIMIT, 'share_target', str(user_id))
 
 
 @recordings_bp.route('/share-target', methods=['POST', 'GET'])
@@ -2283,7 +2137,11 @@ def share_target():
     CSRF is exempted at app startup (the share sheet has no way to
     round-trip a CSRF token). Authentication still happens via the
     session cookie carried by the browser; unauthenticated visitors hit
-    @login_required and are bounced to the login page.
+    @login_required and are bounced to the login page. A POST that a
+    browser marks as sent from another site (``Sec-Fetch-Site``) is
+    refused (#435): a share from the operating system's share sheet is
+    marked ``none``, and a page elsewhere could otherwise submit a forged
+    share with the signed-in user's cookies.
 
     Implementation: save the file to ``UPLOAD_FOLDER``, create a Recording
     row applying the same user / folder / tag defaults as ``upload_file``
@@ -2296,93 +2154,131 @@ def share_target():
         # Some platforms pre-flight with GET. Just land the user on the SPA.
         return redirect(url_for('recordings.index'))
 
+    # Browsers without Fetch Metadata send no header and are let through.
+    if request.headers.get('Sec-Fetch-Site', '').lower() in ('cross-site', 'same-site'):
+        current_app.logger.warning(
+            f"share-target POST from another site refused for user {current_user.id}")
+        return redirect(url_for('recordings.index') + '?share_target_error=cross_site')
+
+    if not _share_target_allowed(current_user.id):
+        current_app.logger.warning(f"share-target rate limit reached for user {current_user.id}")
+        return redirect(url_for('recordings.index') + '?share_target_error=rate_limited')
+
     shared = request.files.get('shared_audio') or request.files.get('file')
     if not shared or not getattr(shared, 'filename', ''):
         return redirect(url_for('recordings.index') + '?share_target_error=missing_file')
 
-    original_filename = shared.filename
-    safe_filename = secure_filename(original_filename) or 'shared-recording.webm'
-    timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
-    filepath = os.path.join(current_app.config['UPLOAD_FOLDER'], f"{timestamp}_{safe_filename}")
+    # The file goes through the same ingestion as every upload (#412 audit
+    # P13): storage backend (local or S3), file hash and duplicate check,
+    # meeting date, MIME type, title placeholder, recording.created and the
+    # transcription job. A share sheet carries no tag or folder; its title,
+    # text and url become the title and notes.
+    from werkzeug.datastructures import MultiDict
+    form = MultiDict()
+    share_title = (request.form.get('title') or '').strip()
+    if share_title:
+        form['title'] = share_title
+    notes_parts = [(request.form.get(k) or '').strip() for k in ('title', 'text', 'url')]
+    notes_parts = [v for v in notes_parts if v]
+    if notes_parts:
+        form['notes'] = '\n\n'.join(notes_parts)
 
     try:
-        shared.save(filepath)
+        result = ingest_uploaded_recording(owner=current_user, uploaded_file=shared, form=form,
+                                           processing_source='share_target')
     except RequestEntityTooLarge:
         return redirect(url_for('recordings.index') + '?share_target_error=too_large')
-    except Exception as save_err:
-        current_app.logger.warning(f"share-target file save failed: {save_err}")
-        return redirect(url_for('recordings.index') + '?share_target_error=save_failed')
+    resp, status = result if isinstance(result, tuple) else (result, result.status_code)
+    data = resp.get_json(silent=True) or {}
+    if status >= 400 or not data.get('id'):
+        current_app.logger.warning(f"share-target ingest failed ({status}): {data.get('error')}")
+        if data.get('code') in ('audio_decode_failed', 'empty_file'):
+            error = 'unreadable'
+        else:
+            error = {413: 'too_large', 507: 'storage_quota'}.get(status, 'save_failed')
+        return redirect(url_for('recordings.index') + f'?share_target_error={error}')
 
-    file_size = os.path.getsize(filepath)
-
-    # Build the recording row. Tags and folder cannot be inferred from a
-    # share sheet, so we leave them empty; the user can adjust from the
-    # recording detail view. Title comes from the share sheet's title field
-    # if present; otherwise we use the SAME placeholder a normal upload gets
-    # (resolve_upload_title) so the AI title task recognises it and generates
-    # a title — previously the filename stem was used, which the title task
-    # treated as a user-chosen title and skipped, leaving shared files untitled.
-    from src.utils.titles import resolve_upload_title
-    share_title = resolve_upload_title(request.form.get('title'), original_filename)
-
-    notes_parts = []
-    for key in ('title', 'text', 'url'):
-        val = (request.form.get(key) or '').strip()
-        if val:
-            notes_parts.append(val)
-    share_notes = '\n\n'.join(notes_parts) if notes_parts else None
-
-    recording = Recording(
-        audio_path=filepath,
-        original_filename=original_filename,
-        title=share_title,
-        status='PENDING',
-        user_id=current_user.id,
-        notes=share_notes,
-        file_size=file_size,
-    )
-    db.session.add(recording)
-    db.session.commit()
-
-    # Enqueue transcription through the shared resolver so a shared file honors
-    # the same account defaults (and any future tag/folder context) as every
-    # other ingestion path. A share sheet carries no tag/folder, so this
-    # resolves to the owner's account-level defaults.
-    job_params = resolve_transcription_params(recording)
-    try:
-        job_queue.enqueue(
-            user_id=current_user.id,
-            recording_id=recording.id,
-            job_type='transcribe',
-            params=job_params,
-            is_new_upload=True,
-        )
-    except Exception as queue_err:
-        current_app.logger.warning(f"share-target enqueue failed for recording {recording.id}: {queue_err}")
-        recording.status = 'FAILED'
-        recording.transcription = f"Processing failed: {queue_err}"
-        db.session.commit()
-        return redirect(url_for('recordings.index') + '?share_target_error=queue_failed')
-
-    return redirect(url_for('recordings.index') + f'?share_target=ok&recording_id={recording.id}')
+    return redirect(url_for('recordings.index') + f"?share_target=ok&recording_id={data['id']}")
 
 
 @recordings_bp.route('/upload', methods=['POST'])
 @login_required
 def upload_file():
+    return ingest_uploaded_recording(
+        owner=current_user,
+        uploaded_file=request.files.get('file'),
+        form=request.form,
+    )
+
+
+def _discard_staging(path):
+    """Remove an upload's staging copy when the upload fails.
+
+    A file handed to storage has already left the staging directory, so
+    after that point this finds nothing to remove.
+    """
+    if not path:
+        return
     try:
-        if 'file' not in request.files:
-            return jsonify({'error': 'No file provided'}), 400
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError as e:
+        current_app.logger.warning(f"Could not remove staging file {path}: {e}")
 
-        file = request.files['file']
-        if file.filename == '':
-            return jsonify({'error': 'No file selected'}), 400
 
-        original_filename = file.filename
-        safe_filename = secure_filename(original_filename)
+def ingest_uploaded_recording(
+    *,
+    owner,
+    uploaded_file,
+    form,
+    original_filename=None,
+    processing_source='upload',
+    success_status=202,
+    reuse_duplicate=False,
+    prepare=None,
+    on_conflict=None,
+):
+    """Run an uploaded file through Speakr's standard ingestion pipeline.
+
+    prepare(recording), when given, runs before the file is stored and the
+    recording is first committed, so fields it sets (API v1 participants,
+    references, the idempotency key) arrive with the recording itself.
+    on_conflict(), when given, answers an upload whose rows hit a unique
+    index (a concurrent retry with the same idempotency key, #476) with a
+    response, or None for the usual error.
+    """
+    filepath = None
+    try:
+        if uploaded_file is None:
+            return jsonify(api_error('no_file_provided')), 400
+
+        file = uploaded_file
+        if not original_filename:
+            original_filename = file.filename
+        if not original_filename:
+            return jsonify(api_error('no_file_selected')), 400
+
+        # Joining several files into one recording (upload dialog). A retry
+        # of a part whose group was already joined gets that recording.
+        from src.services.upload_join import parse_join_fields, joined_recording, JoinError
+        try:
+            join = parse_join_fields(form)
+        except JoinError as e:
+            return jsonify({'error': str(e)}), 400
+        if join:
+            already = joined_recording(owner.id, join[0])
+            if already is not None:
+                response_data = already.to_dict(viewer_user=owner)
+                response_data['idempotent_replay'] = True
+                return jsonify(response_data), success_status
+
+        safe_filename = shorten_filename(secure_filename(original_filename))
         storage = get_storage_service()
         staging_dir = storage.get_staging_dir()
-        filepath = os.path.join(staging_dir, f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{safe_filename}")
+        filepath = os.path.join(
+            staging_dir,
+            f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex}_{safe_filename}",
+        )
 
         # Per-upload override for VIDEO_RETENTION. When True, the
         # processing pipeline extracts audio and discards the video stream
@@ -2391,7 +2287,7 @@ def upload_file():
         # only the extracted audio needs to fit that limit. Sent by the
         # frontend either explicitly (toggle) or implicitly when
         # VIDEO_RETENTION is off and the queued file is video.
-        keep_audio_only_flag = request.form.get('keep_audio_only', 'false').lower() == 'true'
+        keep_audio_only_flag = form.get('keep_audio_only', 'false').lower() == 'true'
         effective_audio_only = keep_audio_only_flag or not VIDEO_RETENTION
 
         # Detect "this looks like a video" by extension up front so the
@@ -2464,31 +2360,108 @@ def upload_file():
         ):
             raise RequestEntityTooLarge()
 
+        # Storage quota (#413). A recording made in this browser was checked
+        # when it started and is not refused at the end, so it is never lost;
+        # only a signed-in browser can say so, never an API token.
+        from src.services.storage_quota import check_room, StorageQuotaExceeded
+        from src.utils.token_auth import current_api_token
+        recorded_in_app = (str(form.get('from_recorder', '')).lower() == 'true'
+                           and current_api_token() is None)
+        if not recorded_in_app:
+            try:
+                check_room(owner, original_file_size)
+            except StorageQuotaExceeded as quota_error:
+                current_app.logger.info(f"Upload refused for user {owner.id}: {quota_error}")
+                return quota_error.response()
+
         file.save(filepath)
         current_app.logger.info(f"File saved to {filepath}")
+
+        # An empty part has nothing to decode: refuse it before the probe and
+        # the conversion (#482).
+        if os.path.getsize(filepath) == 0:
+            current_app.logger.info(f"Upload refused for user {owner.id}: the file is empty")
+            _discard_staging(filepath)
+            return jsonify(api_error('empty_file')), 400
 
         # Compute file hash on the ORIGINAL upload before any conversion/compression.
         # Lossy re-encoding (e.g. FLAC→MP3) produces different bytes each run,
         # so hashing after conversion would miss duplicates.
         file_hash = None
         duplicate_warning = None
+        existing = None
         try:
             file_hash = compute_file_sha256(filepath)
-            existing = Recording.query.filter_by(
-                user_id=current_user.id, file_hash=file_hash
-            ).first()
-            if existing:
-                duplicate_warning = {
-                    'existing_recording_id': existing.id,
-                    'existing_title': existing.title,
-                    'existing_created_at': existing.created_at.isoformat() if existing.created_at else None
-                }
-                current_app.logger.info(
-                    f"Duplicate file detected for user {current_user.id}: "
-                    f"hash={file_hash[:12]}... matches recording {existing.id}"
+            duplicate_query = Recording.query.filter_by(
+                user_id=owner.id,
+                file_hash=file_hash,
+            )
+            if reuse_duplicate:
+                duplicate_query = duplicate_query.filter_by(
+                    processing_source=processing_source,
+                    original_filename=original_filename,
+                    notes=form.get('notes'),
                 )
+                replay_meeting_date = None
+                raw_meeting_date = form.get('meeting_date')
+                if raw_meeting_date:
+                    try:
+                        replay_meeting_date = to_utc_naive(
+                            datetime.fromisoformat(raw_meeting_date.replace('Z', '+00:00'))
+                        )
+                    except (ValueError, TypeError):
+                        pass
+                if replay_meeting_date is not None:
+                    duplicate_query = duplicate_query.filter_by(meeting_date=replay_meeting_date)
+                else:
+                    duplicate_query = duplicate_query.filter(
+                        Recording.created_at >= datetime.utcnow() - timedelta(days=1)
+                    )
+            existing = duplicate_query.first()
         except Exception as e:
-            current_app.logger.warning(f"Could not compute file hash: {e}")
+            current_app.logger.warning(f"Could not compute file hash or check duplicates: {e}")
+
+        if existing and reuse_duplicate:
+            # The existing recording already owns the durable media object, so
+            # the retry's staging copy is never needed for job recovery. Remove
+            # it before enqueueing to avoid leaking one full file each time a
+            # temporarily unavailable queue makes ASR retry the delivery.
+            _discard_staging(filepath)
+
+            existing_job = ProcessingJob.query.filter_by(
+                recording_id=existing.id,
+                job_type='transcribe',
+            ).first()
+            if existing.status in ('PENDING', 'QUEUED') and existing_job is None:
+                # Resolve from the existing recording (tags/folder aware), not
+                # just the owner: equivalent for ASR-sourced recordings today,
+                # but robust if another caller ever reuses this recovery path.
+                recovery_params = resolve_transcription_params(existing)
+                job_queue.enqueue(
+                    user_id=owner.id,
+                    recording_id=existing.id,
+                    job_type='transcribe',
+                    params=recovery_params,
+                    is_new_upload=True,
+                )
+            current_app.logger.info(
+                f"Idempotent upload replay for user {owner.id}: "
+                f"hash={file_hash[:12]}... matches recording {existing.id}"
+            )
+            response_data = existing.to_dict(viewer_user=owner)
+            response_data['idempotent_replay'] = True
+            return jsonify(response_data), success_status
+
+        if existing:
+            duplicate_warning = {
+                'existing_recording_id': existing.id,
+                'existing_title': existing.title,
+                'existing_created_at': existing.created_at.isoformat() if existing.created_at else None
+            }
+            current_app.logger.info(
+                f"Duplicate file detected for user {owner.id}: "
+                f"hash={file_hash[:12]}... matches recording {existing.id}"
+            )
 
         # --- Convert files only when chunking is needed ---
         filename_lower = original_filename.lower()
@@ -2504,6 +2477,7 @@ def upload_file():
         file_size_mb = os.path.getsize(filepath) / (1024 * 1024)
         probe_timeout = max(10, min(60, int(file_size_mb / 10)))  # 10s min, scales ~1s per 10MB, 60s max
         codec_info = None
+        probe_error = None
         try:
             codec_info = get_codec_info(filepath, timeout=probe_timeout)
             current_app.logger.info(
@@ -2514,9 +2488,29 @@ def upload_file():
         except FFProbeError as e:
             current_app.logger.warning(f"Failed to probe {original_filename} (timeout={probe_timeout}s): {e}. Will attempt conversion.")
             codec_info = None
+            probe_error = e
+            # #340: a browser MediaRecorder can produce a .webm whose EBML header
+            # isn't at the front (chunk-order artifact, seen on crash-recovered
+            # recordings). If so, trim to the real header and re-probe before we
+            # fall through to a conversion that would just fail again.
+            if os.path.splitext(original_filename)[1].lower() in ('.webm', '.mkv', '.mka'):
+                repaired_info = try_repair_malformed_webm(filepath, timeout=probe_timeout)
+                if repaired_info is not None:
+                    codec_info = repaired_info
+                    probe_error = None
+                    current_app.logger.info(f"Recovered malformed WebM header for {original_filename}; probe succeeded after trim")
 
         # Video retention/passthrough: skip conversion for videos, processing pipeline handles extraction
         has_video = codec_info.get('has_video', False) if codec_info else False
+
+        # The extension is only a pre-probe size hint. Once ffprobe proves the
+        # upload is audio-only, do not let a video-looking filename grant the
+        # larger video upload ceiling.
+        if codec_info is not None and is_likely_video_by_ext and not has_video:
+            is_likely_video_by_ext = False
+            if should_enforce_size_limit and original_file_size > regular_limit_mb * 1024 * 1024:
+                effective_limit_mb = regular_limit_mb
+                raise RequestEntityTooLarge()
 
         # Fallback: if probe failed but VIDEO_RETENTION or VIDEO_PASSTHROUGH_ASR is on, check file extension
         # to avoid silently discarding video from files we couldn't probe
@@ -2524,20 +2518,49 @@ def upload_file():
             video_extensions = {'.mp4', '.mov', '.mkv', '.avi', '.webm', '.m4v', '.wmv', '.flv', '.ts', '.mts'}
             file_ext = os.path.splitext(original_filename)[1].lower()
             if file_ext in video_extensions:
-                has_video = True
-                current_app.logger.info(
-                    f"Probe failed but file extension '{file_ext}' indicates video — "
-                    f"treating as video for {'VIDEO_PASSTHROUGH_ASR' if VIDEO_PASSTHROUGH_ASR else 'VIDEO_RETENTION'}"
-                )
+                # A failed probe cannot justify the larger video ceiling: an
+                # arbitrary blob or audio file can also carry a video-looking
+                # extension. Require positive video detection for oversized
+                # uploads; smaller files can continue through conversion.
+                if should_enforce_size_limit and original_file_size > regular_limit_mb * 1024 * 1024:
+                    effective_limit_mb = regular_limit_mb
+                    is_likely_video_by_ext = False
+                    raise RequestEntityTooLarge()
+                if probe_error is not None and probe_rejected_input(probe_error):
+                    # ffprobe read the file and could not make sense of it.
+                    # Only a probe that did not finish is trusted to the
+                    # extension: this file goes through conversion, which
+                    # refuses it with audio_decode_failed, as without these
+                    # settings (#482).
+                    current_app.logger.info(
+                        f"ffprobe could not read '{file_ext}' upload; converting it as audio"
+                    )
+                else:
+                    has_video = True
+                    current_app.logger.info(
+                        f"Probe failed but file extension '{file_ext}' indicates video — "
+                        f"treating as video for {'VIDEO_PASSTHROUGH_ASR' if VIDEO_PASSTHROUGH_ASR else 'VIDEO_RETENTION'}"
+                    )
         # Per-upload `keep_audio_only` overrides VIDEO_RETENTION for this
         # request. VIDEO_PASSTHROUGH_ASR is an admin escape hatch that
         # sends video directly to the ASR endpoint — left untouched here.
+        # A video without an audio track has nothing to transcribe: it goes
+        # through conversion, which refuses it, as without these settings.
         keep_video_for_this_upload = (
             ((VIDEO_RETENTION and not keep_audio_only_flag) or VIDEO_PASSTHROUGH_ASR)
             and has_video
+            and (codec_info is None or has_audio_stream(codec_info))
         )
+        # An audio file uploaded to be joined is decoded and re-encoded by the
+        # merge job anyway, so converting it here would only delay the upload
+        # response (minutes for a long recording). Video parts still have their
+        # audio extracted, which is a fast stream copy and keeps a large video
+        # from being stored whole until the join.
+        skip_conversion_for_join = bool(join) and codec_info is not None and not has_video
         if keep_video_for_this_upload:
             current_app.logger.info(f"Video {'passthrough' if VIDEO_PASSTHROUGH_ASR else 'retention'}: keeping original video, skipping conversion")
+        elif skip_conversion_for_join:
+            current_app.logger.info(f"Join part {original_filename}: skipping conversion, the merge re-encodes it")
         else:
             # Use shared conversion utility - handles ALL conversion needs (codec conversion + compression)
             try:
@@ -2556,14 +2579,24 @@ def upload_file():
                 if result.was_converted:
                     current_app.logger.info(f"File converted: {result.original_codec} -> {result.final_codec}")
                 if result.was_compressed:
-                    current_app.logger.info(f"File compressed: {result.size_reduction_percent:.1f}% size reduction")
+                    current_app.logger.info(f"File compressed: {result.size_change_label}")
 
             except FFmpegNotFoundError as e:
                 current_app.logger.error(f"FFmpeg not found: {e}")
-                return jsonify({'error': 'Audio conversion tool (FFmpeg) not found on server.'}), 500
+                _discard_staging(filepath)
+                return jsonify(api_error('audio_converter_missing')), 500
+            except FFmpegTimeoutError as e:
+                # A timeout is the server's limit, not proof the file is bad.
+                current_app.logger.error(f"FFmpeg conversion timed out for {filepath}: {e}")
+                _discard_staging(filepath)
+                return jsonify({'error': translate('server.apiError.audio_conversion_timeout'),
+                                'code': 'audio_conversion_timeout'}), 500
             except FFmpegError as e:
+                # The probe is allowed to fail, so a payload that is not audio
+                # at all is first refused here, as the client's error.
                 current_app.logger.error(f"FFmpeg conversion failed for {filepath}: {e}")
-                return jsonify({'error': f'Failed to convert audio file: {str(e)}'}), 500
+                _discard_staging(filepath)
+                return jsonify(api_error('audio_decode_failed')), 400
 
         # Get final file size (of original or converted file)
         final_file_size = os.path.getsize(filepath)
@@ -2585,23 +2618,16 @@ def upload_file():
             and final_file_size > regular_limit_mb * 1024 * 1024
             and not chunking_will_handle_large_audio
         ):
-            try:
-                if os.path.exists(filepath):
-                    os.remove(filepath)
-            except OSError:
-                pass
+            _discard_staging(filepath)
             current_app.logger.warning(
                 f"Audio-only extraction left {final_file_size/1024/1024:.1f}MB of audio, "
                 f"which exceeds regular limit {regular_limit_mb}MB and chunking is off. "
                 f"Rejecting upload."
             )
             return jsonify({
-                'error': (
-                    f'The extracted audio is {final_file_size / 1024 / 1024:.0f} MB, '
-                    f'larger than the {regular_limit_mb} MB stored-file limit. '
-                    f'Enable chunking in admin settings (ENABLE_CHUNKING=true) or '
-                    f'use a shorter / lower-bitrate source video.'
-                ),
+                **api_error('extracted_audio_too_large',
+                            size=format_number(final_file_size / 1024 / 1024),
+                            limit=format_number(regular_limit_mb)),
                 'max_size_mb': float(regular_limit_mb),
                 'extracted_audio_mb': round(final_file_size / 1024 / 1024, 1),
                 'audio_only_mode': True,
@@ -2626,6 +2652,13 @@ def upload_file():
                 current_app.logger.info(f"Resolved video mime {mime_type!r} -> {corrected!r} from container for {filepath}")
             mime_type = corrected
 
+        # The extension is the uploader's choice: an audio file named .html
+        # was stored as text/html (#438). A guess that is not audio or video
+        # is replaced by the type of the contents.
+        if not (mime_type or '').startswith(('audio/', 'video/')):
+            from src.utils.mime import resolve_media_mime
+            mime_type = served_media_mime(resolve_media_mime(filepath, codec_info=codec_info))
+
         current_app.logger.info(f"Final MIME type: {mime_type} for file {filepath}")
 
         # Cache media duration while the upload is still available locally.
@@ -2639,21 +2672,33 @@ def upload_file():
             current_app.logger.warning(f"Could not determine duration for upload {original_filename}: {e}")
 
         # Get notes from the form
-        notes = request.form.get('notes')
+        notes = form.get('notes')
 
         # Get optional user-provided title and meeting_date
-        user_title = request.form.get('title')
-        user_meeting_date = request.form.get('meeting_date')
+        user_title = form.get('title')
+        user_meeting_date = form.get('meeting_date')
 
         # Get file's lastModified timestamp from client (milliseconds since epoch)
-        file_last_modified = request.form.get('file_last_modified')
+        file_last_modified = form.get('file_last_modified')
+        # Client timezone offset (JS getTimezoneOffset(): minutes to add to
+        # local time to reach UTC). Used to convert filename wall-clock dates
+        # to the naive-UTC storage convention.
+        client_tz_offset = form.get('client_tz_offset')
+        # The browser's IANA zone (#412): saved for an uploader in 'auto' mode so
+        # the title of this very recording already uses it. Only for the
+        # uploader's own recordings, never for an owner uploaded on behalf of.
+        client_timezone = form.get('client_timezone')
+        if client_timezone and current_user.is_authenticated and owner.id == current_user.id:
+            from src.utils.timezones import record_browser_timezone
+            if record_browser_timezone(owner, client_timezone):
+                db.session.commit()
 
         # Get selected tags if provided (multiple tags support)
         selected_tags = []
         tag_index = 0
         while True:
             tag_id_key = f'tag_ids[{tag_index}]'
-            tag_id = request.form.get(tag_id_key)
+            tag_id = form.get(tag_id_key)
             if not tag_id:
                 break
 
@@ -2661,36 +2706,36 @@ def upload_file():
             tag = Tag.query.filter_by(id=tag_id).first()
             if tag:
                 # Allow tag if it's user's own tag OR it's a group tag where user is a member
-                if tag.user_id == current_user.id or (tag.group_id and GroupMembership.query.filter_by(group_id=tag.group_id, user_id=current_user.id).first()):
+                if tag.user_id == owner.id or (tag.group_id and GroupMembership.query.filter_by(group_id=tag.group_id, user_id=owner.id).first()):
                     selected_tags.append(tag)
             tag_index += 1
 
         # For backward compatibility with single tag uploads
         if not selected_tags:
-            single_tag_id = request.form.get('tag_id')
+            single_tag_id = form.get('tag_id')
             if single_tag_id:
                 # Check if tag belongs to user OR is a group tag where user is a member
                 tag = Tag.query.filter_by(id=single_tag_id).first()
-                if tag and (tag.user_id == current_user.id or (tag.group_id and GroupMembership.query.filter_by(group_id=tag.group_id, user_id=current_user.id).first())):
+                if tag and (tag.user_id == owner.id or (tag.group_id and GroupMembership.query.filter_by(group_id=tag.group_id, user_id=owner.id).first())):
                     selected_tags.append(tag)
 
         # Get folder_id if provided
         selected_folder = None
-        folder_id = request.form.get('folder_id')
+        folder_id = form.get('folder_id')
         if folder_id:
             folder = Folder.query.filter_by(id=folder_id).first()
             if folder:
                 # Allow folder if it's user's own folder OR it's a group folder where user is a member
-                if folder.user_id == current_user.id or (folder.group_id and GroupMembership.query.filter_by(group_id=folder.group_id, user_id=current_user.id).first()):
+                if folder.user_id == owner.id or (folder.group_id and GroupMembership.query.filter_by(group_id=folder.group_id, user_id=owner.id).first()):
                     selected_folder = folder
 
         # Get ASR advanced options if provided
-        language = request.form.get('language', '')
-        min_speakers = request.form.get('min_speakers') or None
-        max_speakers = request.form.get('max_speakers') or None
-        hotwords = request.form.get('hotwords', '').strip() or None
-        initial_prompt = request.form.get('initial_prompt', '').strip() or None
-        transcription_model = request.form.get('transcription_model', '').strip() or None
+        language = form.get('language', '')
+        min_speakers = form.get('min_speakers') or None
+        max_speakers = form.get('max_speakers') or None
+        hotwords = form.get('hotwords', '').strip() or None
+        initial_prompt = form.get('initial_prompt', '').strip() or None
+        transcription_model = form.get('transcription_model', '').strip() or None
 
         # Per-recording prompt-template variables. Sent as a JSON string from
         # the upload form so multiple values fit in a single form field. The
@@ -2698,7 +2743,7 @@ def upload_file():
         # size caps so an arbitrary JSON blob cannot bloat the column.
         from src.utils.prompt_variables import sanitize_variable_values
         prompt_variables = None
-        raw_prompt_variables = request.form.get('prompt_variables')
+        raw_prompt_variables = form.get('prompt_variables')
         if raw_prompt_variables:
             try:
                 parsed_vars = json.loads(raw_prompt_variables)
@@ -2739,7 +2784,7 @@ def upload_file():
             },
             tags=selected_tags,
             folder=selected_folder,
-            owner=current_user,
+            owner=owner,
         )
 
         # Create initial database entry
@@ -2758,6 +2803,27 @@ def upload_file():
                 current_app.logger.info(f"Using user-provided meeting_date: {meeting_date}")
             except (ValueError, TypeError) as e:
                 current_app.logger.warning(f"Could not parse user meeting_date '{user_meeting_date}': {e}")
+
+        # Then try parsing a date from the filename when the user opted in
+        # (#342). The pattern is explicit user intent, so it outranks the
+        # automatic sources (lastModified / embedded metadata) below.
+        if not meeting_date and owner.parse_filename_dates and original_filename:
+            from src.utils.filename_dates import parse_filename_date
+            tz_offset = None
+            if client_tz_offset is not None:
+                try:
+                    tz_offset = int(client_tz_offset)
+                except (TypeError, ValueError):
+                    tz_offset = None
+            meeting_date = parse_filename_date(
+                original_filename,
+                pattern_key=owner.filename_date_pattern or 'auto',
+                custom_regex=owner.filename_date_regex,
+                tz_offset_minutes=tz_offset,
+                tz_name=form.get('client_timezone'),
+            )
+            if meeting_date:
+                current_app.logger.info(f"Using filename-parsed meeting_date: {meeting_date}")
 
         # Then try client-provided file lastModified (most reliable for uploads)
         if not meeting_date and file_last_modified:
@@ -2783,19 +2849,43 @@ def upload_file():
             meeting_date = now
             current_app.logger.debug("No file date available, using current time")
 
+        if join:
+            return _ingest_join_part(
+                owner, join, filepath, storage, now,
+                original_filename=original_filename, file_size=final_file_size,
+                mime_type=mime_type, duration=audio_duration_seconds, meeting_date=meeting_date,
+                title=user_title, notes=notes, folder=selected_folder, tags=selected_tags,
+                prompt_variables=prompt_variables, transcribe_params=resolved_params,
+                duplicate_warning=duplicate_warning, success_status=success_status,
+            )
+
+        # The early check above ran before the conversion, which another
+        # upload can overlap. Count again, with the quota held until the
+        # commit below, the bytes that will be stored (#509).
+        if not recorded_in_app:
+            from src.services.storage_quota import reserve_room
+            try:
+                reserve_room(owner, final_file_size)
+            except StorageQuotaExceeded as quota_error:
+                db.session.rollback()
+                current_app.logger.info(f"Upload refused for user {owner.id}: {quota_error}")
+                _discard_staging(filepath)
+                return quota_error.response()
+
         recording = Recording(
             audio_path=None,
             original_filename=original_filename,
             title=resolve_upload_title(user_title, original_filename),
+            title_source=upload_title_source(user_title),
             file_size=final_file_size,
             status='PENDING',
             meeting_date=meeting_date,
-            user_id=current_user.id,
+            user_id=owner.id,
             mime_type=mime_type,
             audio_duration_seconds=audio_duration_seconds,
             notes=notes,
             folder_id=selected_folder.id if selected_folder else None,
-            processing_source='upload',  # Track that this was manually uploaded
+            processing_source=processing_source,
             file_hash=file_hash,
             prompt_variables=prompt_variables,
             # Per-upload override: record the effective audio-only flag so
@@ -2806,6 +2896,8 @@ def upload_file():
         )
         db.session.add(recording)
         db.session.flush()  # Assign recording.id without committing transaction yet
+        if prepare is not None:
+            prepare(recording)
 
         storage_key = storage.build_recording_key(original_filename, recording.id, now=now)
         stored_object = storage.upload_local_file(
@@ -2829,6 +2921,10 @@ def upload_file():
             )
             db.session.add(new_association)
 
+        if selected_folder:
+            from src.api.folders import apply_group_folder_shares
+            apply_group_folder_shares(recording, selected_folder)
+
         db.session.commit()
 
         if selected_tags:
@@ -2843,7 +2939,7 @@ def upload_file():
 
         current_app.logger.info(f"Queueing transcription for recording {recording.id} with params: {job_params}")
         job_queue.enqueue(
-            user_id=current_user.id,
+            user_id=owner.id,
             recording_id=recording.id,
             job_type='transcribe',
             params=job_params,
@@ -2854,27 +2950,18 @@ def upload_file():
         # Webhook event (#275). Fan-out happens off-request via the
         # dispatcher; this call only enqueues a delivery row per matching
         # subscription, so it is cheap and safe inside the request path.
-        try:
-            from src.services.webhook_dispatch import emit_webhook_event
-            emit_webhook_event(
-                user_id=current_user.id,
-                event_type='recording.created',
-                data={
-                    'recording_id': recording.id,
-                    'title': recording.title,
-                    'file_size': recording.file_size,
-                    'original_filename': recording.original_filename,
-                },
-            )
-        except Exception as e:
-            current_app.logger.warning(f"Webhook emit (recording.created) failed: {e}")
+        from src.services.webhook_dispatch import emit_recording_created
+        emit_recording_created(recording)
 
-        response_data = recording.to_dict(viewer_user=current_user)
+        response_data = recording.to_dict(viewer_user=owner)
         if duplicate_warning:
             response_data['duplicate_warning'] = duplicate_warning
-        return jsonify(response_data), 202
+        if reuse_duplicate:
+            response_data['idempotent_replay'] = False
+        return jsonify(response_data), success_status
 
     except RequestEntityTooLarge:
+        _discard_staging(filepath)
         # Report the effective limit that fired (regular vs audio-only)
         # so the frontend can show the right message. effective_limit_mb
         # is set at the top of the function before the size check.
@@ -2891,15 +2978,72 @@ def upload_file():
             f"Upload failed: File too large (>{limit_mb}MB, audio_only={audio_only_mode})"
         )
         return jsonify({
-            'error': f'File too large. Maximum size is {limit_mb:.0f} MB.',
+            **api_error('file_too_large_max', maxSize=format_number(limit_mb)),
             'max_size_mb': limit_mb,
             'effective_limit_mb': limit_mb,
             'audio_only_mode': audio_only_mode,
         }), 413
+    except IntegrityError as e:
+        # Another upload committed the same unique key first (#476): keep
+        # nothing of this one and let the caller answer with that recording.
+        db.session.rollback()
+        _discard_staging(filepath)
+        replay = on_conflict() if on_conflict is not None else None
+        if replay is not None:
+            current_app.logger.info("Upload lost a race on a unique key; answering with the earlier recording")
+            return replay
+        current_app.logger.error(f"Error during file upload: {e}", exc_info=True)
+        return jsonify(api_error('unexpected_error_upload')), 500
     except Exception as e:
         db.session.rollback()
+        _discard_staging(filepath)
         current_app.logger.error(f"Error during file upload: {e}", exc_info=True)
-        return jsonify({'error': 'An unexpected error occurred during upload.'}), 500
+        return jsonify(api_error('unexpected_error_upload')), 500
+
+
+def _ingest_join_part(owner, join, filepath, storage, now, *, original_filename, file_size,
+                      mime_type, duration, meeting_date, title, notes, folder, tags,
+                      prompt_variables, transcribe_params, duplicate_warning, success_status):
+    """Store one file of a join; the file that completes the group creates the recording."""
+    from src.services.upload_join import (
+        store_part, claim_group, create_joined_recording, joined_recording, received_count)
+    group, index, count = join
+    store_part(owner, join, filepath, original_filename=original_filename, file_size=file_size,
+               mime_type=mime_type, duration=duration, meeting_date=meeting_date,
+               storage=storage, now=now)
+
+    parts = claim_group(owner.id, group, count)
+    if parts is None:
+        recording = joined_recording(owner.id, group)
+        if recording is not None:
+            response_data = recording.to_dict(viewer_user=owner)
+        else:
+            response_data = {'join_pending': True, 'join_group': group, 'join_index': index,
+                             'received': received_count(owner.id, group), 'total': count}
+        if duplicate_warning:
+            response_data['duplicate_warning'] = duplicate_warning
+        return jsonify(response_data), success_status
+
+    recording = create_joined_recording(
+        owner, parts, title=title, notes=notes, folder=folder, tags=tags,
+        prompt_variables=prompt_variables, transcribe_params=transcribe_params)
+    current_app.logger.info(f"Joined {count} uploaded files into recording {recording.id}")
+    from src.services.webhook_dispatch import emit_recording_created
+    emit_recording_created(recording)
+    response_data = recording.to_dict(viewer_user=owner)
+    response_data['joined_parts'] = count
+    if duplicate_warning:
+        response_data['duplicate_warning'] = duplicate_warning
+    return jsonify(response_data), success_status
+
+
+@recordings_bp.route('/upload/join/<string:group>', methods=['DELETE'])
+@login_required
+def discard_upload_join(group):
+    """Discard the uploaded parts of a join the dialog gave up on."""
+    from src.services.upload_join import discard_group
+    removed = discard_group(current_user.id, group)
+    return jsonify({'success': True, 'removed': removed})
 
 
 @recordings_bp.route('/api/recordings/incognito', methods=['POST'])
@@ -2915,7 +3059,7 @@ def upload_incognito():
     """
     # Check if incognito mode is enabled
     if not ENABLE_INCOGNITO_MODE:
-        return jsonify({'error': 'Incognito mode is not enabled on this server'}), 403
+        return jsonify(api_error('incognito_disabled')), 403
 
     import tempfile
     from datetime import datetime
@@ -2925,11 +3069,11 @@ def upload_incognito():
 
     try:
         if 'file' not in request.files:
-            return jsonify({'error': 'No file provided'}), 400
+            return jsonify(api_error('no_file_provided')), 400
 
         file = request.files['file']
         if file.filename == '':
-            return jsonify({'error': 'No file selected'}), 400
+            return jsonify(api_error('no_file_selected')), 400
 
         original_filename = file.filename
         safe_filename = secure_filename(original_filename)
@@ -2938,6 +3082,9 @@ def upload_incognito():
         file.seek(0, os.SEEK_END)
         file_size = file.tell()
         file.seek(0)
+
+        if file_size == 0:
+            return jsonify({'incognito': True, **api_error('empty_file')}), 400
 
         # Mirror the regular /upload route's option-B size policy:
         # video files (by extension) use the larger video cap because
@@ -2953,22 +3100,33 @@ def upload_incognito():
         effective_limit_mb = audio_only_limit_mb if _is_video else regular_limit_mb
         if file_size > effective_limit_mb * 1024 * 1024:
             return jsonify({
-                'error': f'File too large. Maximum size is {effective_limit_mb} MB.',
+                **api_error('file_too_large_max', maxSize=format_number(effective_limit_mb)),
                 'max_size_mb': float(effective_limit_mb),
             }), 413
 
-        # Save to temp file - use secure temp directory
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f'_{safe_filename}') as tmp:
+        # Save to temp file - use secure temp directory. Suffix carries only
+        # the extension, not the user's filename: the temp path is logged and
+        # filenames can themselves be sensitive (no PHI in logs or paths).
+        _ext = os.path.splitext(safe_filename)[1].lower() or '.audio'
+        with tempfile.NamedTemporaryFile(delete=False, suffix=_ext) as tmp:
             temp_filepath = tmp.name
             file.save(temp_filepath)
             current_app.logger.info(f"[Incognito] Temp file saved: {temp_filepath}")
 
         # Get optional parameters
-        # Note: Empty string '' means auto-detect, don't convert to None
+        # An empty language falls through to the user's default, as on upload;
+        # "auto" forces auto-detection (resolved in transcribe_incognito, #412).
         language = request.form.get('language', '')
         min_speakers = request.form.get('min_speakers')
         max_speakers = request.form.get('max_speakers')
+        hotwords = request.form.get('hotwords', '').strip() or None
+        initial_prompt = request.form.get('initial_prompt', '').strip() or None
+        transcription_model = request.form.get('transcription_model', '').strip() or None
         auto_summarize = request.form.get('auto_summarize', 'false').lower() == 'true'
+        # The admin switch that disables automatic summaries applies here too (#412).
+        _admin_off = SystemSetting.get_setting('disable_auto_summarization', False)
+        if (_admin_off if isinstance(_admin_off, bool) else str(_admin_off).lower() == 'true'):
+            auto_summarize = False
 
         # Convert to int if provided
         if min_speakers:
@@ -2982,9 +3140,11 @@ def upload_incognito():
             except (ValueError, TypeError):
                 max_speakers = None
 
-        # Log only metadata - NEVER log content for HIPAA compliance
+        # Log only metadata - NEVER log content for HIPAA compliance. The
+        # user's filename is deliberately excluded too (extension only):
+        # filenames routinely contain names/dates and count as PHI.
         current_app.logger.info(f"[Incognito] Processing request from user {current_user.id}: "
-                               f"filename={original_filename}, size={file_size/1024/1024:.2f}MB, "
+                               f"ext={_ext}, size={file_size/1024/1024:.2f}MB, "
                                f"language={language}, auto_summarize={auto_summarize}")
 
         # Perform transcription synchronously (no database operations)
@@ -2994,14 +3154,28 @@ def upload_incognito():
             language=language,
             min_speakers=min_speakers,
             max_speakers=max_speakers,
-            user=current_user
+            hotwords=hotwords,
+            initial_prompt=initial_prompt,
+            user=current_user,
+            transcription_model=transcription_model
         )
 
         if result.get('error'):
             current_app.logger.error(f"[Incognito] Transcription failed: {result['error']}")
+            # result['error'] is English; a known kind of failure carries
+            # error_code and is answered in the interface language (#477).
+            if result.get('error_code') == 'audio_decode_failed':
+                return jsonify({
+                    'incognito': True,
+                    **api_error('audio_decode_failed'),
+                }), 400
+            error_text = result['error']
+            if result.get('error_code') in ('audio_converter_missing', 'audio_conversion_timeout'):
+                error_text = translate(f"server.apiError.{result['error_code']}")
             return jsonify({
                 'incognito': True,
-                'error': result['error']
+                'error': error_text,
+                'error_type': result.get('error_type'),
             }), 500
 
         # Optionally generate summary
@@ -3038,7 +3212,7 @@ def upload_incognito():
         current_app.logger.warning(f"[Incognito] Upload failed: File too large (>{max_size_mb}MB)")
         return jsonify({
             'incognito': True,
-            'error': f'File too large. Maximum size is {max_size_mb:.0f} MB.',
+            **api_error('file_too_large_max', maxSize=format_number(max_size_mb)),
             'max_size_mb': max_size_mb
         }), 413
 
@@ -3046,7 +3220,7 @@ def upload_incognito():
         current_app.logger.error(f"[Incognito] Error during processing: {e}", exc_info=True)
         return jsonify({
             'incognito': True,
-            'error': 'An unexpected error occurred during processing.'
+            **api_error('unexpected_error_processing')
         }), 500
 
     finally:
@@ -3069,14 +3243,12 @@ def chat_incognito():
     """
     # Check if incognito mode is enabled
     if not ENABLE_INCOGNITO_MODE:
-        return jsonify({'error': 'Incognito mode is not enabled on this server'}), 403
-
-    from src.tasks.processing import format_transcription_for_llm
+        return jsonify(api_error('incognito_disabled')), 403
 
     try:
-        data = request.json
+        data = request.get_json(silent=True)
         if not data:
-            return jsonify({'error': 'No data provided'}), 400
+            return jsonify(api_error('no_data_provided')), 400
 
         transcription = data.get('transcription')
         user_message = data.get('message')
@@ -3084,78 +3256,36 @@ def chat_incognito():
         participants = data.get('participants', '')
         notes = data.get('notes', '')
 
-        if not transcription:
-            return jsonify({'error': 'No transcription provided'}), 400
-        if not user_message:
-            return jsonify({'error': 'No message provided'}), 400
+        if not transcription or not isinstance(transcription, str):
+            return jsonify(api_error('no_transcription_provided')), 400
+        if not user_message or not isinstance(user_message, str):
+            return jsonify(api_error('no_message_provided')), 400
+        if not isinstance(message_history, list):
+            message_history = []
 
         # Check if chat client is available
         if chat_client is None:
-            return jsonify({'error': 'Chat service is not available (chat client not configured)'}), 503
+            return jsonify(api_error('chat_client_not_configured')), 503
 
-        # Prepare the system prompt with the transcription
-        user_chat_output_language = current_user.output_language if current_user.is_authenticated else None
+        # Same prompt as API v1 chat (src/services/recording_chat.py). An
+        # incognito recording has no database row: the transcript, participants
+        # and notes come from this request (#527).
+        from src.services.recording_chat import IncognitoTranscript, build_chat_messages
+        transcript = IncognitoTranscript(transcription, participants, notes)
+        messages, _ = build_chat_messages(transcript, current_user, user_message, message_history)
 
-        language_instruction = ""
-        if user_chat_output_language:
-            language_instruction = f"Please provide all your responses in {user_chat_output_language}."
-
-        user_name = current_user.name if current_user.is_authenticated and current_user.name else "User"
-        user_title = current_user.job_title if current_user.is_authenticated and current_user.job_title else "a professional"
-        user_company = current_user.company if current_user.is_authenticated and current_user.company else "their organization"
-
-        _chat_ts = bool(current_user.is_authenticated and current_user.chat_include_timestamps)
-        formatted_transcription = format_transcription_for_llm(
-            transcription,
-            include_timestamps=_chat_ts,
-            template_format=_resolve_timestamp_template_format(
-                current_user, current_user.chat_timestamp_template_id) if _chat_ts else None,
-        )
-
-        # Get configurable transcript length limit for chat
-        transcript_limit = SystemSetting.get_setting('transcript_length_limit', 30000)
-        if transcript_limit == -1:
-            chat_transcript = formatted_transcription
-        else:
-            chat_transcript = formatted_transcription[:transcript_limit]
-
-        system_prompt = f"""You are a professional meeting and audio transcription analyst assisting {user_name}, who is a(n) {user_title} at {user_company}. {language_instruction} Analyze the following meeting information and respond to the specific request.
-
-Following are the meeting participants and their roles:
-{participants or "No specific participants information provided."}
-
-Following is the meeting transcript:
-<<start transcript>>
-{chat_transcript or "No transcript available."}
-<<end transcript>>
-
-Additional context and notes about the meeting:
-{notes or "none"}
-
-Note: This is an incognito recording - no data is stored on the server.
-"""
-
-        # Prepare messages array with system prompt and conversation history
-        messages = [{"role": "system", "content": system_prompt}]
-        if message_history:
-            messages.extend(message_history)
-        messages.append({"role": "user", "content": user_message})
-
-        # Get model info
-        chat_model = os.environ.get('TEXT_MODEL_NAME', os.environ.get('OPENAI_CHAT_MODEL', 'gpt-4o-mini'))
         user_id = current_user.id
 
         current_app.logger.info(f"[Incognito Chat] User {user_id} sending message")
 
+        # Resolved here, in the request context, before the response streams.
+        chat_temperature = get_temperature('chat')
+
         def generate():
             """Stream the chat response."""
             try:
-                response = chat_client.chat.completions.create(
-                    model=chat_model,
-                    messages=messages,
-                    temperature=0.7,
-                    stream=True
-                )
+                # No user_id, so nothing is tracked for incognito
+                response = call_chat_completion(messages, temperature=chat_temperature, stream=True)
 
                 for chunk in response:
                     if chunk.choices and len(chunk.choices) > 0:
@@ -3170,7 +3300,7 @@ Note: This is an incognito recording - no data is stored on the server.
                 # Provide more helpful error message for connection issues
                 error_msg = str(e).lower()
                 if 'connection' in error_msg or 'connect' in error_msg or 'refused' in error_msg:
-                    yield f"data: {json.dumps({'error': 'Could not connect to LLM server. Please check that your LLM service is running.'})}\n\n"
+                    yield f"data: {json.dumps(api_error('llm_connection_failed'))}\n\n"
                 else:
                     yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
@@ -3181,8 +3311,8 @@ Note: This is an incognito recording - no data is stored on the server.
         # Provide more helpful error message for connection issues
         error_msg = str(e).lower()
         if 'connection' in error_msg or 'connect' in error_msg or 'refused' in error_msg:
-            return jsonify({'error': 'Could not connect to LLM server. Please check that your LLM service is running.'}), 503
-        return jsonify({'error': 'An error occurred during chat'}), 500
+            return jsonify(api_error('llm_connection_failed')), 503
+        return jsonify(api_error('chat_error')), 500
 
 
 @recordings_bp.route('/api/recordings/incognito/summary', methods=['POST'])
@@ -3195,7 +3325,7 @@ def generate_incognito_summary_endpoint():
     """
     # Check if incognito mode is enabled
     if not ENABLE_INCOGNITO_MODE:
-        return jsonify({'error': 'Incognito mode is not enabled on this server'}), 403
+        return jsonify(api_error('incognito_disabled')), 403
 
     from src.tasks.processing import generate_incognito_summary
     from src.utils import md_to_html
@@ -3203,15 +3333,15 @@ def generate_incognito_summary_endpoint():
     try:
         data = request.json
         if not data:
-            return jsonify({'error': 'No data provided'}), 400
+            return jsonify(api_error('no_data_provided')), 400
 
         transcription = data.get('transcription')
         if not transcription:
-            return jsonify({'error': 'No transcription provided'}), 400
+            return jsonify(api_error('no_transcription_provided')), 400
 
         # Check if LLM client is available
         if client is None:
-            return jsonify({'error': 'Summary service is not available (LLM client not configured)'}), 503
+            return jsonify(api_error('summary_llm_not_configured')), 503
 
         current_app.logger.info(f"[Incognito Summary] User {current_user.id} requesting summary generation")
 
@@ -3225,15 +3355,15 @@ def generate_incognito_summary_endpoint():
                 'summary_html': summary_html
             })
         else:
-            return jsonify({'error': 'Failed to generate summary. Please check that your LLM service is running.'}), 503
+            return jsonify(api_error('summary_generation_failed')), 503
 
     except Exception as e:
         current_app.logger.error(f"[Incognito Summary] Error: {e}", exc_info=True)
         # Provide more helpful error message for connection issues
         error_msg = str(e).lower()
         if 'connection' in error_msg or 'connect' in error_msg or 'refused' in error_msg:
-            return jsonify({'error': 'Could not connect to LLM server. Please check that your LLM service is running.'}), 503
-        return jsonify({'error': f'Failed to generate summary: {str(e)}'}), 500
+            return jsonify(api_error('llm_connection_failed')), 503
+        return jsonify(api_error('summary_generation_failed_detail', detail=str(e))), 500
 
 
 # Status Endpoint
@@ -3244,25 +3374,16 @@ def generate_incognito_summary_endpoint():
 def delete_recording(recording_id):
     try:
         recording = db.session.get(Recording, recording_id)
-        if not recording:
-            return jsonify({'error': 'Recording not found'}), 404
+        if not recording or (recording.user_id and not has_recording_access(recording, current_user)):
+            return jsonify(api_error('recording_not_found')), 404
 
         # Check if the recording belongs to the current user
         if recording.user_id and recording.user_id != current_user.id:
-            return jsonify({'error': 'You do not have permission to delete this recording'}), 403
+            return jsonify(api_error('recording_delete_denied')), 403
 
         # Check deletion permissions (admin-only if USERS_CAN_DELETE is false)
         if not USERS_CAN_DELETE and not current_user.is_admin:
-            return jsonify({'error': 'Only administrators can delete recordings'}), 403
-
-        # Delete the audio file first
-        try:
-            if recording.audio_path:
-                storage = get_storage_service()
-                storage.delete(recording.audio_path, missing_ok=True)
-                current_app.logger.info(f"Deleted audio file via storage backend: {recording.audio_path}")
-        except Exception as e:
-            current_app.logger.error(f"Error deleting audio file {recording.audio_path}: {e}")
+            return jsonify(api_error('recording_delete_admin_only')), 403
 
         # Log embeddings cleanup for Inquire Mode if enabled
         if ENABLE_INQUIRE_MODE:
@@ -3270,65 +3391,15 @@ def delete_recording(recording_id):
             if chunk_count > 0:
                 current_app.logger.info(f"Deleting {chunk_count} transcript chunks with embeddings for recording {recording_id}")
 
-        # Delete associated records with NOT NULL recording_id constraints
-        from src.models.speaker_snippet import SpeakerSnippet
-        deleted_snippets = SpeakerSnippet.query.filter_by(recording_id=recording_id).delete()
-        if deleted_snippets > 0:
-            current_app.logger.info(f"Deleted {deleted_snippets} speaker snippets for recording {recording_id}")
-
-        from src.models.processing_job import ProcessingJob
-        deleted_jobs = ProcessingJob.query.filter_by(recording_id=recording_id).delete()
-        if deleted_jobs > 0:
-            current_app.logger.info(f"Deleted {deleted_jobs} processing jobs for recording {recording_id}")
-
-        # Capture identity for the webhook event before deletion drops the row.
-        _deleted_recording_id = recording.id
-        _deleted_recording_title = recording.title
-        _deleted_user_id = recording.user_id
-
-        # Delete the database record (cascade will handle chunks/embeddings)
-        db.session.delete(recording)
-        db.session.commit()
-        current_app.logger.info(f"Deleted recording record ID: {recording_id}")
-
-        # Webhook event (#275)
-        try:
-            from src.services.webhook_dispatch import emit_webhook_event
-            emit_webhook_event(
-                user_id=_deleted_user_id,
-                event_type='recording.deleted',
-                data={
-                    'recording_id': _deleted_recording_id,
-                    'title': _deleted_recording_title,
-                },
-            )
-        except Exception as e:
-            current_app.logger.warning(f"Webhook emit (recording.deleted) failed: {e}")
-
-        if ENABLE_INQUIRE_MODE and chunk_count > 0:
-            current_app.logger.info(f"Successfully deleted embeddings and chunks for recording {recording_id}")
-
-        # Mark the export file as deleted
-        mark_export_as_deleted(recording_id)
-
-        # Clean up orphaned speakers (run after successful deletion)
-        # This is a best-effort cleanup; failures are logged but don't affect the delete operation
-        try:
-            from src.services.speaker_cleanup import cleanup_orphaned_speakers
-            speaker_stats = cleanup_orphaned_speakers()
-            if speaker_stats.get('speakers_deleted', 0) > 0:
-                current_app.logger.info(
-                    f"Cleaned up {speaker_stats['speakers_deleted']} orphaned speakers after recording deletion"
-                )
-        except Exception as cleanup_error:
-            # Log the error but don't fail the deletion
-            current_app.logger.warning(f"Speaker cleanup after recording deletion failed: {cleanup_error}")
+        from src.services.recording_deletion import delete_recording_completely, cleanup_orphaned_speakers_quietly
+        delete_recording_completely(recording, storage=get_storage_service())
+        cleanup_orphaned_speakers_quietly()
 
         return jsonify({'success': True})
     except Exception as e:
         db.session.rollback()
         current_app.logger.error(f"Error deleting recording {recording_id}: {e}", exc_info=True)
-        return jsonify({'error': 'An unexpected error occurred while deleting.'}), 500
+        return jsonify(api_error('unexpected_error_deleting')), 500
 
 
 # --- Inbox and Archive Endpoints ---
@@ -3345,17 +3416,26 @@ def get_inbox_recordings():
             Recording.status.in_(['PENDING', 'PROCESSING', 'SUMMARIZING'])
         ).order_by(Recording.created_at.desc())
 
-        recordings = db.session.execute(stmt).scalars().all()
-        return jsonify([recording.to_list_dict(viewer_user=current_user) for recording in recordings])
+        # Page lookups read once, not per row (D#483)
+        from src.services.recording_list import RecordingListBatch, list_load_options
+        recordings = db.session.execute(stmt.options(*list_load_options())).scalars().all()
+        batch = RecordingListBatch(recordings, current_user)
+        return jsonify([recording.to_list_dict(viewer_user=current_user, batch=batch) for recording in recordings])
     except Exception as e:
         current_app.logger.error(f"Error fetching inbox recordings: {e}")
         return jsonify({'error': str(e)}), 500
 
 
+@recordings_bp.route('/api/recordings/audio-removed', methods=['GET'])
 @recordings_bp.route('/api/recordings/archived', methods=['GET'])
 @login_required
 def get_archived_recordings():
-    """Get recordings where audio has been deleted but transcription remains."""
+    """Get recordings where audio has been deleted but transcription remains.
+
+    /api/recordings/archived is the name from before #394 and is kept for
+    existing callers; it does not list recordings archived by the user (use
+    GET /api/recordings?archived=true for those).
+    """
     from sqlalchemy import select
     try:
         search_query = request.args.get('q', '').strip()
@@ -3366,8 +3446,11 @@ def get_archived_recordings():
             Recording.audio_deleted_at.is_not(None)
         ).order_by(Recording.audio_deleted_at.desc())
 
-        recordings = db.session.execute(stmt).scalars().all()
-        return jsonify([recording.to_list_dict(viewer_user=current_user) for recording in recordings])
+        # Page lookups read once, not per row (D#483)
+        from src.services.recording_list import RecordingListBatch, list_load_options
+        recordings = db.session.execute(stmt.options(*list_load_options())).scalars().all()
+        batch = RecordingListBatch(recordings, current_user)
+        return jsonify([recording.to_list_dict(viewer_user=current_user, batch=batch) for recording in recordings])
     except Exception as e:
         current_app.logger.error(f"Error fetching archived recordings: {e}")
         return jsonify({'error': str(e)}), 500
@@ -3383,7 +3466,7 @@ def get_recording_detail(recording_id):
         recording = db.session.get(Recording, recording_id)
 
         if not recording:
-            return jsonify({'error': 'Recording not found'}), 404
+            return jsonify(api_error('recording_not_found')), 404
 
         # Check ownership or shared access
         has_access = recording.user_id == current_user.id
@@ -3397,7 +3480,7 @@ def get_recording_detail(recording_id):
             has_access = share is not None
 
         if not has_access:
-            return jsonify({'error': 'Access denied'}), 403
+            return jsonify(api_error('recording_not_found')), 404
 
         # Return full detail with HTML conversion
         rec_dict = recording.to_dict(include_html=True, viewer_user=current_user)
@@ -3469,11 +3552,8 @@ def get_recording_status_only(recording_id):
     """
     try:
         recording = db.session.get(Recording, recording_id)
-        if not recording:
-            return jsonify({'error': 'Recording not found'}), 404
-
-        if not has_recording_access(recording, current_user):
-            return jsonify({'error': 'You do not have permission to view this recording'}), 403
+        if not recording or not has_recording_access(recording, current_user):
+            return jsonify(api_error('recording_not_found')), 404
 
         # Return the status plus audio_ready so pollers can enable playback the
         # moment a merge/stitch finishes writing the audio file (#323).
@@ -3483,7 +3563,7 @@ def get_recording_status_only(recording_id):
         })
     except Exception as e:
         current_app.logger.error(f"Error fetching status for recording {recording_id}: {e}", exc_info=True)
-        return jsonify({'error': 'An unexpected error occurred.'}), 500
+        return jsonify(api_error('unexpected_error')), 500
 
 
 @recordings_bp.route('/api/recordings/batch-status', methods=['POST'])
@@ -3499,15 +3579,15 @@ def get_batch_recording_status():
     try:
         data = request.get_json()
         if not data or 'recording_ids' not in data:
-            return jsonify({'error': 'recording_ids is required'}), 400
+            return jsonify(api_error('recording_ids_required')), 400
 
         recording_ids = data['recording_ids']
         if not isinstance(recording_ids, list):
-            return jsonify({'error': 'recording_ids must be a list'}), 400
+            return jsonify(api_error('invalid_recording_ids_list')), 400
 
         # Limit batch size to prevent abuse
         if len(recording_ids) > 50:
-            return jsonify({'error': 'Maximum 50 recordings per batch'}), 400
+            return jsonify(api_error('batch_limit_50')), 400
 
         # Query all recordings at once
         recordings = Recording.query.filter(Recording.id.in_(recording_ids)).all()
@@ -3521,7 +3601,7 @@ def get_batch_recording_status():
         return jsonify({'statuses': statuses})
     except Exception as e:
         current_app.logger.error(f"Error fetching batch status: {e}", exc_info=True)
-        return jsonify({'error': 'An unexpected error occurred.'}), 500
+        return jsonify(api_error('unexpected_error')), 500
 
 
 @recordings_bp.route('/api/recordings/job-queue-status', methods=['GET'])
@@ -3595,7 +3675,7 @@ def get_job_queue_status():
         return jsonify({'jobs': job_details})
     except Exception as e:
         current_app.logger.error(f"Error fetching job queue status: {e}", exc_info=True)
-        return jsonify({'error': 'An unexpected error occurred.'}), 500
+        return jsonify(api_error('unexpected_error')), 500
 
 
 @recordings_bp.route('/api/recordings/jobs/<int:job_id>/retry', methods=['POST'])
@@ -3607,13 +3687,13 @@ def retry_failed_job(job_id):
 
         job = db.session.get(ProcessingJob, job_id)
         if not job:
-            return jsonify({'error': 'Job not found'}), 404
+            return jsonify(api_error('job_not_found')), 404
 
         if job.user_id != current_user.id:
-            return jsonify({'error': 'Access denied'}), 403
+            return jsonify(api_error('access_denied')), 403
 
         if job.status != 'failed':
-            return jsonify({'error': 'Only failed jobs can be retried'}), 400
+            return jsonify(api_error('job_retry_failed_only')), 400
 
         # Reset job for retry
         job.status = 'queued'
@@ -3624,11 +3704,11 @@ def retry_failed_job(job_id):
         db.session.commit()
 
         current_app.logger.info(f"Job {job_id} queued for retry by user {current_user.id}")
-        return jsonify({'success': True, 'message': 'Job queued for retry'})
+        return jsonify({'success': True, 'message': translate('server.apiMessage.jobQueuedForRetry')})
 
     except Exception as e:
         current_app.logger.error(f"Error retrying job {job_id}: {e}", exc_info=True)
-        return jsonify({'error': 'An unexpected error occurred.'}), 500
+        return jsonify(api_error('unexpected_error')), 500
 
 
 @recordings_bp.route('/api/recordings/jobs/<int:job_id>', methods=['DELETE'])
@@ -3641,10 +3721,10 @@ def delete_job(job_id):
 
         job = db.session.get(ProcessingJob, job_id)
         if not job:
-            return jsonify({'error': 'Job not found'}), 404
+            return jsonify(api_error('job_not_found')), 404
 
         if job.user_id != current_user.id:
-            return jsonify({'error': 'Access denied'}), 403
+            return jsonify(api_error('access_denied')), 403
 
         # If it's a failed new upload, also delete the recording
         if job.status == 'failed' and job.is_new_upload:
@@ -3665,11 +3745,11 @@ def delete_job(job_id):
         db.session.commit()
 
         current_app.logger.info(f"Job {job_id} deleted by user {current_user.id}")
-        return jsonify({'success': True, 'message': 'Job deleted'})
+        return jsonify({'success': True, 'message': translate('server.apiMessage.jobDeleted')})
 
     except Exception as e:
         current_app.logger.error(f"Error deleting job {job_id}: {e}", exc_info=True)
-        return jsonify({'error': 'An unexpected error occurred.'}), 500
+        return jsonify(api_error('unexpected_error')), 500
 
 
 @recordings_bp.route('/api/recordings/jobs/clear-completed', methods=['POST'])
@@ -3690,7 +3770,7 @@ def clear_completed_jobs():
 
     except Exception as e:
         current_app.logger.error(f"Error clearing completed jobs: {e}", exc_info=True)
-        return jsonify({'error': 'An unexpected error occurred.'}), 500
+        return jsonify(api_error('unexpected_error')), 500
 
 
 @recordings_bp.route('/status/<int:recording_id>', methods=['GET'])
@@ -3699,11 +3779,8 @@ def get_status(recording_id):
     """Endpoint to check the transcription/summarization status (full recording data)."""
     try:
         recording = db.session.get(Recording, recording_id)
-        if not recording:
-            return jsonify({'error': 'Recording not found'}), 404
-
-        if not has_recording_access(recording, current_user):
-            return jsonify({'error': 'You do not have permission to view this recording'}), 403
+        if not recording or not has_recording_access(recording, current_user):
+            return jsonify(api_error('recording_not_found')), 404
 
         # Ensure events are loaded (refresh the recording to get latest relationships)
         db.session.refresh(recording)
@@ -3715,7 +3792,7 @@ def get_status(recording_id):
         return jsonify(recording_dict)
     except Exception as e:
         current_app.logger.error(f"Error fetching status for recording {recording_id}: {e}", exc_info=True)
-        return jsonify({'error': 'An unexpected error occurred.'}), 500
+        return jsonify(api_error('unexpected_error')), 500
 
 
 @recordings_bp.route('/audio/<int:recording_id>')
@@ -3729,7 +3806,7 @@ def get_audio(recording_id):
     try:
         recording = db.session.get(Recording, recording_id)
         if not recording or not recording.audio_path:
-            return jsonify({'error': 'Recording or audio file not found'}), 404
+            return jsonify(api_error('recording_or_audio_not_found')), 404
 
         # Check if the recording belongs to the current user or has been shared with them
         has_access = recording.user_id == current_user.id
@@ -3743,7 +3820,7 @@ def get_audio(recording_id):
             has_access = share is not None
 
         if not has_access:
-            return jsonify({'error': 'You do not have permission to access this audio file'}), 403
+            return jsonify(api_error('recording_or_audio_not_found')), 404
         storage = get_storage_service()
 
         # Check if download is requested
@@ -3757,10 +3834,11 @@ def get_audio(recording_id):
             ext = os.path.splitext(recording.original_filename or '')[1] or '.mp3'
             download_name = f"{filename}{ext}"
 
+        serve_mime = served_media_mime(recording.mime_type, recording.audio_path)
         delivery = storage.get_audio_delivery(
             recording.audio_path,
             download=download,
-            mime_type=recording.mime_type,
+            mime_type=serve_mime,
             download_name=download_name,
             is_public=False,
         )
@@ -3770,21 +3848,21 @@ def get_audio(recording_id):
 
         if not delivery.local_path or not os.path.exists(delivery.local_path):
             current_app.logger.error(f"Audio file missing from server: {recording.audio_path}")
-            return jsonify({'error': 'Audio file missing from server'}), 404
+            return jsonify(api_error('audio_file_missing')), 404
 
         if download:
-            return send_file(
+            return sandbox_media_response(send_file(
                 delivery.local_path,
                 as_attachment=True,
                 download_name=download_name,
-                mimetype=recording.mime_type,
+                mimetype=serve_mime,
                 conditional=True,
-            )
+            ))
 
-        return send_file(delivery.local_path, mimetype=recording.mime_type, conditional=True)
+        return sandbox_media_response(send_file(delivery.local_path, mimetype=serve_mime, conditional=True))
     except Exception as e:
         current_app.logger.error(f"Error serving audio for recording {recording_id}: {e}", exc_info=True)
-        return jsonify({'error': 'An unexpected error occurred.'}), 500
+        return jsonify(api_error('unexpected_error')), 500
 
 
 # --- Chat with Transcription ---
@@ -3796,36 +3874,33 @@ def chat_with_transcription():
     try:
         data = request.json
         if not data:
-            return jsonify({'error': 'No data provided'}), 400
+            return jsonify(api_error('no_data_provided')), 400
 
         recording_id = data.get('recording_id')
         user_message = data.get('message')
         message_history = data.get('message_history', [])
 
         if not recording_id:
-            return jsonify({'error': 'No recording ID provided'}), 400
+            return jsonify(api_error('no_recording_id')), 400
         if not user_message:
-            return jsonify({'error': 'No message provided'}), 400
+            return jsonify(api_error('no_message_provided')), 400
 
         # Get the recording
         recording = db.session.get(Recording, recording_id)
-        if not recording:
-            return jsonify({'error': 'Recording not found'}), 404
-
-        if not has_recording_access(recording, current_user):
-            return jsonify({'error': 'You do not have permission to chat with this recording'}), 403
+        if not recording or not has_recording_access(recording, current_user):
+            return jsonify(api_error('recording_not_found')), 404
 
         # Check if transcription exists
         if not recording.transcription or len(recording.transcription.strip()) < 10:
-            return jsonify({'error': 'No transcription available for this recording'}), 400
+            return jsonify(api_error('no_transcription_for_recording')), 400
 
         # Check if transcription is an error message (not actual content)
         if is_transcription_error(recording.transcription):
-            return jsonify({'error': 'Cannot chat: transcription failed. Please reprocess the transcription first.'}), 400
+            return jsonify(api_error('chat_blocked_transcription_failed')), 400
 
         # Check if chat client is available
         if chat_client is None:
-            return jsonify({'error': 'Chat service is not available (chat client not configured)'}), 503
+            return jsonify(api_error('chat_client_not_configured')), 503
 
         # Prepare the system prompt with the transcription
         user_chat_output_language = current_user.output_language if current_user.is_authenticated else None
@@ -3855,8 +3930,21 @@ def chat_with_transcription():
         else:
             chat_transcript = formatted_transcription[:transcript_limit]
 
-        system_prompt = f"""You are a professional meeting and audio transcription analyst assisting {user_name}, who is a(n) {user_title} at {user_company}. {language_instruction} Analyze the following meeting information and respond to the specific request.
+        # When timestamps are in the transcript, ask the model to cite them so
+        # the chat panel can render clickable seek chips (bracketed [h:mm:ss]).
+        timestamp_instruction = ""
+        if _chat_ts:
+            timestamp_instruction = (
+                "\nWhen you reference a specific moment in the recording, cite its "
+                "timestamp in square brackets exactly as it appears in the transcript "
+                "(for example [00:07:35]). The interface renders these as clickable "
+                "links that start playback at that moment, so cite them wherever they "
+                "support your answer. Never invent a timestamp that is not in the "
+                "transcript.\n"
+            )
 
+        system_prompt = f"""You are a professional meeting and audio transcription analyst assisting {user_name}, who is a(n) {user_title} at {user_company}. {language_instruction} Analyze the following meeting information and respond to the specific request.
+{timestamp_instruction}
 Following are the meeting participants and their roles:
 {recording.participants or "No specific participants information provided."}
 
@@ -3879,6 +3967,9 @@ Additional context and notes about the meeting:
         user_id = current_user.id
         app = current_app._get_current_object()
 
+        # Resolved here, in the request context, before the response streams.
+        chat_temperature = get_temperature('chat')
+
         def generate():
             # Push app context for entire generator execution
             # This is needed because call_chat_completion checks budget which requires db access
@@ -3888,7 +3979,7 @@ Additional context and notes about the meeting:
                 # Enable streaming with user_id for budget enforcement
                 stream = call_chat_completion(
                     messages=messages,
-                    temperature=0.7,
+                    temperature=chat_temperature,
                     max_tokens=int(os.environ.get("CHAT_MAX_TOKENS", "2000")),
                     stream=True,
                     user_id=user_id,
@@ -3907,7 +3998,7 @@ Additional context and notes about the meeting:
                 # Provide more helpful error message for connection issues
                 error_msg = str(e).lower()
                 if 'connection' in error_msg or 'connect' in error_msg or 'refused' in error_msg:
-                    yield f"data: {json.dumps({'error': 'Could not connect to LLM server. Please check that your LLM service is running.'})}\n\n"
+                    yield f"data: {json.dumps(api_error('llm_connection_failed'))}\n\n"
                 else:
                     yield f"data: {json.dumps({'error': str(e)})}\n\n"
             finally:
@@ -3919,7 +4010,7 @@ Additional context and notes about the meeting:
         current_app.logger.error(f"Error in chat endpoint: {str(e)}")
         error_msg = str(e).lower()
         if 'connection' in error_msg or 'connect' in error_msg or 'refused' in error_msg:
-            return jsonify({'error': 'Could not connect to LLM server. Please check that your LLM service is running.'}), 503
+            return jsonify(api_error('llm_connection_failed')), 503
         return jsonify({'error': str(e)}), 500
 
 
@@ -3931,23 +4022,20 @@ def add_tag_to_recording(recording_id):
     """Add a tag to a recording. Triggers auto-share for group tags."""
     try:
         recording = db.session.get(Recording, recording_id)
-        if not recording:
-            return jsonify({'error': 'Recording not found'}), 404
-
         # Check if user has view access to this recording
         # (Edit permission will be checked for group tags specifically)
-        if not has_recording_access(recording, current_user, require_edit=False):
-            return jsonify({'error': 'You do not have permission to access this recording'}), 403
+        if not recording or not has_recording_access(recording, current_user):
+            return jsonify(api_error('recording_not_found')), 404
 
         data = request.get_json()
         tag_id = data.get('tag_id')
 
         if not tag_id:
-            return jsonify({'error': 'Tag ID is required'}), 400
+            return jsonify(api_error('tag_id_required')), 400
 
         tag = db.session.get(Tag, tag_id)
         if not tag:
-            return jsonify({'error': 'Tag not found'}), 404
+            return jsonify(api_error('tag_not_found')), 404
 
         # Check if user has access to this tag and permission to apply it
         if tag.group_id:
@@ -3957,19 +4045,19 @@ def add_tag_to_recording(recording_id):
                 user_id=current_user.id
             ).first()
             if not membership:
-                return jsonify({'error': 'You do not have access to this tag'}), 403
+                return jsonify(api_error('tag_access_denied')), 403
 
             # Only file owner or group admin can apply group tags
             if recording.user_id != current_user.id and membership.role != 'admin':
-                return jsonify({'error': 'Only recording owner or group admin can apply group tags'}), 403
+                return jsonify(api_error('group_tag_apply_restricted')), 403
 
             # Group tags require edit permission
             if not has_recording_access(recording, current_user, require_edit=True):
-                return jsonify({'error': 'You do not have permission to apply group tags to this recording'}), 403
+                return jsonify(api_error('group_tag_apply_denied')), 403
         else:
             # Personal tag - only the tag owner can use it (view access is sufficient)
             if tag.user_id != current_user.id:
-                return jsonify({'error': 'You can only apply your own personal tags'}), 403
+                return jsonify(api_error('personal_tag_apply_own_only')), 403
 
         # Check if tag is already on the recording
         existing = RecordingTag.query.filter_by(
@@ -3978,7 +4066,7 @@ def add_tag_to_recording(recording_id):
         ).first()
 
         if existing:
-            return jsonify({'error': 'Tag is already on this recording'}), 400
+            return jsonify(api_error('tag_already_on_recording')), 400
 
         # Get the next order position
         max_order = db.session.query(db.func.max(RecordingTag.order)).filter_by(
@@ -3993,64 +4081,12 @@ def add_tag_to_recording(recording_id):
         )
         db.session.add(recording_tag)
 
-        # If this is a group tag with sharing enabled, automatically share the recording
-        # Only auto-share if recording is completed (not during processing)
-        if tag.group_id and ENABLE_INTERNAL_SHARING and recording.status == 'COMPLETED' and (tag.auto_share_on_apply or tag.share_with_group_lead):
-            # Determine who to share with
-            if tag.auto_share_on_apply:
-                group_members = GroupMembership.query.filter_by(group_id=tag.group_id).all()
-            elif tag.share_with_group_lead:
-                group_members = GroupMembership.query.filter_by(group_id=tag.group_id, role='admin').all()
-            else:
-                group_members = []
-
-            shares_created = 0
-            for membership_to_share in group_members:
-                # Skip the recording owner
-                if membership_to_share.user_id == recording.user_id:
-                    continue
-
-                # Check if already shared
-                existing_share = InternalShare.query.filter_by(
-                    recording_id=recording_id,
-                    shared_with_user_id=membership_to_share.user_id
-                ).first()
-
-                if not existing_share:
-                    # Create internal share with correct permissions
-                    # Group admins get edit permission, regular members get read-only
-                    share = InternalShare(
-                        recording_id=recording_id,
-                        owner_id=recording.user_id,
-                        shared_with_user_id=membership_to_share.user_id,
-                        can_edit=(membership_to_share.role == 'admin'),
-                        can_reshare=False,
-                        source_type='group_tag',
-                        source_tag_id=tag.id
-                    )
-                    db.session.add(share)
-
-                    # Check if SharedRecordingState already exists (might exist from previous share)
-                    existing_state = SharedRecordingState.query.filter_by(
-                        recording_id=recording_id,
-                        user_id=membership_to_share.user_id
-                    ).first()
-
-                    if not existing_state:
-                        # Create SharedRecordingState with default values for the recipient
-                        state = SharedRecordingState(
-                            recording_id=recording_id,
-                            user_id=membership_to_share.user_id,
-                            is_inbox=True,  # New shares appear in inbox by default
-                            is_highlighted=False  # Not favorited by default
-                        )
-                        db.session.add(state)
-
-                    shares_created += 1
-                    current_app.logger.info(f"Auto-shared recording {recording_id} with user {membership_to_share.user_id} (role={membership_to_share.role}) via group tag '{tag.name}'")
-
-            if shares_created > 0:
-                current_app.logger.info(f"Created {shares_created} auto-shares for recording {recording_id} via group tag '{tag.name}'")
+        # A group tag with sharing shares the completed recording (same rule
+        # as API v1 and the end of processing: src/services/tag_sharing.py).
+        from src.services.tag_sharing import apply_tag_shares
+        shares_created = apply_tag_shares(recording, tag, sharing_enabled=ENABLE_INTERNAL_SHARING)
+        if shares_created > 0:
+            current_app.logger.info(f"Created {shares_created} auto-shares for recording {recording_id} via group tag '{tag.name}'")
 
         db.session.commit()
 
@@ -4066,7 +4102,7 @@ def add_tag_to_recording(recording_id):
     except Exception as e:
         db.session.rollback()
         current_app.logger.error(f"Error adding tag to recording {recording_id}: {e}", exc_info=True)
-        return jsonify({'error': 'An unexpected error occurred.'}), 500
+        return jsonify(api_error('unexpected_error')), 500
 
 
 @recordings_bp.route('/api/recordings/<int:recording_id>/tags/<int:tag_id>', methods=['DELETE'])
@@ -4075,13 +4111,10 @@ def remove_tag_from_recording(recording_id, tag_id):
     """Remove a tag from a recording. Cleans up auto-shares for group tags."""
     try:
         recording = db.session.get(Recording, recording_id)
-        if not recording:
-            return jsonify({'error': 'Recording not found'}), 404
-
         # Check if user has view access to this recording
         # (Edit permission will be checked for group tags specifically)
-        if not has_recording_access(recording, current_user, require_edit=False):
-            return jsonify({'error': 'You do not have permission to access this recording'}), 403
+        if not recording or not has_recording_access(recording, current_user):
+            return jsonify(api_error('recording_not_found')), 404
 
         # Find the recording-tag association
         recording_tag = RecordingTag.query.filter_by(
@@ -4090,7 +4123,7 @@ def remove_tag_from_recording(recording_id, tag_id):
         ).first()
 
         if not recording_tag:
-            return jsonify({'error': 'Tag is not on this recording'}), 404
+            return jsonify(api_error('tag_not_on_recording')), 404
 
         # Get the tag to check permissions and for cleanup
         tag = db.session.get(Tag, tag_id)
@@ -4104,17 +4137,17 @@ def remove_tag_from_recording(recording_id, tag_id):
                 ).first()
                 if recording.user_id != current_user.id:
                     if not membership or membership.role != 'admin':
-                        return jsonify({'error': 'Only recording owner or group admin can remove group tags'}), 403
+                        return jsonify(api_error('group_tag_remove_restricted')), 403
 
                 # Group tags require edit permission
                 if not has_recording_access(recording, current_user, require_edit=True):
-                    return jsonify({'error': 'You do not have permission to remove group tags from this recording'}), 403
+                    return jsonify(api_error('group_tag_remove_denied')), 403
             else:
                 # Personal tag - can be removed by tag owner (view access) or recording owner (edit access)
                 if tag.user_id != current_user.id:
                     # Not the tag owner, must be recording owner with edit permission
                     if not has_recording_access(recording, current_user, require_edit=True):
-                        return jsonify({'error': 'You can only remove your own personal tags'}), 403
+                        return jsonify(api_error('personal_tag_remove_own_only')), 403
 
         # Remove the association
         db.session.delete(recording_tag)
@@ -4163,7 +4196,7 @@ def remove_tag_from_recording(recording_id, tag_id):
     except Exception as e:
         db.session.rollback()
         current_app.logger.error(f"Error removing tag from recording {recording_id}: {e}", exc_info=True)
-        return jsonify({'error': 'An unexpected error occurred.'}), 500
+        return jsonify(api_error('unexpected_error')), 500
 
 
 @recordings_bp.route('/api/recordings/<int:recording_id>/tags/reorder', methods=['PUT'])
@@ -4172,20 +4205,20 @@ def reorder_recording_tags(recording_id):
     """Reorder tags on a recording. Updates the order field for each RecordingTag."""
     try:
         recording = db.session.get(Recording, recording_id)
-        if not recording:
-            return jsonify({'error': 'Recording not found'}), 404
+        if not recording or not has_recording_access(recording, current_user):
+            return jsonify(api_error('recording_not_found')), 404
 
         # Check if user has edit access to this recording
         if not has_recording_access(recording, current_user, require_edit=True):
-            return jsonify({'error': 'You do not have permission to modify this recording'}), 403
+            return jsonify(api_error('recording_modify_denied')), 403
 
         data = request.get_json()
         if not data or 'tag_ids' not in data:
-            return jsonify({'error': 'Missing tag_ids in request body'}), 400
+            return jsonify(api_error('missing_tag_ids')), 400
 
         tag_ids = data.get('tag_ids', [])
         if not isinstance(tag_ids, list):
-            return jsonify({'error': 'tag_ids must be a list'}), 400
+            return jsonify(api_error('invalid_tag_ids')), 400
 
         # Update order for each tag
         for order, tag_id in enumerate(tag_ids, 1):
@@ -4209,7 +4242,7 @@ def reorder_recording_tags(recording_id):
     except Exception as e:
         db.session.rollback()
         current_app.logger.error(f"Error reordering tags on recording {recording_id}: {e}", exc_info=True)
-        return jsonify({'error': 'An unexpected error occurred.'}), 500
+        return jsonify(api_error('unexpected_error')), 500
 
 
 # --- Bulk Operations ---
@@ -4221,19 +4254,19 @@ def bulk_delete_recordings():
     try:
         data = request.get_json()
         if not data or 'recording_ids' not in data:
-            return jsonify({'error': 'Missing recording_ids'}), 400
+            return jsonify(api_error('missing_recording_ids')), 400
 
         recording_ids = data.get('recording_ids', [])
         if not isinstance(recording_ids, list) or len(recording_ids) == 0:
-            return jsonify({'error': 'recording_ids must be a non-empty list'}), 400
+            return jsonify(api_error('recording_ids_empty')), 400
 
         # Limit bulk operations to prevent abuse
         if len(recording_ids) > 100:
-            return jsonify({'error': 'Cannot delete more than 100 recordings at once'}), 400
+            return jsonify(api_error('bulk_delete_limit')), 400
 
         # Check deletion permissions
         if not USERS_CAN_DELETE and not current_user.is_admin:
-            return jsonify({'error': 'Only administrators can delete recordings'}), 403
+            return jsonify(api_error('recording_delete_admin_only')), 403
 
         deleted_ids = []
         errors = []
@@ -4241,7 +4274,7 @@ def bulk_delete_recordings():
         for recording_id in recording_ids:
             try:
                 recording = db.session.get(Recording, recording_id)
-                if not recording:
+                if not recording or (recording.user_id and not has_recording_access(recording, current_user)):
                     errors.append(f"Recording {recording_id} not found")
                     continue
 
@@ -4250,28 +4283,16 @@ def bulk_delete_recordings():
                     errors.append(f"No permission for recording {recording_id}")
                     continue
 
-                # Delete audio file
-                if recording.audio_path:
-                    try:
-                        get_storage_service().delete(recording.audio_path, missing_ok=True)
-                    except Exception as e:
-                        current_app.logger.error(f"Error deleting audio file {recording.audio_path}: {e}")
-
-                # Delete associated records with NOT NULL recording_id constraints
-                from src.models import ProcessingJob
-                from src.models.speaker_snippet import SpeakerSnippet
-                SpeakerSnippet.query.filter_by(recording_id=recording_id).delete()
-                ProcessingJob.query.filter_by(recording_id=recording_id).delete()
-
-                # Delete the recording
-                db.session.delete(recording)
+                delete_recording_completely(recording, storage=get_storage_service())
                 deleted_ids.append(recording_id)
 
             except Exception as e:
+                db.session.rollback()
                 current_app.logger.error(f"Error deleting recording {recording_id}: {e}")
                 errors.append(f"Error with recording {recording_id}")
 
-        db.session.commit()
+        if deleted_ids:
+            cleanup_orphaned_speakers_quietly()
 
         return jsonify({
             'success': True,
@@ -4283,7 +4304,7 @@ def bulk_delete_recordings():
     except Exception as e:
         db.session.rollback()
         current_app.logger.error(f"Error in bulk delete: {e}", exc_info=True)
-        return jsonify({'error': 'An unexpected error occurred'}), 500
+        return jsonify(api_error('unexpected_error')), 500
 
 
 @recordings_bp.route('/api/recordings/bulk-tags', methods=['POST'])
@@ -4293,28 +4314,37 @@ def bulk_update_tags():
     try:
         data = request.get_json()
         if not data:
-            return jsonify({'error': 'Missing request body'}), 400
+            return jsonify(api_error('missing_request_body')), 400
 
         recording_ids = data.get('recording_ids', [])
         tag_id = data.get('tag_id')
         action = data.get('action', 'add')  # 'add' or 'remove'
 
         if not recording_ids or not tag_id:
-            return jsonify({'error': 'Missing recording_ids or tag_id'}), 400
+            return jsonify(api_error('missing_recording_ids_or_tag_id')), 400
 
         if action not in ['add', 'remove']:
-            return jsonify({'error': 'Action must be "add" or "remove"'}), 400
+            return jsonify(api_error('invalid_bulk_tag_action')), 400
 
         if len(recording_ids) > 100:
-            return jsonify({'error': 'Cannot update more than 100 recordings at once'}), 400
+            return jsonify(api_error('bulk_update_limit')), 400
 
         # Verify tag exists and user has access
         tag = db.session.get(Tag, tag_id)
         if not tag:
-            return jsonify({'error': 'Tag not found'}), 404
+            return jsonify(api_error('tag_not_found')), 404
 
-        if tag.user_id != current_user.id and not tag.group_id:
-            return jsonify({'error': 'No permission to use this tag'}), 403
+        # Access check matching the single-tag endpoints: a group tag requires
+        # membership in that group (previously group tags skipped this check
+        # entirely, letting a non-member attach another group's tag); a
+        # personal tag requires ownership.
+        if tag.group_id:
+            membership = GroupMembership.query.filter_by(
+                group_id=tag.group_id, user_id=current_user.id).first()
+            if not membership:
+                return jsonify(api_error('tag_access_denied')), 403
+        elif tag.user_id != current_user.id:
+            return jsonify(api_error('tag_use_denied')), 403
 
         affected_ids = []
 
@@ -4373,7 +4403,7 @@ def bulk_update_tags():
     except Exception as e:
         db.session.rollback()
         current_app.logger.error(f"Error in bulk tag update: {e}", exc_info=True)
-        return jsonify({'error': 'An unexpected error occurred'}), 500
+        return jsonify(api_error('unexpected_error')), 500
 
 
 @recordings_bp.route('/api/recordings/bulk-reprocess', methods=['POST'])
@@ -4383,19 +4413,19 @@ def bulk_reprocess():
     try:
         data = request.get_json()
         if not data:
-            return jsonify({'error': 'Missing request body'}), 400
+            return jsonify(api_error('missing_request_body')), 400
 
         recording_ids = data.get('recording_ids', [])
         reprocess_type = data.get('type', 'summary')  # 'transcription' or 'summary'
 
         if not recording_ids:
-            return jsonify({'error': 'Missing recording_ids'}), 400
+            return jsonify(api_error('missing_recording_ids')), 400
 
         if reprocess_type not in ['transcription', 'summary']:
-            return jsonify({'error': 'Type must be "transcription" or "summary"'}), 400
+            return jsonify(api_error('invalid_reprocess_type')), 400
 
         if len(recording_ids) > 50:
-            return jsonify({'error': 'Cannot reprocess more than 50 recordings at once'}), 400
+            return jsonify(api_error('bulk_reprocess_limit')), 400
 
         queued_ids = []
 
@@ -4413,24 +4443,16 @@ def bulk_reprocess():
                 if recording.status not in ['COMPLETED', 'FAILED']:
                     continue
 
-                # For transcription reprocess, need audio file
-                if reprocess_type == 'transcription':
-                    if not recording.audio_path or not get_storage_service().exists(recording.audio_path):
-                        continue
-                    job_type = 'reprocess_transcription'
-                else:
-                    # For summary, need transcription
-                    if not recording.transcription:
-                        continue
-                    job_type = 'reprocess_summary'
-
-                # Queue the job
-                job_queue.enqueue(
-                    user_id=current_user.id,
-                    recording_id=recording.id,
-                    job_type=job_type,
-                    params={'user_id': current_user.id}
-                )
+                # Same checks, clearing and settings as a single reprocess (#412).
+                from src.services.reprocessing import (
+                    queue_transcription_reprocess, queue_summary_reprocess, ReprocessError)
+                try:
+                    if reprocess_type == 'transcription':
+                        queue_transcription_reprocess(recording, current_user)
+                    else:
+                        queue_summary_reprocess(recording, current_user)
+                except ReprocessError:
+                    continue
 
                 queued_ids.append(recording_id)
 
@@ -4448,7 +4470,7 @@ def bulk_reprocess():
     except Exception as e:
         db.session.rollback()
         current_app.logger.error(f"Error in bulk reprocess: {e}", exc_info=True)
-        return jsonify({'error': 'An unexpected error occurred'}), 500
+        return jsonify(api_error('unexpected_error')), 500
 
 
 @recordings_bp.route('/api/recordings/bulk-toggle', methods=['POST'])
@@ -4458,20 +4480,20 @@ def bulk_toggle():
     try:
         data = request.get_json()
         if not data:
-            return jsonify({'error': 'Missing request body'}), 400
+            return jsonify(api_error('missing_request_body')), 400
 
         recording_ids = data.get('recording_ids', [])
-        field = data.get('field')  # 'inbox' or 'highlight'
+        field = data.get('field')  # 'inbox', 'highlight' or 'archive'
         value = data.get('value')  # True or False
 
         if not recording_ids or field is None or value is None:
-            return jsonify({'error': 'Missing recording_ids, field, or value'}), 400
+            return jsonify(api_error('missing_bulk_status_fields')), 400
 
-        if field not in ['inbox', 'highlight']:
-            return jsonify({'error': 'Field must be "inbox" or "highlight"'}), 400
+        if field not in ['inbox', 'highlight', 'archive']:
+            return jsonify(api_error('invalid_bulk_status_field')), 400
 
         if len(recording_ids) > 100:
-            return jsonify({'error': 'Cannot update more than 100 recordings at once'}), 400
+            return jsonify(api_error('bulk_update_limit')), 400
 
         affected_ids = []
 
@@ -4493,6 +4515,9 @@ def bulk_toggle():
                 # Use set_user_recording_status which handles both owners and shared users
                 if field == 'inbox':
                     set_user_recording_status(recording, current_user, is_inbox=value)
+                elif field == 'archive':
+                    from src.services.recording_state import set_user_archived
+                    set_user_archived(recording, current_user, value)
                 else:
                     set_user_recording_status(recording, current_user, is_highlighted=value)
 
@@ -4512,7 +4537,7 @@ def bulk_toggle():
     except Exception as e:
         db.session.rollback()
         current_app.logger.error(f"Error in bulk toggle: {e}", exc_info=True)
-        return jsonify({'error': 'An unexpected error occurred'}), 500
+        return jsonify(api_error('unexpected_error')), 500
 
 
 # --- Auto-deletion and Chunks Processing ---
@@ -4523,12 +4548,12 @@ def toggle_deletion_exempt(recording_id):
     """Toggle the deletion_exempt flag for a recording."""
     try:
         recording = db.session.get(Recording, recording_id)
-        if not recording:
-            return jsonify({'error': 'Recording not found'}), 404
+        if not recording or not (current_user.is_admin or has_recording_access(recording, current_user)):
+            return jsonify(api_error('recording_not_found')), 404
 
         # Check ownership
         if recording.user_id != current_user.id and not current_user.is_admin:
-            return jsonify({'error': 'Permission denied'}), 403
+            return jsonify(api_error('permission_denied')), 403
 
         # Toggle the flag
         recording.deletion_exempt = not recording.deletion_exempt
@@ -4550,17 +4575,17 @@ def process_recording_chunks_endpoint(recording_id):
     """Process chunks for a specific recording."""
     try:
         recording = db.session.get(Recording, recording_id)
-        if not recording:
-            return jsonify({'error': 'Recording not found'}), 404
+        if not recording or not has_recording_access(recording, current_user):
+            return jsonify(api_error('recording_not_found')), 404
 
         if recording.user_id != current_user.id:
-            return jsonify({'error': 'Permission denied'}), 403
+            return jsonify(api_error('permission_denied')), 403
 
         success = process_recording_chunks(recording_id)
         if success:
-            return jsonify({'message': 'Chunks processed successfully'})
+            return jsonify({'message': translate('server.apiMessage.chunksProcessed')})
         else:
-            return jsonify({'error': 'Failed to process chunks'}), 500
+            return jsonify(api_error('chunk_processing_failed')), 500
 
     except Exception as e:
         current_app.logger.error(f"Error in process chunks endpoint: {e}")

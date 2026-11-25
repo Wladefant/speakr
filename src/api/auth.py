@@ -5,10 +5,12 @@ This blueprint handles user registration, login, logout, account management,
 and password changes.
 """
 
+import hmac
 import os
 import re
 import mimetypes
-from flask import Blueprint, render_template, request, redirect, url_for, flash, jsonify, session, current_app
+from flask import Blueprint, render_template, request, redirect, url_for, flash, jsonify, session, current_app, make_response
+from markupsafe import escape
 from flask_login import login_user, logout_user, login_required, current_user
 from flask_wtf import FlaskForm
 from wtforms import StringField, PasswordField, SubmitField, BooleanField
@@ -19,6 +21,8 @@ import markdown
 from src.database import db
 from src.models import User, SystemSetting, GroupMembership
 from src.utils import password_check, is_safe_url
+from src.services import login_lock
+from src.utils.localization import format_file_size, format_number, translate, api_error, request_language, LazyTranslation
 from src.auth.sso import (
     init_sso_client,
     is_sso_enabled,
@@ -27,12 +31,14 @@ from src.auth.sso import (
     create_or_update_sso_user,
     is_domain_allowed,
     link_sso_to_existing_user,
+    resolve_userinfo,
     update_user_profile_from_claims,
 )
 from src.services.email import (
     is_email_verification_enabled,
     is_email_verification_required,
     is_smtp_configured,
+    can_email_user,
     send_verification_email,
     send_password_reset_email,
     verify_email_token,
@@ -43,6 +49,22 @@ from src.services.email import (
 
 # Create blueprint
 auth_bp = Blueprint('auth', __name__)
+
+
+@auth_bp.context_processor
+def inject_page_translation():
+    """Server-side text for the sign-in pages (login, register, auth/*).
+
+    These pages are plain forms that work without JavaScript, so their text
+    is translated here rather than by i18n.js: ``t('key', name=value)`` in
+    the viewer's language (their interface language when signed in, else
+    the browser's Accept-Language), and ``page_language`` for <html lang>.
+    """
+    language = request_language()
+    return {
+        't': lambda key, **params: translate(key, language, **params),
+        'page_language': language,
+    }
 
 # Import these from app after initialization
 bcrypt = None
@@ -86,32 +108,59 @@ def rate_limit(limit_string):
 
 # --- Forms ---
 
+# Trim + lowercase an email field before validators run. Fixes the mobile
+# autofill case where a trailing space makes Email() reject an otherwise-valid
+# address, and normalizes what gets stored so accounts stay case-consistent.
+_normalize_email_filter = lambda x: x.strip().lower() if x else x
+
+# Validator messages in the language of the request that shows them (#477).
+_REQUIRED = LazyTranslation('server.form.required')
+_INVALID_EMAIL = LazyTranslation('server.form.invalidEmail')
+
+
 class RegistrationForm(FlaskForm):
-    username = StringField('Username', validators=[DataRequired(), Length(min=2, max=20)])
-    email = StringField('Email', validators=[DataRequired(), Email()])
-    password = PasswordField('Password', validators=[DataRequired(), password_check])
-    confirm_password = PasswordField('Confirm Password', validators=[DataRequired(), EqualTo('password')])
+    username = StringField('Username', validators=[
+        DataRequired(message=_REQUIRED),
+        Length(min=2, max=20, message=LazyTranslation('server.form.usernameLength', min=2, max=20))])
+    email = StringField('Email', filters=[_normalize_email_filter], validators=[
+        DataRequired(message=_REQUIRED), Email(message=_INVALID_EMAIL)])
+    password = PasswordField('Password', validators=[DataRequired(message=_REQUIRED), password_check])
+    confirm_password = PasswordField('Confirm Password', validators=[
+        DataRequired(message=_REQUIRED),
+        EqualTo('password', message=LazyTranslation('server.form.passwordsMustMatch'))])
     submit = SubmitField('Sign Up')
 
     def validate_username(self, username):
         user = User.query.filter_by(username=username.data).first()
         if user:
-            raise ValidationError('That username is already taken. Please choose a different one.')
+            raise ValidationError(translate('server.form.usernameTaken'))
 
     def validate_email(self, email):
-        user = User.query.filter_by(email=email.data).first()
-        if user:
-            raise ValidationError('That email is already registered. Please use a different one.')
+        # Case-insensitive so a case-variant of an existing address can't be
+        # registered as a separate account.
+        if User.find_by_email(email.data):
+            raise ValidationError(translate('server.form.emailTaken'))
 
 
 class LoginForm(FlaskForm):
-    email = StringField('Email', filters=[lambda x: x.strip().lower() if x else x], validators=[DataRequired(), Email()])
-    password = PasswordField('Password', validators=[DataRequired()])
+    email = StringField('Email', filters=[_normalize_email_filter], validators=[
+        DataRequired(message=_REQUIRED), Email(message=_INVALID_EMAIL)])
+    password = PasswordField('Password', validators=[DataRequired(message=_REQUIRED)])
     remember = BooleanField('Remember Me')
     submit = SubmitField('Login')
 
 
 # --- Helper Functions ---
+
+def registration_enabled() -> bool:
+    """Whether self-service registration is open (ALLOW_REGISTRATION).
+
+    The /register route and the login page's register link both ask this, so
+    the page never advertises a route that refuses (#479). Read per request:
+    the environment can change under the test suite.
+    """
+    return os.environ.get('ALLOW_REGISTRATION', 'true').lower() == 'true'
+
 
 def is_registration_domain_allowed(email: str) -> bool:
     """Check if email domain is allowed for registration.
@@ -138,16 +187,41 @@ def is_registration_domain_allowed(email: str) -> bool:
     return domain in allowed
 
 
+def _email_notifications_available(user) -> bool:
+    """Whether to offer this user the completion-email toggle (#386).
+
+    Offering a switch that cannot do anything is worse than hiding it, so the
+    account page asks the same question the sender will ask: is SMTP set up,
+    and is this user's address one we can actually deliver to.
+    """
+    return can_email_user(user)
+
+
 # --- Routes ---
+
+@auth_bp.route('/api/user/timezone', methods=['POST'])
+@login_required
+def record_timezone():
+    """Save the browser's timezone for a user in 'auto' mode (#412).
+
+    Sent by static/js/timezone-sync.js once per browser session. A user who
+    chose a zone in Account settings keeps it.
+    """
+    from src.utils.timezones import record_browser_timezone, user_timezone, MODE_AUTO
+    data = request.get_json(silent=True) or {}
+    if record_browser_timezone(current_user, data.get('timezone')):
+        db.session.commit()
+    return jsonify({
+        'timezone': user_timezone(current_user),
+        'mode': current_user.timezone_mode or MODE_AUTO,
+    })
+
 
 @auth_bp.route('/register', methods=['GET', 'POST'])
 @rate_limit("10 per minute")
 def register():
-    # Check if registration is allowed
-    allow_registration = os.environ.get('ALLOW_REGISTRATION', 'true').lower() == 'true'
-
-    if not allow_registration:
-        flash('Registration is currently disabled. Please contact the administrator.', 'danger')
+    if not registration_enabled():
+        flash(translate('server.flash.registrationDisabled'), 'danger')
         return redirect(url_for('auth.login'))
 
     if current_user.is_authenticated:
@@ -157,7 +231,7 @@ def register():
     if form.validate_on_submit():
         # Check if email domain is allowed
         if not is_registration_domain_allowed(form.email.data):
-            flash('Registration is restricted. Please contact the administrator.', 'danger')
+            flash(translate('server.flash.registrationRestricted'), 'danger')
             return render_template('register.html', title='Register', form=form)
 
         hashed_password = bcrypt.generate_password_hash(form.password.data).decode('utf-8')
@@ -173,6 +247,8 @@ def register():
             password=hashed_password,
             email_verified=email_verified
         )
+        from src.services.storage_quota import default_quota_mb
+        user.storage_quota_mb = default_quota_mb()
         db.session.add(user)
         db.session.commit()
 
@@ -185,13 +261,35 @@ def register():
                                      action='verification')
             else:
                 # Email failed to send, but account was created
-                flash('Your account has been created, but we could not send a verification email. Please contact support.', 'warning')
+                flash(translate('server.flash.accountCreatedVerificationFailed'), 'warning')
                 return redirect(url_for('auth.login'))
 
-        flash('Your account has been created! You can now log in.', 'success')
+        flash(translate('server.flash.accountCreated'), 'success')
         return redirect(url_for('auth.login'))
 
     return render_template('register.html', title='Register', form=form)
+
+
+def _password_accepted(user, password):
+    """Check a sign-in password against the account and the login lock (#529).
+
+    The hash is always checked, so a locked account answers as slowly as a
+    wrong password. While the account is locked for this client address, a
+    correct password is refused too, and the count does not change.
+    """
+    matches = bcrypt.check_password_hash(user.password, password)
+    max_attempts, minutes = login_lock.lock_settings()
+    if max_attempts == 0:
+        return matches
+    key = login_lock.client_key(request.remote_addr)
+    if login_lock.is_locked(user.id, key):
+        return False
+    if matches:
+        login_lock.clear_failures(user.id, key)
+        db.session.commit()
+        return True
+    login_lock.record_failure(user.id, key, max_attempts, minutes)
+    return False
 
 
 @auth_bp.route('/login', methods=['GET', 'POST'])
@@ -209,12 +307,14 @@ def login():
 
     form = LoginForm()
     if form.validate_on_submit():
-        user = User.query.filter_by(email=form.email.data).first()
+        user = User.find_by_email(form.email.data)
         if user and user.password:
             # Check if password login is disabled for non-admins
             if password_login_disabled and not user.is_admin:
-                flash('Password login is disabled. Please sign in with SSO.', 'warning')
-            elif bcrypt.check_password_hash(user.password, form.password.data):
+                flash(translate('server.flash.passwordLoginDisabled'), 'warning')
+            elif not _password_accepted(user, form.password.data):
+                flash(translate('server.flash.loginFailed'), 'danger')
+            else:
                 # Check email verification if required
                 if is_email_verification_required() and not user.email_verified:
                     # Store user email in session for resend functionality
@@ -230,12 +330,10 @@ def login():
                 if not is_safe_url(next_page):
                     return redirect(url_for('recordings.index'))
                 return redirect(next_page) if next_page else redirect(url_for('recordings.index'))
-            else:
-                flash('Login unsuccessful. Please check email and password.', 'danger')
         elif user and not user.password:
-            flash('This account uses SSO login. Please sign in with SSO.', 'warning')
+            flash(translate('server.flash.useSsoLogin'), 'warning')
         else:
-            flash('Login unsuccessful. Please check email and password.', 'danger')
+            flash(translate('server.flash.loginFailed'), 'danger')
 
     return render_template(
         'login.html',
@@ -251,12 +349,12 @@ def login():
 @rate_limit("10 per minute")
 def sso_login():
     if not is_sso_enabled():
-        flash('SSO is not configured. Please contact the administrator.', 'danger')
+        flash(translate('server.flash.ssoNotConfigured'), 'danger')
         return redirect(url_for('auth.login'))
 
     oauth = get_sso_client() or init_sso_client(current_app)
     if not oauth:
-        flash('Failed to initialize SSO client. Check server logs.', 'danger')
+        flash(translate('server.flash.ssoClientFailed'), 'danger')
         return redirect(url_for('auth.login'))
 
     next_url = request.args.get('next')
@@ -264,55 +362,76 @@ def sso_login():
         session['sso_next'] = next_url
     else:
         session.pop('sso_next', None)
+    # "Remember me" on the sign-in page, as for a password sign-in (#437)
+    session['sso_remember'] = request.args.get('remember') == '1'
 
-    return oauth.sso.authorize_redirect(redirect_uri=get_sso_config().get('redirect_uri'))
+    return _leave_for_provider(oauth.sso.authorize_redirect(redirect_uri=get_sso_config().get('redirect_uri')))
+
+
+def _leave_for_provider(provider_redirect):
+    """Send the browser on to the identity provider from a page, not with a 302.
+
+    The sign-in and link buttons are forms, and browsers apply the CSP
+    form-action directive to every redirect that follows a form submission,
+    so a 302 to the provider is blocked by form-action 'self' (#496).
+    """
+    location = escape(provider_redirect.headers['Location'])
+    label = escape(translate('authPages.signInWith', provider=get_sso_config().get('provider_name') or 'SSO'))
+    response = make_response(
+        '<!doctype html><html><head><meta charset="utf-8">'
+        f'<meta http-equiv="refresh" content="0;url={location}"></head>'
+        f'<body><a href="{location}">{label}</a></body></html>'
+    )
+    response.headers['Cache-Control'] = 'no-store'
+    return response
 
 
 @auth_bp.route('/auth/sso/callback')
 @rate_limit("20 per minute")
 def sso_callback():
     if not is_sso_enabled():
-        flash('SSO is not configured. Please contact the administrator.', 'danger')
+        flash(translate('server.flash.ssoNotConfigured'), 'danger')
         return redirect(url_for('auth.login'))
 
     oauth = get_sso_client() or init_sso_client(current_app)
     if not oauth:
-        flash('Failed to initialize SSO client. Check server logs.', 'danger')
+        flash(translate('server.flash.ssoClientFailed'), 'danger')
         return redirect(url_for('auth.login'))
 
     try:
         token = oauth.sso.authorize_access_token()
-        userinfo = token.get('userinfo') or oauth.sso.userinfo()
+        userinfo = resolve_userinfo(oauth, token)
     except Exception as e:
         current_app.logger.warning(f"SSO callback error: {e}")
-        flash('SSO login failed. Please try again.', 'danger')
+        flash(translate('server.flash.ssoLoginFailed'), 'danger')
         return redirect(url_for('auth.login'))
 
     subject = userinfo.get('sub')
     if not subject:
-        flash('SSO response did not include a subject identifier.', 'danger')
+        flash(translate('server.flash.ssoMissingSubject'), 'danger')
         return redirect(url_for('auth.login'))
 
     link_user_id = session.pop('sso_link_user_id', None)
     next_url = session.pop('sso_next', None)
+    remember = bool(session.pop('sso_remember', False))
     cfg = get_sso_config()
 
     if link_user_id:
         target_user = db.session.get(User, int(link_user_id))
         if not target_user:
-            flash('Could not link account: user not found.', 'danger')
+            flash(translate('server.flash.ssoLinkUserNotFound'), 'danger')
             return redirect(url_for('auth.account'))
 
         existing = User.query.filter_by(sso_subject=subject).first()
         if existing and existing.id != target_user.id:
-            flash('This SSO account is already linked to another user.', 'danger')
+            flash(translate('server.flash.ssoAlreadyLinked'), 'danger')
             return redirect(url_for('auth.account'))
 
         update_user_profile_from_claims(target_user, userinfo)
         target_user.sso_provider = cfg.get('provider_name', 'SSO')
         target_user.sso_subject = subject
         db.session.commit()
-        flash('SSO account linked successfully.', 'success')
+        flash(translate('server.flash.ssoLinked'), 'success')
         return redirect(url_for('auth.account'))
 
     try:
@@ -325,10 +444,10 @@ def sso_callback():
         return redirect(url_for('auth.login'))
     except Exception as e:
         current_app.logger.warning(f"SSO login error: {e}")
-        flash('Could not complete SSO login. Please try again.', 'danger')
+        flash(translate('server.flash.ssoLoginIncomplete'), 'danger')
         return redirect(url_for('auth.login'))
 
-    login_user(user, remember=True)
+    login_user(user, remember=remember)
 
     if next_url and is_safe_url(next_url):
         return redirect(next_url)
@@ -339,7 +458,7 @@ def sso_callback():
 @login_required
 def sso_link():
     if not is_sso_enabled():
-        flash('SSO is not configured. Please contact the administrator.', 'danger')
+        flash(translate('server.flash.ssoNotConfigured'), 'danger')
         return redirect(url_for('auth.account'))
 
     session['sso_link_user_id'] = current_user.id
@@ -352,32 +471,25 @@ def sso_link():
 @login_required
 def sso_unlink():
     if not current_user.sso_subject:
-        flash('Your account is not linked to SSO.', 'warning')
+        flash(translate('server.flash.ssoNotLinked'), 'warning')
         return redirect(url_for('auth.account'))
 
     if not current_user.password:
-        flash(
-            'Cannot unlink SSO: you have no password set. Use the Forgot Password '
-            'link on the login page with your email address to receive a reset link '
-            'that lets you set a password.',
-            'danger',
-        )
+        flash(translate('server.flash.ssoUnlinkNoPassword'), 'danger')
         return redirect(url_for('auth.account'))
 
     current_user.sso_provider = None
     current_user.sso_subject = None
     db.session.commit()
-    flash('SSO account unlinked successfully.', 'success')
+    flash(translate('server.flash.ssoUnlinked'), 'success')
     return redirect(url_for('auth.account'))
 
 
-@auth_bp.route('/logout')
+@auth_bp.route('/logout', methods=['POST'])
 def logout():
-    # /logout is GET-only, so Flask-WTF's CSRF check (which runs only on
-    # state-changing methods) does not apply. No explicit exemption is
-    # needed. A future hardening pass should move logout to POST so a
-    # CSRF-redirected GET can't log a victim out, but that is a behaviour
-    # change deferred from this security release.
+    # POST-only so the global CSRF check applies: a cross-site GET (e.g.
+    # <img src="/logout">) can no longer force-log-out a victim. The menu
+    # "Sign out" controls are CSRF-token-carrying POST forms.
     logout_user()
     return redirect(url_for('auth.login'))
 
@@ -390,16 +502,16 @@ def verify_email(token):
     user_id = verify_email_token(token)
 
     if user_id is None:
-        flash('The verification link is invalid or has expired.', 'danger')
+        flash(translate('server.flash.verificationLinkInvalid'), 'danger')
         return redirect(url_for('auth.login'))
 
     user = db.session.get(User, user_id)
     if not user:
-        flash('User not found.', 'danger')
+        flash(translate('server.flash.userNotFound'), 'danger')
         return redirect(url_for('auth.login'))
 
     if user.email_verified:
-        flash('Your email has already been verified.', 'info')
+        flash(translate('server.flash.emailAlreadyVerified'), 'info')
         return redirect(url_for('auth.login'))
 
     # Verify the email
@@ -415,35 +527,35 @@ def verify_email(token):
 def resend_verification():
     """Resend verification email."""
     if not is_email_verification_enabled():
-        flash('Email verification is not enabled.', 'danger')
+        flash(translate('server.flash.emailVerificationDisabled'), 'danger')
         return redirect(url_for('auth.login'))
 
     if not is_smtp_configured():
-        flash('Email service is not configured.', 'danger')
+        flash(translate('server.flash.emailServiceNotConfigured'), 'danger')
         return redirect(url_for('auth.login'))
 
     # Get email from session (set during failed login) or form
-    email = session.get('unverified_email') or request.form.get('email')
+    email = User.normalize_email(session.get('unverified_email') or request.form.get('email'))
 
     if not email:
-        flash('Email address is required.', 'danger')
+        flash(translate('server.flash.emailRequired'), 'danger')
         return redirect(url_for('auth.login'))
 
-    user = User.query.filter_by(email=email).first()
+    user = User.find_by_email(email)
 
     if not user:
         # Don't reveal if user exists
-        flash('If an account exists with this email, a verification link has been sent.', 'info')
+        flash(translate('server.flash.verificationSentIfExists'), 'info')
         return redirect(url_for('auth.login'))
 
     if user.email_verified:
-        flash('Your email has already been verified.', 'info')
+        flash(translate('server.flash.emailAlreadyVerified'), 'info')
         return redirect(url_for('auth.login'))
 
     # Check cooldown
     can_resend, remaining = can_resend_verification(user)
     if not can_resend:
-        flash(f'Please wait {remaining} seconds before requesting another verification email.', 'warning')
+        flash(translate('server.flash.verificationCooldown', seconds=remaining), 'warning')
         return render_template('auth/check_email.html',
                              title='Check Your Email',
                              email=email,
@@ -451,9 +563,9 @@ def resend_verification():
                              show_resend=True)
 
     if send_verification_email(user):
-        flash('A new verification email has been sent.', 'success')
+        flash(translate('server.flash.verificationResent'), 'success')
     else:
-        flash('Failed to send verification email. Please try again later.', 'danger')
+        flash(translate('server.flash.verificationSendFailed'), 'danger')
 
     return render_template('auth/check_email.html',
                          title='Check Your Email',
@@ -472,17 +584,17 @@ def forgot_password():
         return redirect(url_for('recordings.index'))
 
     if not is_smtp_configured():
-        flash('Password reset is not available. Please contact the administrator.', 'warning')
+        flash(translate('server.flash.passwordResetUnavailable'), 'warning')
         return redirect(url_for('auth.login'))
 
     if request.method == 'POST':
-        email = request.form.get('email')
+        email = User.normalize_email(request.form.get('email'))
 
         if not email:
-            flash('Email address is required.', 'danger')
+            flash(translate('server.flash.emailRequired'), 'danger')
             return render_template('auth/forgot_password.html', title='Forgot Password')
 
-        user = User.query.filter_by(email=email).first()
+        user = User.find_by_email(email)
 
         # Always show the same message to prevent email enumeration
         if user:
@@ -493,13 +605,16 @@ def forgot_password():
             # case by setting user.password from the form input; if the
             # SSO link is also present, the user ends up with both, which
             # is the prerequisite for sso_unlink later.
-            can_resend, remaining = can_resend_password_reset(user)
-            if not can_resend:
-                flash(f'Please wait {remaining} seconds before requesting another reset email.', 'warning')
-            else:
+            # Only send if outside the resend cooldown, but never surface the
+            # cooldown to the caller: a "please wait N seconds" message would
+            # only ever appear for a real account, confirming the address
+            # exists. Silently skip within the window; the generic message
+            # below is returned identically whether or not the account exists.
+            can_resend, _ = can_resend_password_reset(user)
+            if can_resend:
                 send_password_reset_email(user)
 
-        flash('If an account exists with this email, a password reset link has been sent.', 'info')
+        flash(translate('server.flash.passwordResetSentIfExists'), 'info')
         return render_template('auth/check_email.html',
                              title='Check Your Email',
                              email=email,
@@ -518,12 +633,22 @@ def reset_password(token):
     user_id = verify_reset_token(token)
 
     if user_id is None:
-        flash('The password reset link is invalid or has expired.', 'danger')
+        flash(translate('server.flash.resetLinkInvalid'), 'danger')
         return redirect(url_for('auth.forgot_password'))
 
     user = db.session.get(User, user_id)
     if not user:
-        flash('User not found.', 'danger')
+        flash(translate('server.flash.userNotFound'), 'danger')
+        return redirect(url_for('auth.forgot_password'))
+
+    # Single-use enforcement: the itsdangerous token is only signature+expiry
+    # checked, so on its own it stays replayable for the whole TTL even after
+    # it has been used or superseded. Bind it to the token currently stored on
+    # the user: a used token (cleared on reset) or one superseded by a newer
+    # reset request no longer matches and is rejected immediately.
+    stored_token = user.password_reset_token or ''
+    if not stored_token or not hmac.compare_digest(stored_token, token):
+        flash(translate('server.flash.resetLinkInvalid'), 'danger')
         return redirect(url_for('auth.forgot_password'))
 
     if request.method == 'POST':
@@ -531,11 +656,11 @@ def reset_password(token):
         confirm_password = request.form.get('confirm_password')
 
         if not password or not confirm_password:
-            flash('Both password fields are required.', 'danger')
+            flash(translate('server.flash.passwordFieldsRequired'), 'danger')
             return render_template('auth/reset_password.html', title='Reset Password', token=token)
 
         if password != confirm_password:
-            flash('Passwords do not match.', 'danger')
+            flash(translate('server.flash.passwordsDoNotMatch'), 'danger')
             return render_template('auth/reset_password.html', title='Reset Password', token=token)
 
         # Validate password
@@ -550,6 +675,10 @@ def reset_password(token):
         user.password = hashed_password
         user.password_reset_token = None  # Clear the token
         user.password_reset_sent_at = None
+        # Sign the account out of every browser (#437)
+        user.end_all_sessions()
+        # A new password ends any login lock on the account (#529)
+        login_lock.clear_failures(user.id)
 
         # Also verify email if not already verified
         if not user.email_verified:
@@ -557,10 +686,60 @@ def reset_password(token):
 
         db.session.commit()
 
-        flash('Your password has been reset. You can now log in with your new password.', 'success')
+        flash(translate('server.flash.passwordResetDone'), 'success')
         return redirect(url_for('auth.login'))
 
     return render_template('auth/reset_password.html', title='Reset Password', token=token)
+
+
+def _storage_usage(user):
+    try:
+        from src.services.storage_quota import usage
+        return usage(user)
+    except Exception as e:
+        current_app.logger.warning(f"Could not read storage usage for user {user.id}: {e}")
+        return None
+
+
+def _usage_limits(user):
+    """AI tokens and transcription minutes this month, and storage, each
+    against its limit when one is set, for the Account page (#413). The
+    numbers are in the interface language's notation (#481)."""
+
+    def row(key, label_key, icon, used, limit, fmt):
+        pct = round(used / limit * 100, 1) if limit else None
+        return {'key': key, 'label_key': label_key, 'icon': icon, 'used': fmt(used),
+                'limit': fmt(limit) if limit else None, 'percentage': pct}
+
+    rows = []
+    try:
+        from src.services.token_tracking import token_tracker
+        rows.append(row('tokens', 'account.aiTokensMonth', 'fa-coins',
+                        int(token_tracker.get_monthly_usage(user.id) or 0), user.monthly_token_budget,
+                        lambda n: format_number(int(n))))
+    except Exception as e:
+        current_app.logger.warning(f"Could not read token usage for user {user.id}: {e}")
+    try:
+        from src.services.transcription_tracking import transcription_tracker
+        seconds = int(transcription_tracker.get_monthly_usage(user.id) or 0)
+        budget = user.monthly_transcription_budget
+        rows.append(row('transcription', 'account.transcriptionMonth', 'fa-microphone',
+                        seconds // 60, (budget // 60) if budget else None,
+                        lambda n: translate('adminDashboard.statsPage.minutesShort', count=format_number(int(n)))))
+    except Exception as e:
+        current_app.logger.warning(f"Could not read transcription usage for user {user.id}: {e}")
+    storage = _storage_usage(user)
+    if storage:
+        rows.append(row('storage', 'account.storage', 'fa-hdd', storage['used_bytes'], storage['quota_bytes'], format_file_size))
+    return rows
+
+
+@auth_bp.route('/api/account/storage', methods=['GET'])
+@login_required
+def account_storage():
+    """The signed-in user's storage use and quota (#413)."""
+    from src.services.storage_quota import usage
+    return jsonify(usage(current_user))
 
 
 @auth_bp.route('/account', methods=['GET', 'POST'])
@@ -589,6 +768,12 @@ def account():
         elif 'preferences_form' in request.form:
             current_user.show_timestamps_simple_view = 'show_timestamps_simple_view' in request.form
             current_user.editor_autosave = 'editor_autosave' in request.form
+            # Only honour the notification toggle when the form actually
+            # rendered it. The checkbox is hidden when Speakr cannot mail this
+            # user, and an absent checkbox must not silently clear a
+            # preference they set while SMTP was working.
+            if 'email_notifications_shown' in request.form:
+                current_user.notify_email_on_completion = 'notify_email_on_completion' in request.form
             # Audio player position — only update if the field is
             # actually present in the submission. The Preferences tab
             # (which doesn't expose the radio) submits without this
@@ -598,6 +783,11 @@ def account():
             if 'audio_player_position' in request.form:
                 pos = request.form.get('audio_player_position', 'bottom')
                 current_user.audio_player_position = pos if pos in ('bottom', 'top') else 'bottom'
+            # Default recording sort: same "only if submitted" rule as above. Anything
+            # other than the two known sorts is stored as NULL, which means 'created_at'.
+            if 'default_recording_sort' in request.form:
+                sort = request.form.get('default_recording_sort')
+                current_user.default_recording_sort = sort if sort in ('created_at', 'meeting_date') else None
 
             ui_lang = request.form.get('ui_language')
             transcription_lang = request.form.get('transcription_language')
@@ -609,13 +799,60 @@ def account():
             current_user.transcription_language = normalize_language_code(transcription_lang)
             current_user.output_language = output_lang if output_lang else None
 
+            # Timezone for generated titles (#412). Gated on the field being
+            # present so tabs that submit 'preferences_form' without it leave the
+            # setting alone. 'auto' keeps the detected zone and resumes updating
+            # it from the browser; a zone name fixes it.
+            if 'timezone' in request.form:
+                from src.utils.timezones import is_valid_timezone, MODE_AUTO, MODE_FIXED
+                tz_value = (request.form.get('timezone') or '').strip()
+                if tz_value == MODE_AUTO or not tz_value:
+                    current_user.timezone_mode = MODE_AUTO
+                    detected = (request.form.get('detected_timezone') or '').strip()
+                    if is_valid_timezone(detected):
+                        current_user.timezone = detected
+                elif is_valid_timezone(tz_value):
+                    current_user.timezone_mode = MODE_FIXED
+                    current_user.timezone = tz_value
+
+            # Filename date parsing (#342). Gated on the select being present
+            # so other tabs that submit 'preferences_form' without this
+            # section cannot clobber the settings (same reasoning as
+            # audio_player_position above).
+            if 'filename_date_pattern' in request.form:
+                from src.utils.filename_dates import VALID_PATTERN_KEYS, validate_custom_regex
+                pattern = request.form.get('filename_date_pattern', 'auto')
+                if pattern not in VALID_PATTERN_KEYS:
+                    pattern = 'auto'
+                custom_regex = (request.form.get('filename_date_regex') or '').strip() or None
+                if pattern == 'custom':
+                    regex_error = validate_custom_regex(custom_regex or '')
+                    if regex_error:
+                        if request.headers.get('X-Requested-With') == 'XMLHttpRequest' or request.accept_mimetypes.best == 'application/json':
+                            return jsonify({'success': False, 'error': regex_error}), 400
+                        flash(regex_error, 'error')
+                        return redirect(url_for('auth.account'))
+                current_user.parse_filename_dates = 'parse_filename_dates' in request.form
+                current_user.filename_date_pattern = pattern
+                current_user.filename_date_regex = custom_regex
+
         # Check if this is the custom prompts form (has summary_prompt field)
         elif 'summary_prompt' in request.form:
             # Handle custom prompt updates
             summary_prompt_text = request.form.get('summary_prompt')
             current_user.summary_prompt = summary_prompt_text if summary_prompt_text else None
+            # Gated on its own field so a form without it cannot clear it (#400).
+            if 'title_prompt' in request.form:
+                title_prompt_text = (request.form.get('title_prompt') or '').strip()
+                current_user.title_prompt = title_prompt_text or None
             # Handle event extraction setting
             current_user.extract_events = 'extract_events' in request.form
+            # Inquire content availability (agentic inquire). Gated on the
+            # marker field so form submissions without this section cannot
+            # clobber the settings (same reasoning as audio_player_position).
+            if 'inquire_privacy_section' in request.form:
+                current_user.inquire_allow_summaries = 'inquire_allow_summaries' in request.form
+                current_user.inquire_allow_notes = 'inquire_allow_notes' in request.form
             # Handle transcription hints
             hotwords = request.form.get('transcription_hotwords')
             current_user.transcription_hotwords = hotwords if hotwords else None
@@ -634,22 +871,35 @@ def account():
                 return tpl.id if tpl else None
 
             current_user.summary_include_timestamps = 'summary_include_timestamps' in request.form
+            # Gated on its marker field so another form cannot clear it (#440)
+            if 'summary_notes_section' in request.form:
+                current_user.summary_include_notes = 'summary_include_notes' in request.form
             current_user.summary_timestamp_template_id = _ts_template_id('summary_timestamp_template_id')
             current_user.chat_include_timestamps = 'chat_include_timestamps' in request.form
             current_user.chat_timestamp_template_id = _ts_template_id('chat_timestamp_template_id')
 
-        # Only update diarize if it's not locked by env var
-        if 'ASR_DIARIZE' not in os.environ:
-            current_user.diarize = 'diarize' in request.form
+        # Check if this is the export filename template form (#348)
+        elif 'export_filename_template' in request.form:
+            template_value = (request.form.get('export_filename_template') or '').strip()
+            # Path separators would let a template escape the per-user export
+            # directory; reject them outright.
+            if '/' in template_value or '\\' in template_value:
+                error_msg = translate('server.flash.exportTemplateSeparators')
+                if request.headers.get('X-Requested-With') == 'XMLHttpRequest' or request.accept_mimetypes.best == 'application/json':
+                    return jsonify({'success': False, 'error': error_msg}), 400
+                flash(error_msg, 'danger')
+                return redirect(url_for('auth.account'))
+            # Empty string = use the default template (recording_{{id}})
+            current_user.export_filename_template = template_value if template_value else None
 
         db.session.commit()
 
         # Return JSON response for AJAX requests
         if request.headers.get('X-Requested-With') == 'XMLHttpRequest' or request.accept_mimetypes.best == 'application/json':
-            return jsonify({'success': True, 'message': 'Account details updated successfully!'})
+            return jsonify({'success': True, 'message': translate('server.apiMessage.accountUpdated')})
 
         # Regular form submission with redirect
-        flash('Account details updated successfully!', 'success')
+        flash(translate('server.flash.accountUpdated'), 'success')
 
         # Preserve the active tab when redirecting
         if 'summary_prompt' in request.form:
@@ -666,8 +916,10 @@ def account():
         from src.config.prompts import DEFAULT_SUMMARY_PROMPT
         default_summary_prompt_text = DEFAULT_SUMMARY_PROMPT
 
-    asr_diarize_locked = 'ASR_DIARIZE' in os.environ
-    ASR_DIARIZE = os.environ.get('ASR_DIARIZE', 'false').lower() == 'true'
+    # The title instructions a user gets when they leave their own blank.
+    from src.tasks.processing import _user_title_instructions
+    default_title_prompt_text = _user_title_instructions(None)[0]
+
     USE_ASR_ENDPOINT = os.environ.get('USE_ASR_ENDPOINT', 'false').lower() == 'true'
     USE_NEW_TRANSCRIPTION_ARCHITECTURE = os.environ.get('USE_NEW_TRANSCRIPTION_ARCHITECTURE', 'true').lower() == 'true'
     ENABLE_AUTO_DELETION = os.environ.get('ENABLE_AUTO_DELETION', 'false').lower() == 'true'
@@ -679,17 +931,35 @@ def account():
     connector_supports_diarization = USE_ASR_ENDPOINT  # Default to USE_ASR_ENDPOINT for backwards compat
     connector_supports_hotwords = USE_ASR_ENDPOINT
     connector_supports_initial_prompt = USE_ASR_ENDPOINT
+    connector_supports_speaker_embeddings = ASR_RETURN_SPEAKER_EMBEDDINGS
     if USE_NEW_TRANSCRIPTION_ARCHITECTURE:
         try:
             from src.services.transcription import get_registry
+            from src.services.transcription.base import TranscriptionCapability
             registry = get_registry()
             connector = registry.get_active_connector()
             if connector:
                 connector_supports_diarization = connector.supports_diarization
                 connector_supports_hotwords = connector.supports_hotwords
                 connector_supports_initial_prompt = connector.supports_initial_prompt
+                # Query the live instance: the asr_endpoint connector adds the
+                # SPEAKER_EMBEDDINGS capability conditionally (only when its env
+                # flag is on), so the class-level set would be wrong.
+                connector_supports_speaker_embeddings = connector.supports(
+                    TranscriptionCapability.SPEAKER_EMBEDDINGS
+                )
         except Exception as e:
             current_app.logger.warning(f"Could not get connector capabilities: {e}")
+
+    # Speaker auto-labelling comes in two flavours. When the connector returns
+    # voice embeddings, matching is biometric and tuned by a confidence
+    # threshold. When it diarizes but returns no embeddings, we fall back to a
+    # contextual LLM match; the toggle should still be offered in that case (the
+    # threshold does not apply). Surfacing both lets the account page show the
+    # toggle for embedding-less connectors, where it used to be hidden.
+    contextual_labelling_available = (
+        connector_supports_diarization and not connector_supports_speaker_embeddings
+    )
 
     # Check if user is a team admin and get their admin groups
     admin_memberships = GroupMembership.query.filter_by(
@@ -723,9 +993,15 @@ def account():
     # Get user's UI language preference
     user_language = current_user.ui_language if current_user.ui_language else 'en'
 
+    from src.services.inquire_agent import get_availability as _get_inquire_availability
+    _inquire_availability = _get_inquire_availability(current_user)
+
     return render_template('account.html',
                            title='Account',
+                           storage_usage=_storage_usage(current_user),
+                           usage_limits=_usage_limits(current_user),
                            default_summary_prompt_text=default_summary_prompt_text,
+                           default_title_prompt_text=default_title_prompt_text,
                            use_asr_endpoint=USE_ASR_ENDPOINT,
                            connector_supports_diarization=connector_supports_diarization,
                            connector_supports_hotwords=connector_supports_hotwords,
@@ -733,8 +1009,6 @@ def account():
                            enable_auto_deletion=ENABLE_AUTO_DELETION,
                            enable_internal_sharing=ENABLE_INTERNAL_SHARING,
                            user_admin_groups=user_admin_groups,
-                           asr_diarize_locked=asr_diarize_locked,
-                           asr_diarize_env_value=ASR_DIARIZE,
                            is_team_admin=is_team_admin,
                            sso_enabled=sso_enabled,
                            sso_provider_name=sso_config.get('provider_name', 'SSO'),
@@ -742,11 +1016,15 @@ def account():
                            sso_subject=current_user.sso_subject,
                            has_password=bool(current_user.password),
                            password_login_disabled=password_login_disabled,
-                           speaker_embeddings_enabled=ASR_RETURN_SPEAKER_EMBEDDINGS,
+                           speaker_embeddings_enabled=connector_supports_speaker_embeddings,
+                           email_notifications_available=_email_notifications_available(current_user),
+                           contextual_labelling_available=contextual_labelling_available,
                            auto_speaker_labelling=current_user.auto_speaker_labelling,
                            auto_speaker_labelling_threshold=current_user.auto_speaker_labelling_threshold or 'medium',
                            admin_disabled_auto_summarization=admin_disabled_auto_summarization,
                            auto_summarization=current_user.auto_summarization if current_user.auto_summarization is not None else True,
+                           inquire_allow_summaries=_inquire_availability['summaries'],
+                           inquire_allow_notes=_inquire_availability['notes'],
                            user_language=user_language,
                            enable_auto_export=ENABLE_AUTO_EXPORT,
                            enable_auto_processing=os.environ.get('ENABLE_AUTO_PROCESSING', 'false').lower() == 'true')
@@ -759,7 +1037,7 @@ def update_auto_speaker_labelling():
     data = request.get_json()
 
     if data is None:
-        return jsonify({'success': False, 'error': 'Invalid JSON'}), 400
+        return jsonify({'success': False, **api_error('invalid_json')}), 400
 
     # Update enabled state
     if 'enabled' in data:
@@ -771,7 +1049,7 @@ def update_auto_speaker_labelling():
         if threshold in ('low', 'medium', 'high'):
             current_user.auto_speaker_labelling_threshold = threshold
         else:
-            return jsonify({'success': False, 'error': 'Invalid threshold value'}), 400
+            return jsonify({'success': False, **api_error('invalid_threshold')}), 400
 
     db.session.commit()
 
@@ -789,7 +1067,7 @@ def update_auto_summarization():
     data = request.get_json()
 
     if data is None:
-        return jsonify({'success': False, 'error': 'Invalid JSON'}), 400
+        return jsonify({'success': False, **api_error('invalid_json')}), 400
 
     if 'enabled' in data:
         current_user.auto_summarization = bool(data['enabled'])
@@ -809,7 +1087,7 @@ def change_password():
     sso_config = get_sso_config()
     password_login_disabled = is_sso_enabled() and sso_config.get('disable_password_login', False)
     if password_login_disabled and not current_user.is_admin:
-        flash('Password management is disabled. Please use SSO to sign in.', 'warning')
+        flash(translate('server.flash.passwordManagementDisabled'), 'warning')
         return redirect(url_for('auth.account'))
 
     current_password = request.form.get('current_password')
@@ -832,26 +1110,20 @@ def change_password():
     # We redirect them there instead of letting this endpoint set the
     # password without any second factor.
     if not has_existing_password:
-        flash(
-            'This account has no local password set. To add one, use the '
-            'Forgot Password link on the login page with your email '
-            'address; the reset email will let you set a password '
-            'securely.',
-            'warning',
-        )
+        flash(translate('server.flash.noLocalPassword'), 'warning')
         return redirect(url_for('auth.account'))
 
     # Validate form data - current password only required if user has one
     if has_existing_password and not current_password:
-        flash('Current password is required.', 'danger')
+        flash(translate('server.flash.currentPasswordRequired'), 'danger')
         return redirect(url_for('auth.account'))
 
     if not new_password or not confirm_password:
-        flash('New password and confirmation are required.', 'danger')
+        flash(translate('server.flash.newPasswordRequired'), 'danger')
         return redirect(url_for('auth.account'))
 
     if new_password != confirm_password:
-        flash('New password and confirmation do not match.', 'danger')
+        flash(translate('server.flash.newPasswordMismatch'), 'danger')
         return redirect(url_for('auth.account'))
 
     # Custom validation for new password
@@ -864,15 +1136,27 @@ def change_password():
     # Verify current password only if user has one
     if has_existing_password:
         if not bcrypt.check_password_hash(current_user.password, current_password):
-            flash('Current password is incorrect.', 'danger')
+            flash(translate('server.flash.currentPasswordIncorrect'), 'danger')
             return redirect(url_for('auth.account'))
 
     # Update password
     hashed_password = bcrypt.generate_password_hash(new_password).decode('utf-8')
     current_user.password = hashed_password
+    # Invalidate any outstanding password-reset link: a deliberate change must
+    # not leave an emailed reset token able to overwrite the new password.
+    current_user.password_reset_token = None
+    current_user.password_reset_sent_at = None
+    # Sign the account out of every other browser (#437), and sign this one
+    # in again with the new login id.
+    remembered = current_app.config.get('REMEMBER_COOKIE_NAME', 'remember_token') in request.cookies
+    current_user.end_all_sessions()
     db.session.commit()
+    # The real object, not the proxy: login_user stores what it is given as
+    # the request's user, and a stored proxy resolves to itself, so any later
+    # current_user access (the translated flash below) would recurse forever.
+    login_user(current_user._get_current_object(), remember=remembered)
 
-    flash('Your password has been updated!', 'success')
+    flash(translate('server.flash.passwordUpdated'), 'success')
     return redirect(url_for('auth.account'))
 
 

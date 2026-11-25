@@ -25,9 +25,18 @@ class Share(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     share_summary = db.Column(db.Boolean, default=True)
     share_notes = db.Column(db.Boolean, default=True)
+    # After this time the public link answers 404 (API v1 expires_in_days).
+    expires_at = db.Column(db.DateTime, nullable=True)
 
     user = db.relationship('User', backref=db.backref('shares', lazy=True, cascade='all, delete-orphan'))
     recording = db.relationship('Recording', backref=db.backref('shares', lazy=True, cascade='all, delete-orphan'))
+
+    # The recording lists count links by recording and the Shared
+    # Transcripts list reads them by user (D#483)
+    __table_args__ = (
+        db.Index('ix_share_recording_id', 'recording_id'),
+        db.Index('ix_share_user_id', 'user_id'),
+    )
 
     def to_dict(self):
         """Convert model to dictionary representation."""
@@ -39,7 +48,8 @@ class Share(db.Model):
             'share_summary': self.share_summary,
             'share_notes': self.share_notes,
             'recording_title': self.recording.title if self.recording else "N/A",
-            'audio_available': self.recording.audio_deleted_at is None if self.recording else True
+            'audio_available': self.recording.audio_deleted_at is None if self.recording else True,
+            'expires_at': self.expires_at.isoformat() if self.expires_at else None,
         }
 
 
@@ -74,8 +84,14 @@ class InternalShare(db.Model):
     owner = db.relationship('User', foreign_keys=[owner_id], backref=db.backref('shared_recordings', lazy=True, cascade='all, delete'))
     shared_with = db.relationship('User', foreign_keys=[shared_with_user_id], backref=db.backref('received_shares', lazy=True, cascade='all, delete'))
 
-    # Unique constraint: can't share same recording with same user twice
-    __table_args__ = (db.UniqueConstraint('recording_id', 'shared_with_user_id', name='unique_recording_share'),)
+    # Unique constraint: can't share same recording with same user twice.
+    # The recording lists find a user's shares by recipient and the Shared
+    # Transcripts list by owner (D#483).
+    __table_args__ = (
+        db.UniqueConstraint('recording_id', 'shared_with_user_id', name='unique_recording_share'),
+        db.Index('ix_internal_share_shared_with_user_id', 'shared_with_user_id'),
+        db.Index('ix_internal_share_owner_id', 'owner_id'),
+    )
 
     def to_dict(self):
         """Convert model to dictionary representation."""
@@ -136,7 +152,8 @@ class InternalShare(db.Model):
             requested_permissions: Dict with 'can_edit' and 'can_reshare' flags
 
         Returns:
-            Tuple of (is_valid: bool, error_message: str or None)
+            Tuple of (is_valid: bool, error code: str or None); the code is a
+            server.apiError key (#477)
         """
         # Owner can grant anything
         if recording.user_id == grantor_user.id:
@@ -147,11 +164,11 @@ class InternalShare(db.Model):
 
         # Validate edit permission
         if requested_permissions.get('can_edit', False) and not max_permissions['can_edit']:
-            return False, "You cannot grant edit permission because you do not have edit access"
+            return False, 'reshare_edit_not_permitted'
 
         # Validate reshare permission
         if requested_permissions.get('can_reshare', False) and not max_permissions['can_reshare']:
-            return False, "You cannot grant reshare permission because you do not have reshare access"
+            return False, 'reshare_reshare_not_permitted'
 
         return True, None
 
@@ -211,6 +228,7 @@ class SharedRecordingState(db.Model):
     personal_notes = db.Column(db.Text, nullable=True)  # Private notes only this user can see
     is_inbox = db.Column(db.Boolean, default=True)  # User's personal inbox status
     is_highlighted = db.Column(db.Boolean, default=False)  # User's personal highlight/favorite status
+    is_archived = db.Column(db.Boolean, default=False)  # User's personal archive status (#394)
     last_viewed = db.Column(db.DateTime, default=datetime.utcnow)
 
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
@@ -220,8 +238,12 @@ class SharedRecordingState(db.Model):
     recording = db.relationship('Recording', backref=db.backref('user_states', lazy=True, cascade='all, delete-orphan'))
     user = db.relationship('User', backref=db.backref('recording_states', lazy=True, cascade='all, delete-orphan'))
 
-    # Unique constraint: one state per user per recording
-    __table_args__ = (db.UniqueConstraint('recording_id', 'user_id', name='unique_user_recording_state'),)
+    # Unique constraint: one state per user per recording. The starred and
+    # inbox filters of the recording list read a user's states (D#483).
+    __table_args__ = (
+        db.UniqueConstraint('recording_id', 'user_id', name='unique_user_recording_state'),
+        db.Index('ix_shared_recording_state_user_id', 'user_id'),
+    )
 
     def to_dict(self):
         """Convert model to dictionary representation."""

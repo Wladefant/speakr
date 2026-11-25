@@ -39,6 +39,8 @@ exports/
 auto-process/
 
 # Non-runtime directories
+.cache/
+node_modules/
 temp/
 docs/
 site/
@@ -61,3 +63,7 @@ tests/
 !requirements*.txt
 LICENSE
 CLAUDE.md
+
+# Vendor files are downloaded and checksum-verified during the build; a local
+# copy must never replace them
+static/vendor/

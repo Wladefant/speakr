@@ -38,6 +38,7 @@ from datetime import datetime
 from flask import current_app
 
 from src.database import db
+from src.services.recording_deletion import delete_recording_completely
 from src.models import Recording, RecordingTag
 from src.services.job_queue import job_queue
 from src.services.storage.service import get_storage_service
@@ -109,6 +110,11 @@ def _concat_audio(input_paths: list, output_path: str) -> None:
         '-map', '[out]',
         '-c:a', 'aac',
         '-b:a', _MERGED_BITRATE,
+        # Put the moov atom first. Without this, MP4 output cannot be decoded
+        # from a non-seekable pipe — the WhisperX ASR webservice pipes uploads
+        # to ffmpeg stdin and silently decodes 0 samples, which surfaces as a
+        # pyannote "(channel, time) torch Tensor" 500 (#372).
+        '-movflags', '+faststart',
         output_path,
     ]
     _run_ffmpeg_command(cmd, f"merge concat of {len(input_paths)} recordings")
@@ -159,7 +165,7 @@ def _validate_sources(user, recording_ids, storage, require_settled=True):
 
 
 def create_merge_recording(user, recording_ids, title=None, delete_originals=False,
-                           require_settled=True, notes_source_id=_UNSET):
+                           require_settled=True, notes_source_id=_UNSET, remove_original_audio=False):
     """Validate sources and create a placeholder recording queued for merging.
 
     Runs in the request (or, with ``require_settled=False``, from the stitch
@@ -174,7 +180,13 @@ def create_merge_recording(user, recording_ids, title=None, delete_originals=Fal
     ordered_ids = [r.id for r in recordings]
 
     first = recordings[0]
-    merged_title = (title or '').strip() or f"{first.title or 'Recording'} (merged)"
+    # A typed title is kept. A blank title gets the upload placeholder, so the
+    # title step names the merged recording like an upload (AI title or naming
+    # template); without an LLM its fallback is the "<first title> (merged)"
+    # filename, the name merges had before (#412).
+    from src.utils.titles import resolve_upload_title, upload_title_source
+    user_title = (title or '').strip()
+    merged_name = user_title or f"{first.title or 'Recording'} (merged)"
 
     now = datetime.utcnow()
 
@@ -217,8 +229,9 @@ def create_merge_recording(user, recording_ids, title=None, delete_originals=Fal
 
     recording = Recording(
         audio_path=None,
-        original_filename=f"{merged_title}.m4a",
-        title=merged_title,
+        original_filename=f"{merged_name}.m4a",
+        title=resolve_upload_title(user_title, f"{merged_name}.m4a"),
+        title_source=upload_title_source(user_title),
         # 'QUEUED' matches what job_queue.enqueue() sets for a transcription-side
         # job; set it here too so the row is consistent even before enqueue.
         status='QUEUED',
@@ -253,6 +266,8 @@ def create_merge_recording(user, recording_ids, title=None, delete_originals=Fal
             order += 1
 
     db.session.commit()
+    from src.services.webhook_dispatch import emit_recording_created
+    emit_recording_created(recording)
 
     try:
         job_queue.enqueue(
@@ -262,6 +277,9 @@ def create_merge_recording(user, recording_ids, title=None, delete_originals=Fal
             params={
                 'source_ids': ordered_ids,
                 'delete_originals': bool(delete_originals),
+                # Keep the sources but remove their audio once the merged file
+                # is stored: frees the space, keeps transcripts and notes (#413).
+                'remove_original_audio': bool(remove_original_audio) and not delete_originals,
             },
             is_new_upload=True,
         )
@@ -283,23 +301,38 @@ def run_merge_job(recording, params):
     Raises MergeError on failure so the worker can flip the recording to FAILED.
     """
     source_ids = (params or {}).get('source_ids') or []
+    part_ids = (params or {}).get('part_ids') or []
     delete_originals = bool((params or {}).get('delete_originals', False))
+    remove_original_audio = bool((params or {}).get('remove_original_audio', False))
 
-    if len(source_ids) < 2:
+    if len(source_ids) < 2 and len(part_ids) < 2:
         raise MergeError("Merge job is missing its source recordings.")
 
     storage = get_storage_service()
 
     # Re-fetch and re-validate sources at run time (they may have changed since
-    # the request was made).
+    # the request was made). Files joined at upload arrive as UploadJoinParts
+    # claimed for this recording, not as recordings.
     sources = []
-    for rid in source_ids:
-        rec = db.session.get(Recording, rid)
-        if not rec or rec.user_id != recording.user_id:
-            raise MergeError("A source recording is no longer available.")
-        if not rec.audio_path or not storage.exists(rec.audio_path):
-            raise MergeError("Audio for a source recording is unavailable.")
-        sources.append(rec)
+    parts = []
+    if part_ids:
+        from src.models.upload_join import UploadJoinPart
+        for pid in part_ids:
+            part = db.session.get(UploadJoinPart, pid)
+            if not part or part.user_id != recording.user_id or part.recording_id != recording.id:
+                raise MergeError("An uploaded file to join is no longer available.")
+            if not part.audio_path or not storage.exists(part.audio_path):
+                raise MergeError("Audio for an uploaded file to join is unavailable.")
+            parts.append(part)
+    else:
+        for rid in source_ids:
+            rec = db.session.get(Recording, rid)
+            if not rec or rec.user_id != recording.user_id:
+                raise MergeError("A source recording is no longer available.")
+            if not rec.audio_path or not storage.exists(rec.audio_path):
+                raise MergeError("Audio for a source recording is unavailable.")
+            sources.append(rec)
+    locators = [p.audio_path for p in parts] or [r.audio_path for r in sources]
 
     now = datetime.utcnow()
     upload_folder = current_app.config['UPLOAD_FOLDER']
@@ -311,8 +344,8 @@ def run_merge_job(recording, params):
     try:
         with ExitStack() as stack:
             local_paths = []
-            for rec in sources:
-                materialized = stack.enter_context(storage.materialize(rec.audio_path))
+            for locator in locators:
+                materialized = stack.enter_context(storage.materialize(locator))
                 local_paths.append(materialized.local_path)
             _concat_audio(local_paths, staging_path)
 
@@ -354,20 +387,37 @@ def run_merge_job(recording, params):
         raise MergeError("Failed to store the merged recording.")
 
     # Delete originals only after the merged audio is safely stored.
+    if parts:
+        from src.services.upload_join import release_parts_media
+        release_parts_media(parts, storage)
     if delete_originals:
         for rec in sources:
             try:
-                _delete_recording(rec, storage)
+                delete_recording_completely(rec, storage=storage)
             except Exception as e:
+                db.session.rollback()
                 current_app.logger.warning(f"Failed to delete source recording {rec.id} after merge: {e}")
-        db.session.commit()
+    elif remove_original_audio:
+        # Same point as deletion: the merged audio is stored, so the sources'
+        # audio lives on in it. A source whose removal fails keeps its audio.
+        from src.services.retention import remove_recording_audio
+        for rec in sources:
+            if rec.audio_deleted_at:
+                continue
+            try:
+                remove_recording_audio(rec)
+            except Exception as e:
+                db.session.rollback()
+                current_app.logger.warning(f"Failed to remove the audio of source recording {rec.id} after merge: {e}")
 
     # Queue transcription with the SAME resolved params a normal upload gets, so
     # the merged file honors all of the owner's tag/folder/account preferences
     # (speaker-count hints, hotwords, initial prompt, transcription model) and
     # therefore diarization + auto speaker labelling behave identically (#323).
+    # A join at upload carries the params its upload resolved, which include
+    # the dialog's language, speaker count, hotwords and model.
     from src.services.transcription_defaults import resolve_transcription_params
-    job_params = resolve_transcription_params(recording)
+    job_params = (params or {}).get('transcribe_params') or resolve_transcription_params(recording)
     job_queue.enqueue(
         user_id=recording.user_id,
         recording_id=recording.id,
@@ -375,16 +425,6 @@ def run_merge_job(recording, params):
         params=job_params,
         is_new_upload=True,
     )
-
-
-def _delete_recording(recording, storage):
-    """Delete a source recording's audio and row. Best-effort on the file."""
-    if recording.audio_path:
-        try:
-            storage.delete(recording.audio_path, missing_ok=True)
-        except Exception as e:
-            current_app.logger.warning(f"Could not delete audio for recording {recording.id}: {e}")
-    db.session.delete(recording)
 
 
 def _safe_unlink(path):

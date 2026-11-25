@@ -8,7 +8,7 @@ import json
 import time
 import logging
 import httpx
-from openai import OpenAI, APITimeoutError
+from openai import OpenAI, APITimeoutError, BadRequestError
 
 # Use standard logging instead of current_app.logger for context independence
 logger = logging.getLogger(__name__)
@@ -84,6 +84,30 @@ CHAT_MODEL_NAME = os.environ.get("CHAT_MODEL_NAME")
 CHAT_GPT5_REASONING_EFFORT = os.environ.get("CHAT_GPT5_REASONING_EFFORT")
 CHAT_GPT5_VERBOSITY = os.environ.get("CHAT_GPT5_VERBOSITY")
 
+# Provider-specific request parameters, as a JSON object merged into the body
+# of every request to the model (OpenAI SDK extra_body). Reasoning controls
+# differ by provider and model (reasoning_effort, OpenRouter's reasoning
+# object, chat_template_kwargs on vLLM), so they are set here, not mapped.
+def _parse_extra_body(env_var):
+    """Return (parameters, error) for a JSON object in env_var."""
+    raw = os.environ.get(env_var, "").strip()
+    if not raw:
+        return {}, None
+    try:
+        value = json.loads(raw)
+    except ValueError as e:
+        return {}, f"{env_var} is not valid JSON ({e})"
+    if not isinstance(value, dict):
+        return {}, f"{env_var} must be a JSON object, such as {{\"reasoning_effort\": \"low\"}}"
+    return value, None
+
+
+TEXT_MODEL_EXTRA_BODY, TEXT_MODEL_EXTRA_BODY_ERROR = _parse_extra_body("TEXT_MODEL_EXTRA_BODY")
+CHAT_MODEL_EXTRA_BODY, CHAT_MODEL_EXTRA_BODY_ERROR = _parse_extra_body("CHAT_MODEL_EXTRA_BODY")
+for _error in (TEXT_MODEL_EXTRA_BODY_ERROR, CHAT_MODEL_EXTRA_BODY_ERROR):
+    if _error:
+        logger.error(f"{_error}; requests to that model will fail until it is corrected.")
+
 # Streaming options - disable for LLM servers that don't support OpenAI's stream_options
 ENABLE_STREAM_OPTIONS = os.environ.get("ENABLE_STREAM_OPTIONS", "true").lower() == "true"
 
@@ -102,26 +126,50 @@ llm_timeout = httpx.Timeout(
 )
 
 
+def _gpt5_mode_forced(env_var="GPT5_FORCE_MODE"):
+    """Whether GPT-5 parameter handling is forced on via environment variable.
+
+    The autodetection requires api.openai.com in the base URL, which misses
+    GPT-5 models served through Azure AI Foundry or other gateways (#367).
+    """
+    return str(os.environ.get(env_var, "")).strip().lower() in ("true", "1", "yes")
+
+
 def get_chat_config():
     """
     Get chat model configuration, falling back to TEXT_MODEL if not set.
 
     Returns a dict with api_key, base_url, model_name, and GPT-5 settings.
+    A dedicated chat model needs CHAT_MODEL_NAME and either its own key or
+    its own base URL; a local server often needs no key at all (#403).
     """
-    if CHAT_MODEL_API_KEY and CHAT_MODEL_NAME:
+    if CHAT_MODEL_NAME and (CHAT_MODEL_API_KEY or CHAT_MODEL_BASE_URL):
         return {
-            'api_key': CHAT_MODEL_API_KEY,
+            # The text model's key goes only to the text model's server.
+            'api_key': CHAT_MODEL_API_KEY or (TEXT_MODEL_API_KEY if (CHAT_MODEL_BASE_URL or TEXT_MODEL_BASE_URL) == TEXT_MODEL_BASE_URL else None),
             'base_url': CHAT_MODEL_BASE_URL or TEXT_MODEL_BASE_URL,
             'model_name': CHAT_MODEL_NAME,
             'gpt5_reasoning_effort': CHAT_GPT5_REASONING_EFFORT or os.environ.get("GPT5_REASONING_EFFORT", "medium"),
-            'gpt5_verbosity': CHAT_GPT5_VERBOSITY or os.environ.get("GPT5_VERBOSITY", "medium")
+            'gpt5_verbosity': CHAT_GPT5_VERBOSITY or os.environ.get("GPT5_VERBOSITY", "medium"),
+            # A separate chat model does not inherit GPT5_FORCE_MODE: it may
+            # be a different (non-GPT-5) model than the main text model.
+            'gpt5_force': _gpt5_mode_forced("CHAT_GPT5_FORCE_MODE"),
+            # Like GPT5_FORCE_MODE, the text model's parameters are not
+            # inherited: they may not suit a different model or server.
+            'extra_body': CHAT_MODEL_EXTRA_BODY,
+            'extra_body_variable': 'CHAT_MODEL_EXTRA_BODY',
+            'extra_body_error': CHAT_MODEL_EXTRA_BODY_ERROR,
         }
     return {
         'api_key': TEXT_MODEL_API_KEY,
         'base_url': TEXT_MODEL_BASE_URL,
         'model_name': TEXT_MODEL_NAME,
         'gpt5_reasoning_effort': os.environ.get("GPT5_REASONING_EFFORT", "medium"),
-        'gpt5_verbosity': os.environ.get("GPT5_VERBOSITY", "medium")
+        'gpt5_verbosity': os.environ.get("GPT5_VERBOSITY", "medium"),
+        'gpt5_force': _gpt5_mode_forced(),
+        'extra_body': TEXT_MODEL_EXTRA_BODY,
+        'extra_body_variable': 'TEXT_MODEL_EXTRA_BODY',
+        'extra_body_error': TEXT_MODEL_EXTRA_BODY_ERROR,
     }
 
 
@@ -137,8 +185,15 @@ http_client_no_proxy = httpx.Client(
     headers=app_headers
 )
 
-# Create client with placeholder key if not provided (allows app to start)
+# A language model is configured when it has a key or its server address was
+# set explicitly; a local server often needs no key (#403). Without either,
+# no client is created and nothing is sent: the default address is a hosted
+# service, and a transcript must never go there unasked.
+TEXT_MODEL_CONFIGURED = bool(TEXT_MODEL_API_KEY) or bool(os.environ.get("TEXT_MODEL_BASE_URL", "").split('#')[0].strip())
+
 try:
+    if not TEXT_MODEL_CONFIGURED:
+        raise RuntimeError("no text model configured (set TEXT_MODEL_BASE_URL, and TEXT_MODEL_API_KEY for a hosted service)")
     api_key = TEXT_MODEL_API_KEY or "not-needed"
     client = OpenAI(
         api_key=api_key,
@@ -157,27 +212,52 @@ try:
 except Exception as client_init_e:
     client = None
 
-# Create chat client (may be same as main client if no separate config)
-chat_client = None
-try:
+def _build_chat_client():
+    """The chat client: the main client, or a dedicated one when the chat
+    model has its own key or server. The key is optional, since a local
+    server often runs without one (#403)."""
     chat_config = get_chat_config()
-    if chat_config['api_key']:
-        if CHAT_MODEL_API_KEY and CHAT_MODEL_API_KEY != TEXT_MODEL_API_KEY:
-            # Separate chat configuration - create dedicated client
-            chat_client = OpenAI(
-                api_key=chat_config['api_key'],
-                base_url=chat_config['base_url'],
-                http_client=http_client_no_proxy,
-                timeout=llm_timeout,
-                max_retries=LLM_MAX_RETRIES,
-            )
-            logger.info(f"Separate chat client initialized: {chat_config['base_url']} / {chat_config['model_name']}")
-        else:
-            # Use same client as main LLM
-            chat_client = client
+    if (chat_config['api_key'], chat_config['base_url']) == (TEXT_MODEL_API_KEY, TEXT_MODEL_BASE_URL):
+        return client
+    if not (CHAT_MODEL_API_KEY or CHAT_MODEL_BASE_URL or TEXT_MODEL_CONFIGURED):
+        return None
+    dedicated = OpenAI(
+        api_key=chat_config['api_key'] or "not-needed",
+        base_url=chat_config['base_url'],
+        http_client=http_client_no_proxy,
+        timeout=llm_timeout,
+        max_retries=LLM_MAX_RETRIES,
+    )
+    logger.info(f"Separate chat client initialized: {chat_config['base_url']} / {chat_config['model_name']}")
+    return dedicated
+
+
+# Create chat client (may be same as main client if no separate config)
+try:
+    chat_client = _build_chat_client()
 except Exception as chat_client_init_e:
     logger.warning(f"Failed to initialize chat client, falling back to main client: {chat_client_init_e}")
     chat_client = client
+
+
+def _add_extra_body(completion_args, extra_body, error):
+    """Merge the configured request parameters into completion_args.
+
+    They are applied last, so they take precedence over the parameters set
+    above (temperature, max_tokens, the GPT-5 settings)."""
+    if error:
+        raise ValueError(error)
+    if extra_body:
+        completion_args["extra_body"] = dict(extra_body)
+
+
+def _log_rejected_parameters(error, variable, extra_body):
+    """Name the request parameters setting when the provider rejects a request."""
+    if extra_body and isinstance(error, BadRequestError):
+        logger.error(
+            f"The model server rejected the request. {variable} adds "
+            f"{', '.join(sorted(extra_body))}; check that the server accepts these parameters."
+        )
 
 
 def is_gpt5_model(model_name):
@@ -208,6 +288,10 @@ def is_using_openai_api():
 
 
 
+class LLMNotConfiguredError(ValueError):
+    """No text model is configured; the API answers with text_model_not_configured."""
+
+
 def call_llm_completion(messages, temperature=0.7, response_format=None, stream=False, max_tokens=None,
                         user_id=None, operation_type=None):
     """
@@ -226,10 +310,7 @@ def call_llm_completion(messages, temperature=0.7, response_format=None, stream=
         OpenAI completion object or generator (if streaming)
     """
     if not client:
-        raise ValueError("LLM client not initialized")
-
-    if not TEXT_MODEL_API_KEY:
-        raise ValueError("TEXT_MODEL_API_KEY not configured")
+        raise LLMNotConfiguredError("No text model is configured. Set TEXT_MODEL_BASE_URL, and TEXT_MODEL_API_KEY for a hosted service.")
 
     # Check budget before making the call
     if user_id and operation_type:
@@ -247,8 +328,9 @@ def call_llm_completion(messages, temperature=0.7, response_format=None, stream=
             logger.warning(f"Budget check failed for user {user_id}: {e}")
 
     try:
-        # Check if we're using GPT-5 with OpenAI API
-        using_gpt5 = is_gpt5_model(TEXT_MODEL_NAME) and is_using_openai_api()
+        # Check if we're using GPT-5 with OpenAI API (or forced via env for
+        # Azure AI Foundry and other gateways the URL check can't detect)
+        using_gpt5 = _gpt5_mode_forced() or (is_gpt5_model(TEXT_MODEL_NAME) and is_using_openai_api())
 
         completion_args = {
             "model": TEXT_MODEL_NAME,
@@ -286,6 +368,8 @@ def call_llm_completion(messages, temperature=0.7, response_format=None, stream=
 
         if response_format:
             completion_args["response_format"] = response_format
+
+        _add_extra_body(completion_args, TEXT_MODEL_EXTRA_BODY, TEXT_MODEL_EXTRA_BODY_ERROR)
 
         # Make the resolved max_tokens visible in logs so users can confirm
         # their SUMMARY_MAX_TOKENS / CHAT_MAX_TOKENS / etc. settings actually
@@ -347,11 +431,12 @@ def call_llm_completion(messages, temperature=0.7, response_format=None, stream=
         raise
     except Exception as e:
         logger.error(f"LLM API call failed: {e}")
+        _log_rejected_parameters(e, 'TEXT_MODEL_EXTRA_BODY', TEXT_MODEL_EXTRA_BODY)
         raise
 
 
 def call_chat_completion(messages, temperature=0.7, response_format=None, stream=False, max_tokens=None,
-                         user_id=None, operation_type=None):
+                         user_id=None, operation_type=None, tools=None, tool_choice=None):
     """
     Chat-specific LLM completion function. Uses dedicated chat model if configured,
     otherwise falls back to standard TEXT_MODEL configuration.
@@ -364,6 +449,9 @@ def call_chat_completion(messages, temperature=0.7, response_format=None, stream
         max_tokens: Optional maximum tokens to generate
         user_id: Optional user ID for token tracking and budget enforcement
         operation_type: Optional operation type for token tracking (e.g., 'chat')
+        tools: Optional list of tool schemas (OpenAI function-calling format).
+            Only sent when provided, so non-agent call sites are unaffected.
+        tool_choice: Optional tool_choice value, passed through when tools are set.
 
     Returns:
         OpenAI completion object or generator (if streaming)
@@ -373,9 +461,6 @@ def call_chat_completion(messages, temperature=0.7, response_format=None, stream
 
     if not effective_client:
         raise ValueError("Chat LLM client not initialized")
-
-    if not chat_config['api_key']:
-        raise ValueError("Chat model API key not configured")
 
     # Check budget before making the call
     if user_id and operation_type:
@@ -396,8 +481,9 @@ def call_chat_completion(messages, temperature=0.7, response_format=None, stream
         model_name = chat_config['model_name']
         base_url = chat_config['base_url'] or ''
 
-        # Check if we're using GPT-5 with OpenAI API
-        using_gpt5 = is_gpt5_model(model_name) and 'api.openai.com' in base_url
+        # Check if we're using GPT-5 with OpenAI API (or forced via env for
+        # Azure AI Foundry and other gateways the URL check can't detect)
+        using_gpt5 = chat_config['gpt5_force'] or (is_gpt5_model(model_name) and 'api.openai.com' in base_url)
 
         completion_args = {
             "model": model_name,
@@ -425,6 +511,13 @@ def call_chat_completion(messages, temperature=0.7, response_format=None, stream
 
         if response_format:
             completion_args["response_format"] = response_format
+
+        if tools:
+            completion_args["tools"] = tools
+            if tool_choice:
+                completion_args["tool_choice"] = tool_choice
+
+        _add_extra_body(completion_args, chat_config['extra_body'], chat_config['extra_body_error'])
 
         # Visibility: surface the resolved budget per call so admins can
         # confirm CHAT_MAX_TOKENS or per-call overrides took effect.
@@ -479,6 +572,7 @@ def call_chat_completion(messages, temperature=0.7, response_format=None, stream
         raise
     except Exception as e:
         logger.error(f"Chat LLM API call failed: {e}")
+        _log_rejected_parameters(e, chat_config['extra_body_variable'], chat_config['extra_body'])
         raise
 
 
@@ -522,8 +616,17 @@ def process_streaming_with_thinking(stream, user_id=None, operation_type=None, m
     content_buffer = ""
     in_thinking = False
     thinking_buffer = ""
+    finish_reason = None
 
     for chunk in stream:
+        # Capture the provider's final finish_reason so truncation
+        # (finish_reason == 'length') survives to the terminal SSE event
+        # instead of being silently dropped (issue #349).
+        if chunk.choices:
+            chunk_finish = getattr(chunk.choices[0], 'finish_reason', None)
+            if chunk_finish:
+                finish_reason = chunk_finish
+
         # Check for usage in final chunk (from stream_options={'include_usage': True})
         if hasattr(chunk, 'usage') and chunk.usage and user_id and operation_type:
             try:
@@ -613,8 +716,14 @@ def process_streaming_with_thinking(stream, user_id=None, operation_type=None, m
         # Regular content
         yield f"data: {json.dumps({'delta': content_buffer})}\n\n"
 
-    # Signal the end of the stream
-    yield f"data: {json.dumps({'end_of_stream': True})}\n\n"
+    # Signal the end of the stream, propagating the provider's finish_reason
+    # so the frontend can flag truncated (finish_reason == 'length') responses.
+    end_event = {'end_of_stream': True}
+    if finish_reason:
+        end_event['finish_reason'] = finish_reason
+        if finish_reason == 'length':
+            end_event['truncated'] = True
+    yield f"data: {json.dumps(end_event)}\n\n"
 
 
 

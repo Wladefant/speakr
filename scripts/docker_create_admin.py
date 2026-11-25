@@ -37,7 +37,7 @@ def create_admin_user_from_env():
     
     # Get values from environment variables
     username = os.environ.get('ADMIN_USERNAME')
-    email = os.environ.get('ADMIN_EMAIL')
+    email = User.normalize_email(os.environ.get('ADMIN_EMAIL'))
     password = os.environ.get('ADMIN_PASSWORD')
     
     # Validate required environment variables
@@ -50,14 +50,21 @@ def create_admin_user_from_env():
         print("Error: Username must be at least 3 characters long.")
         sys.exit(1)
     
-    # Validate email (skip DNS/MX check if SKIP_EMAIL_DOMAIN_CHECK=true)
-    skip_domain_check = os.environ.get('SKIP_EMAIL_DOMAIN_CHECK', 'false').lower() == 'true'
+    # Validate the address format only. The administrator chose this address
+    # in the environment, and a domain that does not receive mail (such as
+    # the example.com placeholder in the example configuration) must not stop
+    # the container from starting. Self-registration keeps the full check.
     try:
-        validate_email(email, check_deliverability=not skip_domain_check)
+        validate_email(email, check_deliverability=False)
     except EmailNotValidError as e:
         print(f"Error: Invalid email: {str(e)}")
         sys.exit(1)
     
+    # The username column holds 20 characters
+    if not 2 <= len(username) <= 20:
+        print("Error: ADMIN_USERNAME must be 2 to 20 characters long.")
+        sys.exit(1)
+
     # Validate password
     if len(password) < 8:
         print("Error: Password must be at least 8 characters long.")
@@ -71,8 +78,8 @@ def create_admin_user_from_env():
             print(f"User with username '{username}' already exists.")
             sys.exit(0)
         
-        # Check if email already exists
-        existing_email = db.session.query(User).filter_by(email=email).first()
+        # Check if email already exists (case-insensitive)
+        existing_email = User.find_by_email(email)
         if existing_email:
             print(f"User with email '{email}' already exists.")
             sys.exit(0)

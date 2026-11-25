@@ -6,20 +6,59 @@
 import * as RecordingDB from '../db/recording-persistence.js';
 import * as IncognitoStorage from '../db/incognito-storage.js';
 import * as ServerSessions from '../db/server-recording-sessions.js';
+import {
+    findExternalAudioInputCandidates,
+    getAudioInputCandidateSignature,
+    shouldAutoOfferExternalAudioInput
+} from '../utils/platform.js';
+
+export function buildMicrophoneConstraints(deviceId = '', disableAudioProcessing = false) {
+    const constraints = {
+        echoCancellation: !disableAudioProcessing,
+        noiseSuppression: !disableAudioProcessing,
+        autoGainControl: !disableAudioProcessing,
+        sampleRate: 48000
+    };
+    if (deviceId) constraints.deviceId = { exact: deviceId };
+    return constraints;
+}
+
+export function isUnavailableAudioInputError(error) {
+    return error?.name === 'NotFoundError' || error?.name === 'OverconstrainedError';
+}
+
+export async function acquireMicrophoneStream(mediaDevices, options = {}) {
+    const deviceId = options.deviceId || '';
+    const disableAudioProcessing = !!options.disableAudioProcessing;
+
+    try {
+        const stream = await mediaDevices.getUserMedia({
+            audio: buildMicrophoneConstraints(deviceId, disableAudioProcessing)
+        });
+        return { stream, requestedDeviceId: deviceId, usedFallback: false, originalError: null };
+    } catch (error) {
+        if (!deviceId || !isUnavailableAudioInputError(error)) throw error;
+
+        const stream = await mediaDevices.getUserMedia({
+            audio: buildMicrophoneConstraints('', disableAudioProcessing)
+        });
+        return { stream, requestedDeviceId: deviceId, usedFallback: true, originalError: error };
+    }
+}
 
 export function useAudio(state, utils) {
     const {
-        isRecording, mediaRecorder, audioContext, analyser, micAnalyser, systemAnalyser,
+        isRecording, isPaused, mediaRecorder, audioContext, analyser, micAnalyser, systemAnalyser,
         audioChunks, recordingTime, recordingInterval, recordingMode, audioBlobURL,
         estimatedFileSize, actualBitrate, recordingNotes, recordingQuality,
-        maxRecordingMB, fileSizeWarningShown, sizeCheckInterval, recordingDisclaimer,
+        maxRecordingMB, fileSizeWarningShown, sizeCheckInterval, isServerStreamedRecording, isFinalizingRecording, recordingDisclaimer,
         showRecordingDisclaimerModal, pendingRecordingMode, currentView, showUploadModal, showSystemAudioHelp, disableAudioProcessing,
         recordSystemVideo, recordingVideoActive, videoRetentionEnabled,
-        selectedMicDeviceId, selectedSecondaryDeviceId,
+        inputAudioDevices, selectedMicDeviceId, selectedSecondaryDeviceId,
         isDarkMode, wakeLock, animationFrameId,
         activeStreams, visualizer, micVisualizer, systemVisualizer, canRecordAudio,
         canRecordSystemAudio, systemAudioSupported, systemAudioError, globalError,
-        selectedTagIds, selectedFolderId, asrLanguage, asrMinSpeakers, asrMaxSpeakers, uploadQueue,
+        selectedTagIds, selectedFolderId, asrLanguage, asrMinSpeakers, asrMaxSpeakers, asrInitialPrompt, asrHotwords, asrTranscriptionModel, uploadQueue,
         progressPopupMinimized, progressPopupClosed,
         // Incognito mode
         enableIncognitoMode, incognitoMode, incognitoRecording, incognitoProcessing,
@@ -39,6 +78,63 @@ export function useAudio(state, utils) {
     // estimate reflects the WHOLE recording, not just the new segment.
     let serverResumePriorBytes = 0;
 
+    const isPreparingRecording = Vue.ref(false);
+    const pendingMicrophoneSelection = Vue.ref(null);
+    let pendingMicrophoneSelectionResolver = null;
+    let dismissedMicrophoneCandidateSignature = '';
+    const dismissedCandidateStorageKey = 'dismissedExternalMicCandidateSignature';
+
+    try {
+        dismissedMicrophoneCandidateSignature = sessionStorage.getItem(dismissedCandidateStorageKey) || '';
+    } catch (_) { /* sessionStorage may be unavailable in private contexts */ }
+
+    const rememberDismissedMicrophoneCandidates = (signature) => {
+        dismissedMicrophoneCandidateSignature = signature || '';
+        try {
+            sessionStorage.setItem(dismissedCandidateStorageKey, dismissedMicrophoneCandidateSignature);
+        } catch (_) { /* keep the in-memory fallback */ }
+    };
+
+    const waitForMicrophoneSelection = (candidates, activeDeviceId) => new Promise((resolve) => {
+        const signature = getAudioInputCandidateSignature(candidates);
+        pendingMicrophoneSelection.value = {
+            candidates,
+            activeDeviceId: activeDeviceId || '',
+            candidateSignature: signature
+        };
+        pendingMicrophoneSelectionResolver = resolve;
+    });
+
+    const resolveMicrophoneSelection = (result) => {
+        const resolver = pendingMicrophoneSelectionResolver;
+        pendingMicrophoneSelectionResolver = null;
+        pendingMicrophoneSelection.value = null;
+        if (resolver) resolver(result);
+    };
+
+    const confirmPendingMicrophoneSelection = () => {
+        const deviceId = (selectedMicDeviceId && selectedMicDeviceId.value) || '';
+        const pending = pendingMicrophoneSelection.value;
+        if (!deviceId && pending?.candidateSignature) {
+            rememberDismissedMicrophoneCandidates(pending.candidateSignature);
+        }
+        resolveMicrophoneSelection(deviceId
+            ? { action: 'select', deviceId }
+            : { action: 'continue', deviceId: '' });
+    };
+
+    const cancelPendingMicrophoneSelection = () => {
+        resolveMicrophoneSelection({ action: 'cancel', deviceId: '' });
+    };
+
+    if (typeof Vue !== 'undefined' && Vue.watch && showUploadModal) {
+        Vue.watch(showUploadModal, (visible) => {
+            if (!visible && pendingMicrophoneSelection.value) {
+                cancelPendingMicrophoneSelection();
+            }
+        });
+    }
+
     // Phase B: server-side chunk streaming (#287 c/d). Feature-flagged via
     // the page-level dataset attribute `data-server-recording-chunks`
     // (rendered by Flask from ENABLE_SERVER_RECORDING_CHUNKS). When the
@@ -48,6 +144,9 @@ export function useAudio(state, utils) {
     //
     // None of this is exposed on the shared state surface yet; the UI to
     // monitor sync backlog lands in Phase C.
+    // startTime of the crash-recovery session this recording is saved under,
+    // handed to the upload so only that session is cleared afterwards (#407).
+    let currentRecordingSessionStartTime = null;
     let serverSessionId = null;
     let serverSessionUploader = null;
     let serverSessionMimeType = 'audio/webm';
@@ -78,6 +177,7 @@ export function useAudio(state, utils) {
         serverSessionId = null;
         serverSessionUploader = null;
         serverSessionLastError = null;
+        if (isServerStreamedRecording) isServerStreamedRecording.value = false;
     }
 
     // Pick the best MediaRecorder container for the capture. Video captures
@@ -216,7 +316,7 @@ export function useAudio(state, utils) {
             return true;
         } catch (error) {
             console.warn('[iOS Wake Lock] Failed to start silent audio:', error);
-            showToast('iOS wake lock may not work - keep screen active', 'warning');
+            showToast((utils.t && utils.t('toasts.iosWakeLockUnreliable')) || 'iOS wake lock may not work - keep screen active', 'warning');
             return false;
         }
     };
@@ -251,15 +351,15 @@ export function useAudio(state, utils) {
                 return true;
             } else {
                 console.warn('[WakeLock] Wake Lock API not supported');
-                showToast('Screen may sleep during recording', 'info');
+                showToast((utils.t && utils.t('toasts.screenMaySleep')) || 'Screen may sleep during recording', 'info');
                 return false;
             }
         } catch (err) {
             console.warn('[WakeLock] Could not acquire:', err.message);
             if (err.name === 'NotAllowedError') {
-                showToast('Screen lock permission denied', 'warning');
+                showToast((utils.t && utils.t('toasts.wakeLockPermissionDenied')) || 'Screen lock permission denied', 'warning');
             } else if (err.name === 'NotSupportedError') {
-                showToast('Wake lock not supported on this device', 'info');
+                showToast((utils.t && utils.t('toasts.wakeLockUnsupported')) || 'Wake lock not supported on this device', 'info');
             }
             return false;
         }
@@ -306,68 +406,122 @@ export function useAudio(state, utils) {
             console.log('[Visibility] Page visible, re-acquiring wake lock');
             const acquired = await acquireWakeLock();
             if (acquired) {
-                showToast('Recording resumed - screen will stay awake', 'success');
+                showToast((utils.t && utils.t('toasts.recordingResumedScreenAwake')) || 'Recording resumed - screen will stay awake', 'success');
             }
         } else if (document.visibilityState === 'hidden' && isRecording.value) {
             console.log('[Visibility] Page hidden, wake lock may be released by browser');
         }
     };
 
-    // Start recording
-    // IMPORTANT: For Firefox, getDisplayMedia MUST be the first async call from user gesture
-    const startRecording = async (mode = 'microphone', resumeContext = null) => {
-        const needsDisplayMedia = mode === 'system' || mode === 'both';
+    const refreshAudioDeviceLists = async () => {
+        if (utils.refreshVirtualAudioDevices) utils.refreshVirtualAudioDevices();
+        if (utils.refreshInputAudioDevices) return await utils.refreshInputAudioDevices();
+        return (inputAudioDevices && inputAudioDevices.value) || [];
+    };
 
-        // For system audio modes, get display media FIRST before any other operations
-        // This is required for Firefox's "transient activation" security model
-        if (needsDisplayMedia) {
-            try {
-                const displayStream = await navigator.mediaDevices.getDisplayMedia({
-                    video: true,
-                    audio: true
-                });
+    const showSelectedMicrophoneUnavailable = () => {
+        const message = (utils.t && utils.t('recording.selectedMicUnavailable'))
+            || 'The selected microphone is no longer available. Using the system default.';
+        showToast(message, 'fa-exclamation-triangle');
+    };
 
-                // Check if we got an audio track
-                const audioTrack = displayStream.getAudioTracks()[0];
-                if (!audioTrack) {
-                    displayStream.getTracks().forEach(track => track.stop());
-                    // Open the platform-aware help modal so the user
-                    // gets per-OS guidance instead of a bare toast.
-                    if (showSystemAudioHelp) showSystemAudioHelp.value = true;
-                    showToast('No audio track came through — see the help guide for per-OS setup.', 'fa-exclamation-triangle');
-                    return;
-                }
-
-                // Store stream for use after disclaimer (if any)
-                pendingDisplayStream = displayStream;
-            } catch (error) {
-                console.error('[Recording] Failed to get display media:', error);
-                if (error.name === 'NotAllowedError') {
-                    showToast('Screen sharing was cancelled', 'error');
-                } else {
-                    showToast(`Failed to capture: ${error.message}`, 'error');
-                }
-                return;
-            }
-        }
-
-        // Now check for disclaimer (after we've secured the display stream)
-        if (recordingDisclaimer.value && recordingDisclaimer.value.trim() !== '') {
-            showRecordingDisclaimerModal.value = true;
-            pendingRecordingMode.value = mode;
-            pendingResumeContext = resumeContext;
+    const requestMicrophonePermission = async () => {
+        if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
+            showToast(
+                (utils.t && utils.t('recording.micPermissionUnavailable'))
+                    || 'Microphone access is not available. Make sure you are using HTTPS.',
+                'error'
+            );
             return;
         }
 
-        await startRecordingInternal(mode, resumeContext);
+        let permissionStream = null;
+        try {
+            permissionStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            await refreshAudioDeviceLists();
+        } catch (error) {
+            const denied = error?.name === 'NotAllowedError' || error?.name === 'SecurityError';
+            showToast(
+                (utils.t && utils.t(denied ? 'recording.microphonePermissionDenied' : 'recording.micPermissionFailed'))
+                    || (denied
+                        ? 'Microphone permission was denied. Allow access in your browser settings and try again.'
+                        : 'Could not access the microphone. Check that it is connected and not in use.'),
+                'error'
+            );
+        } finally {
+            if (permissionStream) permissionStream.getTracks().forEach(track => track.stop());
+        }
+    };
+
+    // Start recording
+    // IMPORTANT: For Firefox, getDisplayMedia MUST be the first async call from user gesture
+    const startRecording = async (mode = 'microphone', resumeContext = null) => {
+        if (isPreparingRecording.value || isRecording.value) return;
+        isPreparingRecording.value = true;
+
+        try {
+            const needsDisplayMedia = mode === 'system' || mode === 'both';
+
+            // For system audio modes, get display media FIRST before any other operations
+            // This is required for Firefox's "transient activation" security model
+            if (needsDisplayMedia) {
+                try {
+                    const displayStream = await navigator.mediaDevices.getDisplayMedia({
+                        video: true,
+                        audio: true,
+                        audioSelection: 'preferred'
+                    });
+
+                    // Check if we got an audio track
+                    const audioTrack = displayStream.getAudioTracks()[0];
+                    if (!audioTrack) {
+                        displayStream.getTracks().forEach(track => track.stop());
+                        // Open the platform-aware help modal so the user
+                        // gets per-OS guidance instead of a bare toast.
+                        if (showSystemAudioHelp) showSystemAudioHelp.value = true;
+                        showToast((utils.t && utils.t('toasts.noAudioTrackSeeHelp')) || 'No audio track came through — see the help guide for per-OS setup.', 'fa-exclamation-triangle');
+                        return;
+                    }
+
+                    // Store stream for use after disclaimer (if any)
+                    pendingDisplayStream = displayStream;
+                } catch (error) {
+                    console.error('[Recording] Failed to get display media:', error);
+                    if (error.name === 'NotAllowedError') {
+                        showToast((utils.t && utils.t('toasts.screenShareCancelled')) || 'Screen sharing was cancelled', 'error');
+                    } else {
+                        showToast((utils.t && utils.t('toasts.captureFailed', { error: error.message })) || `Failed to capture: ${error.message}`, 'error');
+                    }
+                    return;
+                }
+            }
+
+            // Now check for disclaimer (after we've secured the display stream)
+            if (recordingDisclaimer.value && recordingDisclaimer.value.trim() !== '') {
+                showRecordingDisclaimerModal.value = true;
+                pendingRecordingMode.value = mode;
+                pendingResumeContext = resumeContext;
+                return;
+            }
+
+            await startRecordingInternal(mode, resumeContext);
+        } finally {
+            isPreparingRecording.value = false;
+        }
     };
 
     // Accept recording disclaimer and start recording
     const acceptRecordingDisclaimer = async () => {
+        if (isPreparingRecording.value || isRecording.value) return;
+        isPreparingRecording.value = true;
         showRecordingDisclaimerModal.value = false;
         const resumeContext = pendingResumeContext;
         pendingResumeContext = null;
-        await startRecordingInternal(pendingRecordingMode.value || 'microphone', resumeContext);
+        try {
+            await startRecordingInternal(pendingRecordingMode.value || 'microphone', resumeContext);
+        } finally {
+            isPreparingRecording.value = false;
+        }
     };
 
     // Cancel recording disclaimer
@@ -386,10 +540,37 @@ export function useAudio(state, utils) {
     // existing server session after a page reload: a fresh MediaRecorder keeps
     // POSTing chunks to the same session id, and its header chunk starts a new
     // segment that the server-side assembly concatenates onto the prior audio.
+    // Storage quota (#413): a new recording starts only below the quota, and
+    // once started it is kept whatever its length. A failed check never
+    // blocks the recorder.
+    const hasStorageRoom = async () => {
+        try {
+            const response = await fetch('/api/account/storage', { credentials: 'same-origin' });
+            if (!response.ok) return true;
+            const usage = await response.json();
+            if (!usage.quota_bytes || usage.used_bytes < usage.quota_bytes) return true;
+            const message = (utils.t && utils.t('storageQuota.recordingBlocked', {
+                used: formatFileSize(usage.used_bytes), quota: formatFileSize(usage.quota_bytes),
+            })) || 'Your storage is full. Delete recordings or remove their audio before recording again.';
+            setGlobalError(message);
+            return false;
+        } catch (e) {
+            return true;
+        }
+    };
+
     const startRecordingInternal = async (mode, resumeContext = null) => {
+        if (!resumeContext && !(incognitoMode && incognitoMode.value) && !(await hasStorageRoom())) {
+            if (pendingDisplayStream) {
+                pendingDisplayStream.getTracks().forEach(track => track.stop());
+                pendingDisplayStream = null;
+            }
+            return;
+        }
         try {
             recordingMode.value = mode;
             recordingVideoActive.value = false;
+            if (isPaused) isPaused.value = false;
             audioChunks.value = [];
             // On resume, continue the on-screen timer and size estimate from
             // where the prior segment left off so both reflect the WHOLE
@@ -398,6 +579,21 @@ export function useAudio(state, utils) {
             serverResumePriorBytes = (resumeContext && resumeContext.priorBytes) || 0;
             estimatedFileSize.value = serverResumePriorBytes;
             fileSizeWarningShown.value = false;
+
+            // A resumed recording already has chunks on the server, so it
+            // cannot become incognito: processing it in incognito would send
+            // only the locally-held new segment (silent partial audio) and
+            // discard the prior one. Force the toggle off — relevant when
+            // INCOGNITO_MODE_DEFAULT is on or the user flipped it earlier.
+            if (resumeContext && resumeContext.sessionId && incognitoMode && incognitoMode.value) {
+                incognitoMode.value = false;
+                showToast(
+                    (utils.t && utils.t('toasts.resumedRecordingNotIncognito'))
+                        || 'Incognito was turned off: this resumed recording was already streaming to the server.',
+                    'fa-user-secret',
+                    7000
+                );
+            }
 
             // Initialize IndexedDB session
             currentChunkIndex = 0;
@@ -417,7 +613,7 @@ export function useAudio(state, utils) {
 
             if (mode === 'microphone') {
                 if (!canRecordAudio.value) {
-                    throw new Error('Microphone recording is not available. Make sure you are using HTTPS.');
+                    throw new Error((utils.t && utils.t('recording.micPermissionUnavailable')) || 'Microphone recording is not available. Make sure you are using HTTPS.');
                 }
                 // When the user is routing system audio in via a
                 // monitor source / virtual audio device, the default
@@ -429,37 +625,73 @@ export function useAudio(state, utils) {
                 // as a toggle in the upload modal next to the mic
                 // button and persisted in localStorage.
                 const skipProc = disableAudioProcessing && disableAudioProcessing.value;
-                const buildConstraints = (deviceId) => {
-                    const c = {
-                        echoCancellation: !skipProc,
-                        noiseSuppression: !skipProc,
-                        autoGainControl: !skipProc,
-                        sampleRate: 48000
-                    };
-                    if (deviceId) c.deviceId = { exact: deviceId };
-                    return c;
-                };
+                let primaryDeviceId = (selectedMicDeviceId && selectedMicDeviceId.value) || '';
 
-                const primaryDeviceId = (selectedMicDeviceId && selectedMicDeviceId.value) || '';
+                // Acquire first, then enumerate. Browsers reveal useful
+                // device labels only after the normal microphone permission
+                // grant initiated by the user's click.
+                let primaryResult = await acquireMicrophoneStream(navigator.mediaDevices, {
+                    deviceId: primaryDeviceId,
+                    disableAudioProcessing: skipProc
+                });
+                let micStreamA = primaryResult.stream;
+                activeStreams.value = [micStreamA];
+
+                if (primaryResult.usedFallback) {
+                    primaryDeviceId = '';
+                    if (selectedMicDeviceId) selectedMicDeviceId.value = '';
+                    showSelectedMicrophoneUnavailable();
+                }
+
+                const refreshedInputs = await refreshAudioDeviceLists();
+                const activeDeviceId = micStreamA.getAudioTracks()[0]?.getSettings?.().deviceId || '';
+
+                // Mobile browsers generally lack the desktop browser's own
+                // microphone chooser. Only offer Speakr's inline fallback on
+                // mobile, when no explicit selection is active and the browser
+                // exposes a confidently separate physical input. Desktop keeps
+                // its native chooser without a second automatic selection step.
+                // Never offer during a resume: a continued session must keep
+                // its original input, and the prompt UI lives inside the
+                // upload modal, which a crash-recovery resume may not have
+                // open — awaiting the selection there would hang forever
+                // with the record buttons stuck disabled.
+                if (!primaryDeviceId && !resumeContext && shouldAutoOfferExternalAudioInput()) {
+                    const candidates = findExternalAudioInputCandidates(refreshedInputs, activeDeviceId);
+                    const candidateSignature = getAudioInputCandidateSignature(candidates);
+                    if (candidates.length > 0
+                        && candidateSignature
+                        && candidateSignature !== dismissedMicrophoneCandidateSignature) {
+                        const selection = await waitForMicrophoneSelection(candidates, activeDeviceId);
+                        if (selection.action === 'cancel') {
+                            micStreamA.getTracks().forEach(track => track.stop());
+                            activeStreams.value = [];
+                            return;
+                        }
+
+                        if (selection.action === 'select' && selection.deviceId) {
+                            primaryDeviceId = selection.deviceId;
+                            if (primaryDeviceId !== activeDeviceId) {
+                                micStreamA.getTracks().forEach(track => track.stop());
+                                activeStreams.value = [];
+                                primaryResult = await acquireMicrophoneStream(navigator.mediaDevices, {
+                                    deviceId: primaryDeviceId,
+                                    disableAudioProcessing: skipProc
+                                });
+                                micStreamA = primaryResult.stream;
+                                activeStreams.value = [micStreamA];
+                                if (primaryResult.usedFallback) {
+                                    primaryDeviceId = '';
+                                    if (selectedMicDeviceId) selectedMicDeviceId.value = '';
+                                    showSelectedMicrophoneUnavailable();
+                                }
+                            }
+                        }
+                    }
+                }
+
                 const secondaryDeviceId = (selectedSecondaryDeviceId && selectedSecondaryDeviceId.value) || '';
                 const wantsMix = !!secondaryDeviceId && secondaryDeviceId !== primaryDeviceId;
-
-                // Primary stream (the user's mic, or whatever they
-                // explicitly picked as the primary input).
-                const micStreamA = await navigator.mediaDevices.getUserMedia({
-                    audio: buildConstraints(primaryDeviceId)
-                });
-
-                // Now that the user has granted mic permission,
-                // device labels populate — re-scan for virtual audio
-                // routing devices (BlackHole / VB-Cable / monitor
-                // sources) so the upload modal can offer them. Also
-                // refresh the full input-device list for the picker
-                // (post-permission the labels are real names instead
-                // of opaque IDs).
-                if (utils.refreshVirtualAudioDevices) utils.refreshVirtualAudioDevices();
-                if (utils.refreshInputAudioDevices)   utils.refreshInputAudioDevices();
-
                 audioContext.value = new (window.AudioContext || window.webkitAudioContext)();
 
                 if (wantsMix) {
@@ -474,12 +706,16 @@ export function useAudio(state, utils) {
                     let micStreamB;
                     try {
                         micStreamB = await navigator.mediaDevices.getUserMedia({
-                            audio: buildConstraints(secondaryDeviceId)
+                            audio: buildMicrophoneConstraints(secondaryDeviceId, skipProc)
                         });
                     } catch (mixErr) {
                         console.warn('[Recording] Secondary input unavailable, falling back to primary only:', mixErr);
+                        if (isUnavailableAudioInputError(mixErr) && selectedSecondaryDeviceId) {
+                            selectedSecondaryDeviceId.value = '';
+                            refreshAudioDeviceLists();
+                        }
                         if (utils.showToast) utils.showToast(
-                            'Secondary input unavailable — recording primary only.',
+                            (utils.t && utils.t('toasts.secondaryInputUnavailable')) || 'Secondary input unavailable — recording primary only.',
                             'fa-exclamation-triangle'
                         );
                     }
@@ -517,7 +753,7 @@ export function useAudio(state, utils) {
 
             } else if (mode === 'system') {
                 if (!canRecordSystemAudio.value) {
-                    throw new Error('System audio recording is not available. Make sure you are using HTTPS.');
+                    throw new Error((utils.t && utils.t('errors.systemAudioUnavailableHttps')) || 'System audio recording is not available. Make sure you are using HTTPS.');
                 }
                 // Use pre-obtained display stream (required for Firefox user gesture)
                 // or get it now for browsers that don't require immediate call
@@ -533,7 +769,8 @@ export function useAudio(state, utils) {
                             echoCancellation: false,
                             noiseSuppression: false,
                             autoGainControl: false
-                        }
+                        },
+                        audioSelection: 'preferred'
                     };
                     stream = await navigator.mediaDevices.getDisplayMedia(displayMediaConstraints);
                 }
@@ -548,6 +785,7 @@ export function useAudio(state, utils) {
                     // acknowledged.
                     if (showSystemAudioHelp) showSystemAudioHelp.value = true;
                     throw new Error(
+                        (utils.t && utils.t('errors.noAudioTrackInScreenShare')) ||
                         'No audio track came through with the screen share. ' +
                         'Make sure you ticked "Share system audio" / "Share tab audio" ' +
                         'in the share dialog. The help guide that just opened has ' +
@@ -577,19 +815,24 @@ export function useAudio(state, utils) {
 
             } else if (mode === 'both') {
                 if (!canRecordAudio.value || !canRecordSystemAudio.value) {
-                    throw new Error('Recording is not available. Make sure you are using HTTPS.');
+                    throw new Error((utils.t && utils.t('errors.recordingUnavailableHttps')) || 'Recording is not available. Make sure you are using HTTPS.');
                 }
-                // Honour the disableAudioProcessing flag here too —
-                // see comment at the microphone-only path above.
+                // Honour the chosen primary input and the processing flag
+                // here too. Display capture was already acquired first in
+                // startRecording(), preserving Firefox's transient activation.
                 const skipProcBoth = disableAudioProcessing && disableAudioProcessing.value;
-                const micStream = await navigator.mediaDevices.getUserMedia({
-                    audio: {
-                        echoCancellation: !skipProcBoth,
-                        noiseSuppression: !skipProcBoth,
-                        autoGainControl: !skipProcBoth,
-                        sampleRate: 48000
-                    }
+                const selectedDeviceId = (selectedMicDeviceId && selectedMicDeviceId.value) || '';
+                const micResult = await acquireMicrophoneStream(navigator.mediaDevices, {
+                    deviceId: selectedDeviceId,
+                    disableAudioProcessing: skipProcBoth
                 });
+                const micStream = micResult.stream;
+                activeStreams.value = [micStream];
+                if (micResult.usedFallback) {
+                    if (selectedMicDeviceId) selectedMicDeviceId.value = '';
+                    showSelectedMicrophoneUnavailable();
+                }
+                await refreshAudioDeviceLists();
 
                 // Use pre-obtained display stream or get it now
                 const isFirefox = navigator.userAgent.toLowerCase().indexOf('firefox') > -1;
@@ -605,7 +848,8 @@ export function useAudio(state, utils) {
                             echoCancellation: false,
                             noiseSuppression: false,
                             autoGainControl: false
-                        }
+                        },
+                        audioSelection: 'preferred'
                     });
                 }
 
@@ -617,6 +861,7 @@ export function useAudio(state, utils) {
                     // sees per-OS setup instead of a generic error.
                     if (showSystemAudioHelp) showSystemAudioHelp.value = true;
                     throw new Error(
+                        (utils.t && utils.t('errors.noAudioTrackInScreenShare')) ||
                         'No audio track came through with the screen share. ' +
                         'Make sure you ticked "Share system audio" / "Share tab audio" ' +
                         'in the share dialog. The help guide that just opened has ' +
@@ -691,18 +936,24 @@ export function useAudio(state, utils) {
             }
 
             // Start IndexedDB recording session - convert Vue reactive objects to plain objects
+            currentRecordingSessionStartTime = null;
             try {
-                await RecordingDB.startRecordingSession({
+                const savedSession = await RecordingDB.startRecordingSession({
                     mode,
                     notes: recordingNotes.value || '',
                     tags: selectedTagIds.value ? [...selectedTagIds.value] : [], // Convert reactive array to plain array
                     asrOptions: {
                         language: asrLanguage.value || '',
                         min_speakers: asrMinSpeakers.value || '',
-                        max_speakers: asrMaxSpeakers.value || ''
+                        max_speakers: asrMaxSpeakers.value || '',
+                        initial_prompt: asrInitialPrompt.value || '',
+                        hotwords: asrHotwords.value || '',
+                        transcription_model: asrTranscriptionModel.value || ''
                     },
-                    mimeType
+                    mimeType,
+                    incognito: !!(incognitoMode && incognitoMode.value)
                 });
+                currentRecordingSessionStartTime = savedSession ? savedSession.startTime : null;
             } catch (dbError) {
                 console.warn('[Recording] IndexedDB persistence failed, continuing without persistence:', dbError);
             }
@@ -712,7 +963,15 @@ export function useAudio(state, utils) {
             // straight to the server. A failure here logs and falls back to
             // local-only recording — the user's audio is never blocked on
             // a network round-trip.
-            if (_serverRecordingChunksEnabled()) {
+            //
+            // Incognito recordings never open a session: the whole point of
+            // incognito is that audio does not touch server storage until the
+            // explicit process-without-saving upload, so they stay on the
+            // in-browser path (RAM + IndexedDB, 200 MB cap) regardless of the
+            // streaming flag. The resume guard above already cleared the
+            // toggle for resumed server sessions, so this cannot strand a
+            // half-uploaded session.
+            if (_serverRecordingChunksEnabled() && !(incognitoMode && incognitoMode.value)) {
                 try {
                     let startIndex = 1;
                     if (resumeContext && resumeContext.sessionId) {
@@ -739,6 +998,10 @@ export function useAudio(state, utils) {
                             }
                         },
                     });
+                    // Mirror the streaming state into a ref so the recording
+                    // view can hide the size-limit warning UI (#332), which
+                    // only applies to the in-RAM legacy path.
+                    if (isServerStreamedRecording) isServerStreamedRecording.value = true;
                 } catch (e) {
                     serverSessionLastError = e;
                     console.warn('[Recording] Could not open server session; falling back to local-only:', e);
@@ -813,8 +1076,38 @@ export function useAudio(state, utils) {
             const appEl = document.getElementById('app');
             const maxHoursAttr = appEl?.dataset?.recordingMaxHours;
             const recordingMaxSeconds = Math.max(60, parseFloat(maxHoursAttr || '8') * 3600);
+            // Warn once at 80% of the ceiling (matching the size warning's
+            // threshold convention) so a long recording never just cuts off
+            // by surprise. `>=` plus a flag, not `===`: a recovered/resumed
+            // recording restores recordingTime past the mark in one jump and
+            // then gets the warning on its first tick.
+            let durationWarningShown = false;
+            // Advance the counter by real elapsed wall time instead of by
+            // tick count (#341): mobile browsers (iOS especially) suspend
+            // timers while the screen is locked, so counting ticks makes the
+            // displayed duration fall far behind the actual recording even
+            // though the audio itself keeps capturing. On return from
+            // background the first tick folds in the whole missed interval.
+            let lastTickMs = Date.now();
             recordingInterval.value = setInterval(() => {
-                recordingTime.value++;
+                const nowMs = Date.now();
+                // Freeze the elapsed-time counter while paused (#338). The
+                // interval keeps running so the max-duration closure survives a
+                // pause/resume; it just skips ticking (and absorbs the gap so
+                // paused time never counts).
+                if (isPaused && isPaused.value) { lastTickMs = nowMs; return; }
+                recordingTime.value += Math.max(0, Math.round((nowMs - lastTickMs) / 1000));
+                lastTickMs = nowMs;
+                if (!durationWarningShown && recordingTime.value >= recordingMaxSeconds * 0.8) {
+                    durationWarningShown = true;
+                    const minutesLeft = Math.max(1, Math.round((recordingMaxSeconds - recordingTime.value) / 60));
+                    showToast(
+                        (utils.t && utils.t('toasts.recordingMaxDurationApproaching', { minutes: minutesLeft }))
+                            || `Recording will stop automatically in about ${minutesLeft} minutes (maximum duration reached).`,
+                        'fa-exclamation-triangle',
+                        7000
+                    );
+                }
                 if (recordingTime.value >= recordingMaxSeconds) {
                     stopRecording();
                     showToast(
@@ -848,7 +1141,7 @@ export function useAudio(state, utils) {
 
         } catch (error) {
             console.error('Recording error:', error);
-            setGlobalError(`Failed to start recording: ${error.message}`);
+            setGlobalError((utils.t && utils.t('errors.startRecordingFailed', { error: error.message })) || `Failed to start recording: ${error.message}`);
 
             // Clean up any started streams
             if (activeStreams.value.length > 0) {
@@ -867,10 +1160,62 @@ export function useAudio(state, utils) {
     };
 
     // Stop recording
+    // Pause an in-progress recording. MediaRecorder.pause() freezes the media
+    // timeline, so the audio resumes contiguously with no silent gap — meeting
+    // breaks are simply excluded from the recording (#338). Works on every
+    // capture path (mic/system/both, legacy in-RAM and server-streamed) since
+    // it operates purely at the MediaRecorder level.
+    const pauseRecording = () => {
+        const recorder = mediaRecorder.value;
+        if (!recorder || !isRecording.value || (isPaused && isPaused.value)) return;
+        if (recorder.state !== 'recording') return;
+        try {
+            recorder.pause();
+        } catch (e) {
+            console.warn('[Recording] pause() failed:', e);
+            return;
+        }
+        if (isPaused) isPaused.value = true;
+        // The capture tracks stay live while paused, so freeze the level meter —
+        // otherwise it would keep animating to incoming (unrecorded) audio.
+        if (animationFrameId.value) {
+            cancelAnimationFrame(animationFrameId.value);
+            animationFrameId.value = null;
+        }
+        showToast(
+            (utils.t && utils.t('toasts.recordingPaused')) || 'Recording paused',
+            'fa-circle-pause',
+            3000
+        );
+    };
+
+    // Resume a paused recording: MediaRecorder continues the same stream, so the
+    // assembled file stays a single valid container (no new header).
+    const resumeRecording = () => {
+        const recorder = mediaRecorder.value;
+        if (!recorder || !isRecording.value || !(isPaused && isPaused.value)) return;
+        if (recorder.state !== 'paused') return;
+        try {
+            recorder.resume();
+        } catch (e) {
+            console.warn('[Recording] resume() failed:', e);
+            return;
+        }
+        if (isPaused) isPaused.value = false;
+        drawVisualizers();  // restart the level meter
+        showToast(
+            (utils.t && utils.t('toasts.recordingResumed')) || 'Recording resumed',
+            'fa-circle-play',
+            3000
+        );
+    };
+
+    // Stop recording
     const stopRecording = async () => {
         if (mediaRecorder.value && isRecording.value) {
             mediaRecorder.value.stop();
             isRecording.value = false;
+            if (isPaused) isPaused.value = false;
             _detachVideoPreview();
 
             // Clear the recording timer
@@ -912,10 +1257,11 @@ export function useAudio(state, utils) {
         }
     };
 
-    // Upload recorded audio
-    const uploadRecordedAudio = async (opts = {}) => {
+    // Upload recorded audio (inner implementation — call uploadRecordedAudio,
+    // which adds the re-entrancy guard and button state around this).
+    const _uploadRecordedAudioInner = async (opts = {}) => {
         if (!audioBlobURL.value) {
-            setGlobalError("No recorded audio to upload.");
+            setGlobalError((utils.t && utils.t('errors.noRecordedAudioToUpload')) || 'No recorded audio to upload.');
             return;
         }
         // Optional merge intent: when present, the server routes the stitched
@@ -953,6 +1299,9 @@ export function useAudio(state, utils) {
                     language: asrLanguage.value || null,
                     min_speakers: asrMinSpeakers.value || null,
                     max_speakers: asrMaxSpeakers.value || null,
+                    initial_prompt: asrInitialPrompt.value || null,
+                    hotwords: asrHotwords.value || null,
+                    transcription_model: asrTranscriptionModel.value || null,
                 };
                 if (mergeIntent) {
                     metadata.merge_intent = mergeIntent;
@@ -983,7 +1332,7 @@ export function useAudio(state, utils) {
                 // panel so the queued recording appears immediately, the same
                 // way a drag-drop upload does (instead of only after a manual
                 // page refresh).
-                currentView.value = null;
+                currentView.value = selectedRecording.value ? 'detail' : null;
                 showUploadModal.value = false;
                 try { await utils.onServerRecordingQueued?.(); } catch (_) { /* non-fatal */ }
                 return result;
@@ -1019,12 +1368,16 @@ export function useAudio(state, utils) {
             asrOptions: {
                 language: asrLanguage.value,
                 min_speakers: asrMinSpeakers.value,
-                max_speakers: asrMaxSpeakers.value
+                max_speakers: asrMaxSpeakers.value,
+                initial_prompt: asrInitialPrompt.value,
+                hotwords: asrHotwords.value,
+                transcription_model: asrTranscriptionModel.value
             },
             status: 'queued',
             recordingId: null,
             clientId: queueClientId,
             fromInProgressRecording: true,  // marker: upload-success handler clears RecordingDB session
+            recordingSessionStartTime: currentRecordingSessionStartTime,  // clear only this session (#407)
             error: null,
             willAutoSummarize: false // Server will tell us via SUMMARIZING status
         });
@@ -1046,11 +1399,17 @@ export function useAudio(state, utils) {
         asrLanguage.value = '';
         asrMinSpeakers.value = '';
         asrMaxSpeakers.value = '';
+        asrInitialPrompt.value = '';
+        asrHotwords.value = '';
+        asrTranscriptionModel.value = '';
         await releaseWakeLock();
         await hideRecordingNotification();
 
         // Return to upload modal so the user can finish the upload form.
-        currentView.value = null;
+        // Behind the modal, land on the open recording's detail view when one
+        // is selected (a bare null left a blank main area if the user then
+        // cancelled the modal).
+        currentView.value = selectedRecording.value ? 'detail' : null;
         showUploadModal.value = true;
 
         // Start upload immediately
@@ -1059,6 +1418,27 @@ export function useAudio(state, utils) {
 
         if (startUploadQueue) {
             startUploadQueue();
+        }
+    };
+
+    // Public entry point: re-entrancy guard + button state around the inner
+    // upload. Draining the chunk backlog before finalize can take many
+    // seconds with no other visible change, so users double-click — and
+    // every extra call used to send another finalize for the same session,
+    // minting duplicate recordings. The server is idempotent about replayed
+    // finalizes now, but the first line of defense is not sending them:
+    // ignore clicks while one upload is in flight and let the template
+    // disable the buttons via isFinalizingRecording.
+    const uploadRecordedAudio = async (opts = {}) => {
+        if (isFinalizingRecording && isFinalizingRecording.value) {
+            console.log('[Recording] Upload already in progress; ignoring duplicate request');
+            return;
+        }
+        if (isFinalizingRecording) isFinalizingRecording.value = true;
+        try {
+            return await _uploadRecordedAudioInner(opts);
+        } finally {
+            if (isFinalizingRecording) isFinalizingRecording.value = false;
         }
     };
 
@@ -1090,10 +1470,11 @@ export function useAudio(state, utils) {
     // Called by the merge modal (recording mode) on confirm: finalize the
     // recording session with the merge intent. `orderedSpec` is the ordered
     // source list with the string '__self__' marking this clip's position.
-    const finalizeRecordingMerge = async (orderedSpec, { deleteOriginals = true, title = undefined, notesSource = undefined } = {}) => {
+    const finalizeRecordingMerge = async (orderedSpec, { deleteOriginals = true, removeOriginalAudio = false, title = undefined, notesSource = undefined } = {}) => {
         const mergeIntent = {
             order: orderedSpec,
             delete_originals: !!deleteOriginals,
+            remove_original_audio: !deleteOriginals && !!removeOriginalAudio,
             title: title || undefined,
         };
         // notesSource: '__self__' | <id> | null. Only include the key when the
@@ -1107,7 +1488,7 @@ export function useAudio(state, utils) {
     // Upload recorded audio in incognito mode
     const uploadRecordedAudioIncognito = async () => {
         if (!audioBlobURL.value) {
-            setGlobalError("No recorded audio to upload.");
+            setGlobalError((utils.t && utils.t('errors.noRecordedAudioToUpload')) || 'No recorded audio to upload.');
             return;
         }
 
@@ -1116,6 +1497,29 @@ export function useAudio(state, utils) {
             console.warn('[Incognito] Incognito state not available, falling back to normal upload');
             uploadRecordedAudio();
             return;
+        }
+
+        // The recording may have streamed to a server session before the user
+        // chose incognito in the review pane (incognito recordings never OPEN
+        // a session, but the toggle can be flipped after a normal recording
+        // finishes). Honor the choice: delete the server-side chunks up front,
+        // before processing, rather than only after success via
+        // discardRecording. Refuse outright if part of the audio exists ONLY
+        // on the server (resumed session) — incognito-processing just the
+        // local segment would silently truncate the recording. That state
+        // should be unreachable (the resume path clears the toggle), so this
+        // is defense-in-depth.
+        if (serverSessionId) {
+            if (serverResumePriorBytes > 0) {
+                setGlobalError((utils.t && utils.t('errors.incognitoResumedNotAllowed')) || 'This resumed recording cannot be processed in incognito because its earlier audio exists only on the server. Use the normal upload instead.');
+                return;
+            }
+            try {
+                await ServerSessions.abortSession(serverSessionId);
+            } catch (e) {
+                console.warn('[Incognito] Could not abort server session before incognito processing:', e);
+            }
+            _resetServerSessionState();
         }
 
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -1129,7 +1533,7 @@ export function useAudio(state, utils) {
             : _rawRecordedFile;
 
         incognitoProcessing.value = true;
-        processingMessage.value = 'Processing recording in incognito mode...';
+        processingMessage.value = (utils.t && utils.t('incognito.processingInProgress')) || 'Processing recording in incognito mode...';
         processingProgress.value = 10;
         progressPopupMinimized.value = false;
         progressPopupClosed.value = false;
@@ -1148,11 +1552,17 @@ export function useAudio(state, utils) {
             if (asrMaxSpeakers.value && asrMaxSpeakers.value !== '') {
                 formData.append('max_speakers', asrMaxSpeakers.value.toString());
             }
+            if (asrInitialPrompt.value && asrInitialPrompt.value.trim()) {
+                formData.append('initial_prompt', asrInitialPrompt.value.trim());
+            }
+            if (asrHotwords.value && asrHotwords.value.trim()) {
+                formData.append('hotwords', asrHotwords.value.trim());
+            }
 
             // Request auto-summarization
             formData.append('auto_summarize', 'true');
 
-            processingMessage.value = 'Uploading recording for incognito processing...';
+            processingMessage.value = (utils.t && utils.t('incognito.uploadingRecording')) || 'Uploading recording for incognito processing...';
             processingProgress.value = 20;
 
             console.log('[Incognito] Uploading recorded audio');
@@ -1169,23 +1579,23 @@ export function useAudio(state, utils) {
             if (!contentType.includes('application/json')) {
                 const text = await response.text();
                 const titleMatch = text.match(/<title>([^<]+)<\/title>/i);
-                throw new Error(titleMatch?.[1] || `Server error (${response.status})`);
+                throw new Error(titleMatch?.[1] || (utils.t && utils.t('errors.serverErrorStatus', { status: response.status })) || `Server error (${response.status})`);
             }
 
             const data = await response.json();
 
             if (!response.ok || data.error) {
-                throw new Error(data.error || `Processing failed with status ${response.status}`);
+                throw new Error(data.error || (utils.t && utils.t('errors.processingFailedWithStatus', { status: response.status })) || `Processing failed with status ${response.status}`);
             }
 
             processingProgress.value = 80;
-            processingMessage.value = 'Processing complete!';
+            processingMessage.value = (utils.t && utils.t('incognito.processingComplete')) || 'Processing complete!';
 
             // Store result in sessionStorage
             const incognitoData = {
                 id: 'incognito',
                 incognito: true,
-                title: data.title || 'Incognito Recording',
+                title: data.title || (utils.t && utils.t('incognito.recordingTitle')) || 'Incognito Recording',
                 transcription: data.transcription,
                 summary: data.summary,
                 summary_html: data.summary_html,
@@ -1214,7 +1624,7 @@ export function useAudio(state, utils) {
             await discardRecording();
 
             processingProgress.value = 100;
-            processingMessage.value = 'Incognito recording ready!';
+            processingMessage.value = (utils.t && utils.t('incognito.recordingReady')) || 'Incognito recording ready!';
 
             // Auto-select the incognito recording and switch to detail view
             selectedRecording.value = incognitoData;
@@ -1228,13 +1638,13 @@ export function useAudio(state, utils) {
             incognitoMode.value = false;
 
             // Show toast
-            showToast('Incognito recording processed - data will be lost when tab closes', 'fa-user-secret');
+            showToast((utils.t && utils.t('incognito.recordingProcessed')) || 'Incognito recording processed - data will be lost when tab closes', 'fa-user-secret');
 
             console.log('[Incognito] Recording processing complete');
 
         } catch (error) {
             console.error('[Incognito] Recording processing failed:', error);
-            setGlobalError(`Incognito processing failed: ${error.message}`);
+            setGlobalError((utils.t && utils.t('incognito.processingFailed', { error: error.message })) || `Incognito processing failed: ${error.message}`);
         } finally {
             incognitoProcessing.value = false;
             // Reset the shared processing-progress state so it isn't left
@@ -1263,6 +1673,7 @@ export function useAudio(state, utils) {
         audioBlobURL.value = null;
         audioChunks.value = [];
         isRecording.value = false;
+        if (isPaused) isPaused.value = false;
         recordingTime.value = 0;
         if (recordingInterval.value) clearInterval(recordingInterval.value);
         recordingNotes.value = '';
@@ -1270,6 +1681,9 @@ export function useAudio(state, utils) {
         asrLanguage.value = '';
         asrMinSpeakers.value = '';
         asrMaxSpeakers.value = '';
+        asrInitialPrompt.value = '';
+        asrHotwords.value = '';
+        asrTranscriptionModel.value = '';
 
         // If a server-side session was open (Phase B of #287 c/d), abort it
         // so the chunks on disk are reaped immediately rather than waiting
@@ -1294,7 +1708,10 @@ export function useAudio(state, utils) {
         await hideRecordingNotification();
 
         // Return to upload modal so the user can finish the upload form.
-        currentView.value = null;
+        // Behind the modal, land on the open recording's detail view when one
+        // is selected (a bare null left a blank main area if the user then
+        // cancelled the modal).
+        currentView.value = selectedRecording.value ? 'detail' : null;
         showUploadModal.value = true;
     };
 
@@ -1361,6 +1778,8 @@ export function useAudio(state, utils) {
     // Update file size estimate
     const updateFileSizeEstimate = () => {
         if (!isRecording.value || !audioChunks.value.length) return;
+        // No new chunks arrive while paused (#338); leave the estimate frozen.
+        if (isPaused && isPaused.value) return;
 
         // Include bytes already uploaded before a resume so the estimate (and
         // the derived bitrate) reflect the whole recording, not just the new
@@ -1373,15 +1792,22 @@ export function useAudio(state, utils) {
             actualBitrate.value = (totalSize * 8) / recordingTime.value;
         }
 
-        // Phase C of #287 (c)(d): the 200 MB cap used to be a hard auto-stop
-        // because the entire blob was held in browser RAM and would crash
-        // the tab past a certain size. When server-side chunk streaming is
-        // active that constraint goes away — chunks flush to the server as
-        // they are produced. We still surface a soft warning at the same
-        // threshold so users know they are recording a large file, but the
-        // hard auto-stop is replaced by an absolute hours-based ceiling
-        // (`RECORDING_MAX_HOURS`, default 8) so a runaway recording from a
-        // misclick still has a backstop.
+        // Phase C of #287 (c)(d): the 200 MB cap exists because on the legacy
+        // path the entire blob is held in browser RAM and would crash the tab
+        // past a certain size. When server-side chunk streaming is active that
+        // constraint goes away — chunks flush to the server as they are
+        // produced, so NO size-based warning or stop applies (#332: warning
+        // users about a limit that does not exist was alarming them). The
+        // ceiling in streaming mode is hours-based (`RECORDING_MAX_HOURS`,
+        // default 8, warned about and enforced in the recording-time tick) so
+        // a runaway recording from a misclick still has a backstop.
+        if (serverSessionUploader) {
+            return;
+        }
+
+        // Legacy single-shot path: soft-warn at 80% of the cap, then hard
+        // auto-stop at the cap so the in-memory blob does not run the tab
+        // out of RAM.
         const sizeMB = totalSize / (1024 * 1024);
         const warningThresholdMB = maxRecordingMB.value * 0.8;
 
@@ -1395,18 +1821,10 @@ export function useAudio(state, utils) {
             );
         }
 
-        // Server-streaming path: no client-side hard size cap. The absolute
-        // ceiling is hours-based and lives in the recording-time tick below.
-        if (serverSessionUploader) {
-            return;
-        }
-
-        // Legacy single-shot path: keep the hard auto-stop at the configured
-        // size so the in-memory blob does not run the tab out of RAM.
         if (sizeMB > maxRecordingMB.value) {
             stopRecording();
             showToast(
-                `Recording automatically stopped at ${formatFileSize(totalSize)}`,
+                (utils.t && utils.t('toasts.recordingAutoStoppedAtSize', { size: formatFileSize(totalSize) })) || `Recording automatically stopped at ${formatFileSize(totalSize)}`,
                 'fa-stop-circle',
                 7000
             );
@@ -1444,6 +1862,7 @@ export function useAudio(state, utils) {
 
             // Restore chunks
             audioChunks.value = recovered.chunks;
+            currentRecordingSessionStartTime = recovered.metadata.startTime || null;
 
             // Create blob URL. Also restore the recording's mime type so the
             // legacy upload path builds the File with the right container
@@ -1462,6 +1881,16 @@ export function useAudio(state, utils) {
                 asrLanguage.value = recovered.metadata.asrOptions.language || '';
                 asrMinSpeakers.value = recovered.metadata.asrOptions.min_speakers || '';
                 asrMaxSpeakers.value = recovered.metadata.asrOptions.max_speakers || '';
+                asrInitialPrompt.value = recovered.metadata.asrOptions.initial_prompt || '';
+                asrHotwords.value = recovered.metadata.asrOptions.hotwords || '';
+                asrTranscriptionModel.value = recovered.metadata.asrOptions.transcription_model || '';
+            }
+
+            // Restore the incognito state the recording was left in, so a
+            // crashed incognito recording is offered back as incognito instead
+            // of silently becoming a normal (permanently stored) one.
+            if (incognitoMode && enableIncognitoMode && enableIncognitoMode.value) {
+                incognitoMode.value = !!recovered.metadata.incognito;
             }
 
             console.log('[Recording] Successfully recovered recording from IndexedDB');
@@ -1477,8 +1906,26 @@ export function useAudio(state, utils) {
         // Placeholder for future initialization if needed
     };
 
+    // Keep the crash-recovery session's incognito flag in sync with the
+    // toggle. It can be flipped in the review pane after recording stops
+    // (and the modal toggle can flip it with no session — then this is a
+    // harmless no-op), so a crash after the flip still recovers into the
+    // mode the user last chose.
+    if (typeof Vue !== 'undefined' && Vue.watch && incognitoMode) {
+        Vue.watch(incognitoMode, (v) => {
+            RecordingDB.updateRecordingMetadata({ incognito: !!v });
+        });
+    }
+
     return {
         startRecording,
+        requestMicrophonePermission,
+        confirmPendingMicrophoneSelection,
+        cancelPendingMicrophoneSelection,
+        isPreparingRecording,
+        pendingMicrophoneSelection,
+        pauseRecording,
+        resumeRecording,
         stopRecording,
         discardRecording,
         normalizeLiveMediaDuration,

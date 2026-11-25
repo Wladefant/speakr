@@ -10,6 +10,13 @@ import json
 from typing import Dict, Optional, Tuple
 
 
+def _code(status):
+    """A status code as a separate token ("status 401", "(429)"), never inside
+    an id or a longer number: "401" in a Ray actor id labelled a WhisperX
+    out-of-memory traceback as an authentication error."""
+    return rf'(?<![\w.-]){status}(?![\w-]|\.\w)'
+
+
 # Known error patterns with user-friendly messages
 ERROR_PATTERNS = [
     # File size errors
@@ -17,7 +24,7 @@ ERROR_PATTERNS = [
         'patterns': [
             r'maximum content size limit.*exceeded',
             r'file.*too large',
-            r'413.*exceeded',
+            _code(413) + r'.*exceeded',
             r'payload too large',
         ],
         'title': 'File Too Large',
@@ -43,7 +50,7 @@ ERROR_PATTERNS = [
     # Authentication errors
     {
         'patterns': [
-            r'401.*unauthorized',
+            _code(401) + r'.*unauthorized',
             r'invalid.*api.*key',
             r'authentication.*failed',
             r'api key.*invalid',
@@ -60,7 +67,7 @@ ERROR_PATTERNS = [
         'patterns': [
             r'rate.*limit',
             r'too many requests',
-            r'429',
+            _code(429),
             r'quota.*exceeded',
         ],
         'title': 'Rate Limit Exceeded',
@@ -88,9 +95,9 @@ ERROR_PATTERNS = [
     # Service unavailable
     {
         'patterns': [
-            r'503.*service unavailable',
-            r'502.*bad gateway',
-            r'500.*internal server error',
+            _code(503) + r'.*service unavailable',
+            _code(502) + r'.*bad gateway',
+            _code(500) + r'.*internal server error',
             r'service.*unavailable',
             r'server.*error',
         ],
@@ -108,6 +115,8 @@ ERROR_PATTERNS = [
             r'could not.*decode',
             r'audio.*corrupt',
             r'not.*valid.*audio',
+            # FFmpeg's wording for a file it cannot open
+            r'invalid data found when processing input',
         ],
         'title': 'Invalid Audio Format',
         'message': 'The audio file format is not supported or the file may be corrupted.',
@@ -201,6 +210,19 @@ def extract_error_details(error_text: str) -> Dict:
     return details
 
 
+# ANSI terminal colour codes some ASR runtimes (e.g. Ray/faster-whisper) inject
+# into error bodies. Matches both real ESC sequences and the literal ``[..m``
+# form that survives JSON encoding and would otherwise render as garbage in the UI.
+_ANSI_RE = re.compile(r'(?:\x1b|\\x1b|\\u001b)\[[0-9;]*m')
+
+
+def _strip_ansi(text: str) -> str:
+    """Remove ANSI colour codes from an error string (see _ANSI_RE)."""
+    if not text:
+        return text
+    return _ANSI_RE.sub('', text)
+
+
 def format_error_for_user(error_text: str) -> Dict:
     """
     Transform a technical error message into a user-friendly format.
@@ -226,6 +248,9 @@ def format_error_for_user(error_text: str) -> Dict:
             'is_known': False
         }
 
+    # Strip terminal colour codes before anything else so pattern matching, the
+    # user-facing message, and the technical detail are all free of ANSI noise.
+    error_text = _strip_ansi(error_text)
     error_lower = error_text.lower()
 
     # Check against known patterns
@@ -257,24 +282,56 @@ def format_error_for_user(error_text: str) -> Dict:
     if len(clean_message) > 200:
         clean_message = clean_message[:200] + '...'
 
-    # Generate a reasonable title based on error code
+    # Generate a reasonable title/message based on error code
     title = 'Processing Error'
+    message = clean_message
+    guidance = 'If this error persists, try reprocessing the recording or contact support for assistance.'
+    icon = 'fa-exclamation-circle'
+    error_type = 'unknown'
     if details['code']:
         code = details['code']
         if code.startswith('4'):
             title = 'Request Error'
         elif code.startswith('5'):
-            title = 'Server Error'
+            # A 5xx from the transcription service usually carries an internal
+            # traceback that means nothing to a user. Replace it with a plain
+            # explanation; the raw text stays available under "technical".
+            title = 'Transcription Service Error'
+            message = 'The transcription service could not process this recording.'
+            guidance = (
+                'This is often temporary — try reprocessing. If it keeps failing, the '
+                'recording may contain little or no speech, or the transcription service '
+                'may need attention.'
+            )
+            icon = 'fa-server'
+            error_type = 'service_error'
 
     return {
         'title': title,
-        'message': clean_message,
-        'guidance': 'If this error persists, try reprocessing the recording or contact support for assistance.',
-        'icon': 'fa-exclamation-circle',
-        'type': 'unknown',
+        'message': message,
+        'guidance': guidance,
+        'icon': icon,
+        'type': error_type,
         'technical': error_text,
         'is_known': False
     }
+
+
+def truncate_middle(text: str, limit: int, tail_share: float = 0.6) -> str:
+    """Cut `text` to at most `limit` characters, keeping both ends.
+
+    A traceback says why it failed on its last line, so a cut that keeps
+    only the start loses the one line worth reading. Most of the budget
+    goes to the end (`tail_share`); the rest keeps the first lines, which
+    name the request that failed.
+    """
+    if len(text) <= limit:
+        return text
+    marker = ' … '
+    budget = max(limit - len(marker), 0)
+    tail = int(budget * tail_share)
+    head = budget - tail
+    return text[:head] + marker + text[len(text) - tail:]
 
 
 def format_error_for_storage(error_text: str) -> str:
@@ -303,7 +360,9 @@ def format_error_for_storage(error_text: str) -> str:
     # "Technical details" panel has something to show even for unknown errors
     # where the user-facing message is the same as the raw text.
     if formatted['technical']:
-        error_data['d'] = formatted['technical'][:500]  # Limit technical detail length
+        # Limit technical detail length, keeping the end: that is where a
+        # traceback names the exception.
+        error_data['d'] = truncate_middle(formatted['technical'], 500)
 
     try:
         json_str = json.dumps(error_data, ensure_ascii=False)

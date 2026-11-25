@@ -15,7 +15,7 @@ https://your-speakr-instance.com/api/v1/
 
 ## Authentication
 
-All endpoints require authentication. See [API Tokens](api-tokens.md) for details on creating and managing tokens.
+All endpoints require authentication, except the API description and the interactive API docs. See [API Tokens](api-tokens.md) for details on creating and managing tokens.
 
 === "Bearer Token (Recommended)"
     ```bash
@@ -29,10 +29,83 @@ All endpoints require authentication. See [API Tokens](api-tokens.md) for detail
          https://speakr.example.com/api/v1/stats
     ```
 
-=== "Query Parameter"
+=== "Query Parameter (deprecated)"
     ```bash
     curl "https://speakr.example.com/api/v1/stats?token=YOUR_TOKEN"
     ```
+
+A header is the preferred way to send a token. The `?token=` query parameter is deprecated and is accepted only on `GET` requests, and only with full-access tokens. A `POST`, `PUT`, `PATCH` or `DELETE` request that carries the token only in `?token=` gets `401` with the code `query_token_read_only`. Every response to a request that uses `?token=` carries the header `Deprecation: true`. A URL that contains a token can be recorded in proxy logs and browser history, so a header is the safer choice for every client.
+
+### Scopes
+
+A token has full access or a set of scopes. Each endpoint below lists the scope it needs; `/api/v1/openapi.json` gives the same as `x-required-scopes` per operation.
+
+| Scope | Allows |
+|-------|--------|
+| `read` | Every GET under `/api/v1` except webhook management: recordings, transcripts, summaries, notes, events, speakers, tags, folders, statistics, audio download |
+| `write` | Editing recordings, notes and summaries; adding and removing tags; creating and editing tags, folders and speakers; assigning speakers |
+| `upload` | `POST /recordings/upload` and the ASR Voice Recorder upload |
+| `process` | Requests that use model or GPU time: transcribe, summarize, regenerate title, identify speakers, chat |
+| `share` | Creating, listing and revoking shares |
+| `delete` | Deleting recordings, audio, tags, folders and speakers |
+| `webhooks` | Everything under `/api/v1/webhooks` |
+| `account` | Account settings under `/api/v1/settings` |
+
+A token with no scopes is a full-access token and is reported as `["full"]`. Every token created before scopes existed is a full-access token. Scoped tokens work only in a header and only on API v1 routes. A scoped token without a needed scope gets `403` before anything changes:
+
+```json
+{
+  "error": "This token does not have the 'write' scope",
+  "code": "insufficient_scope",
+  "required_scopes": ["write"],
+  "token_scopes": ["read"]
+}
+```
+
+with the header `WWW-Authenticate: Bearer error="insufficient_scope", scope="write"`.
+
+### Current Token
+
+```http
+GET /api/v1/tokens/current
+```
+
+**Scope:** none (any valid token)
+
+Returns the token used for the request. A request signed in through the web interface gets `404` with `"code": "not_found"`.
+
+```json
+{
+  "id": 14,
+  "name": "mailr",
+  "scopes": ["read", "write", "upload"],
+  "created_at": "2026-10-02T09:00:00.000000Z",
+  "expires_at": "2027-10-02T09:00:00.000000Z",
+  "last_used_at": "2026-10-02T09:05:11.000000Z",
+  "via": "header"
+}
+```
+
+### Capabilities
+
+```http
+GET /api/v1/capabilities
+```
+
+**Scope:** none (any valid token or a signed-in session)
+
+Lists the features this instance supports. Read features here, not from the version string; a feature missing from `features` is not supported.
+
+```json
+{
+  "speakr_version": "v0.10.11-alpha",
+  "api_version": "1.1",
+  "features": {"token_scopes": true, "changes_feed": true, "etags": true},
+  "models_local": false
+}
+```
+
+`models_local` is `true` only when the administrator sets `MODELS_ARE_LOCAL=true`, which states that the text, chat and embedding models all run on machines the administrator controls.
 
 ## OpenAPI Specification
 
@@ -40,6 +113,10 @@ All endpoints require authentication. See [API Tokens](api-tokens.md) for detail
 |----------|-------------|
 | `GET /api/v1/docs` | Interactive Swagger UI |
 | `GET /api/v1/openapi.json` | OpenAPI 3.0 specification |
+
+Both addresses are available without signing in, by design. They describe the endpoints only and contain no user data or credentials.
+
+Every operation in the specification has an `operationId`, which is required to add Speakr to Open WebUI as an OpenAPI tool server. When the specification is fetched with a scoped token, it lists only the operations that token may call, so a tool server built from it offers only those tools. A full token or a signed-in browser session receives every operation.
 
 <div style="max-width: 90%; margin: 1.5em auto;">
   <img src="../../assets/images/screenshots/api-swagger-ui.png" alt="Swagger UI Documentation" style="border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
@@ -57,6 +134,8 @@ Dashboard-compatible statistics endpoint, designed for integration with homepage
 ```http
 GET /api/v1/stats
 ```
+
+**Scope:** `read`
 
 **Query Parameters:**
 
@@ -136,6 +215,8 @@ GET /api/v1/stats
 GET /api/v1/users/me
 ```
 
+**Scope:** `read`
+
 Returns the authenticated user's profile, preferences, and group memberships. Useful for companion apps and automation flows that need to display the current user's identity.
 
 **Response:**
@@ -171,9 +252,16 @@ Returns the authenticated user's profile, preferences, and group memberships. Us
       "role": "admin",
       "joined_at": "2024-01-10T08:00:00Z"
     }
-  ]
+  ],
+  "storage": {
+    "used_bytes": 244862976,
+    "quota_bytes": 314572800,
+    "available_bytes": 69709824
+  }
 }
 ```
+
+`storage.quota_bytes` and `storage.available_bytes` are `null` when the user has no storage quota.
 
 ---
 
@@ -185,21 +273,36 @@ Returns the authenticated user's profile, preferences, and group memberships. Us
 POST /api/v1/recordings/upload
 ```
 
+**Scope:** `upload`
+
 Upload a recording as multipart form-data and immediately queue transcription.
 
 **Form Fields:**
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `file` | file | yes | Audio file to upload |
-| `notes` | string | no | Optional notes |
-| `file_last_modified` | string | no | Client file lastModified (ms epoch) |
+| `file` | file | yes | Audio or video file |
+| `title` | string | no | Title. Without it, the title comes from your title settings once the transcript exists. |
+| `participants` | string | no | Comma-separated names, at most 500 characters |
+| `meeting_date` | string | no | ISO 8601. Takes precedence over every other date source. |
+| `file_last_modified` | string | no | The file's last-modified time in milliseconds since the epoch. Used when `meeting_date` is absent and no date is read from the file name. |
+| `notes` | string | no | Notes |
+| `folder_id` | integer | no | Folder (your own or a group folder you belong to) |
+| `tag_ids[0]`, `tag_ids[1]`, ... | integer | no | Tags, in order (your own or group tags you belong to) |
+| `tag_id` | integer | no | Single tag (legacy) |
+| `external_refs` | string | no | JSON array of [external references](#external-references) without `id` |
+| `idempotency_key` | string | no | 1 to 100 characters; see below |
+| `strict` | boolean | no | `true`: a tag or folder you cannot use is an error (`400`). Default `false`: it is dropped and reported in `ignored`. |
 | `language` | string | no | Language hint (ISO 639-1) |
-| `min_speakers` | integer | no | Min speaker count |
-| `max_speakers` | integer | no | Max speaker count |
-| `tag_ids[0]`, `tag_ids[1]`, ... | integer | no | Tag IDs (multi) |
-| `tag_id` | integer | no | Single tag ID (legacy) |
+| `min_speakers`, `max_speakers` | integer | no | Speaker count limits |
+| `hotwords`, `initial_prompt` | string | no | Transcription hints |
+| `transcription_model` | string | no | One of the models the administrator allows |
+| `prompt_variables` | string | no | JSON object of `{{name}}` values for the summary prompt |
 | `keep_audio_only` | boolean | no | If `true`, the server discards the video stream and stores only the extracted audio. Lets you upload videos larger than `max_file_size_mb`, up to `max_audio_only_video_size_mb`, as long as the extracted audio fits the regular limit. When `VIDEO_RETENTION` is off at the server, this is implicit for video uploads. |
+
+The meeting date is chosen in this order: `meeting_date`, a date in the file name (when you turned that on in your settings), `file_last_modified`, the date stored in the file, the upload time.
+
+**Idempotent uploads.** Send an `idempotency_key` (for example a message id and attachment number) when a client may retry. A repeat with the same key by the same user within 24 hours returns the recording the first call created, with `200` and `"idempotent_replay": true`; the file is not stored again and no second transcription is queued. Keys are per user.
 
 **Response:**
 
@@ -207,26 +310,125 @@ Upload a recording as multipart form-data and immediately queue transcription.
 // 202 Accepted
 {
   "id": 123,
-  "title": "Recording - meeting.mp3",
+  "title": "Weekly sync",
   "status": "PENDING",
   "created_at": "2024-01-15T10:00:00Z",
   "meeting_date": "2024-01-15T09:00:00Z",
+  "participants": "Dana, Omar",
   "file_size": 15728640,
   "original_filename": "meeting.mp3",
   "mime_type": "audio/mpeg",
-  "notes": "Quick test upload"
+  "notes": "Quick test upload",
+  "external_refs": [{"id": 77, "system": "mailr", "kind": "event", "ref": "5f1c@example.com", "url": null, "label": null, "created_at": "2024-01-15T10:00:00.000000Z"}],
+  "ignored": {"tag_ids": [], "folder_id": null}
 }
 ```
+
+`ignored` lists the tags and folder the upload dropped because you cannot use them.
+
+An upload that would exceed the user's storage quota is refused with `507 Insufficient Storage`:
+
+```json
+{
+  "error": "This upload would exceed your storage quota: 233.5 MB of 300.0 MB used, and the file is 80.0 MB.",
+  "code": "storage_quota_exceeded",
+  "used_bytes": 244862976,
+  "quota_bytes": 314572800,
+  "file_bytes": 83886080,
+  "available_bytes": 69709824
+}
+```
+
+`GET /api/v1/users/me` includes the same figures under `storage`, and `/api/v1/capabilities` lists `storage_quota`.
+
+A file that cannot be ingested is refused with `400`. No recording is created and the file is not kept:
+
+| Code | Meaning |
+|------|---------|
+| `empty_file` | The file part has no content. |
+| `audio_decode_failed` | The file cannot be decoded as audio or video, for example a text file with an `.mp3` extension or a damaged file. |
+
+```json
+{
+  "error": "The uploaded file could not be read as audio. It may be corrupt or in an unsupported format.",
+  "code": "audio_decode_failed"
+}
+```
+
+A conversion that runs longer than `FFMPEG_TIMEOUT_SECONDS` is a server error: `500` with the code `audio_conversion_timeout`.
 
 **Example:**
 
 ```bash
 curl -X POST \
-  -H "X-API-Token: YOUR_TOKEN" \
+  -H "Authorization: Bearer YOUR_TOKEN" \
   -F "file=@/path/to/audio.mp3" \
-  -F "notes=Quick test upload" \
-  -F "language=en" \
+  -F "title=Weekly sync" \
+  -F "participants=Dana, Omar" \
+  -F 'external_refs=[{"system":"mailr","kind":"event","ref":"5f1c@example.com"}]' \
+  -F "idempotency_key=msg-4411:part-2" \
   https://speakr.example.com/api/v1/recordings/upload
+```
+
+### ASR Voice Recorder Upload
+
+```http
+POST /api/v1/integrations/asr-voice-recorder/upload
+```
+
+**Scope:** `upload`
+
+This adapter accepts the multipart webhook format sent by the Android **ASR Voice Recorder** app and queues the completed recording through Speakr's normal upload and transcription pipeline. Unlike other API endpoints, authentication comes from the required multipart `secret` field because the recorder cannot set a custom Authorization header.
+
+**Form Fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `file` | file | for uploads | Completed audio recording; omitted by ASR's connection test |
+| `secret` | string | yes | A personal Speakr API token |
+| `file_name` | string | no | Original filename override; sanitized by Speakr |
+| `date` | integer | no | Recording time as Unix epoch seconds or milliseconds |
+| `duration` | number | no | Accepted for compatibility but ignored; Speakr measures duration from the media |
+| `note` | string | no | Stored as the recording's notes |
+
+A session cookie or normal API Authorization header does not replace `secret` on this endpoint. Create a dedicated, expiring token for the recorder because Speakr API tokens currently provide full access to their owner's account. The endpoint limits each source IP by both request count and total declared upload size; HTTP 429 means ASR should retry later. Multi-worker deployments using Flask-Limiter's in-memory storage should also enforce an aggregate upload rate at the reverse proxy.
+
+When saving the webhook destination, ASR first sends an authenticated connection test without a file or recording metadata. Speakr returns HTTP 200 with `{"status":"ok","connection_test":true}` and does not create a recording. Completed deliveries still require the `file` field.
+
+**Response:**
+
+```json
+// 200 OK
+{
+  "id": 123,
+  "title": "Recording - interview.m4a",
+  "status": "PENDING",
+  "original_filename": "interview.m4a",
+  "notes": "Interview recorded with an external microphone",
+  "idempotent_replay": false
+}
+```
+
+An empty or undecodable file is refused with `400` and the codes `empty_file` or `audio_decode_failed`, as on [Upload Recording](#upload-recording).
+
+If ASR retries the same completed file with matching filename, note, and recording date for the same user, Speakr returns the existing recording with `idempotent_replay: true` instead of queueing another transcription. Identical audio submitted with different metadata remains a distinct recording. Simultaneous first deliveries are not a strict exactly-once guarantee.
+
+**ASR Voice Recorder configuration:**
+
+- Webhook URL: `https://speakr.example.com/api/v1/integrations/asr-voice-recorder/upload`
+- Secret: the dedicated Speakr API token
+- Method/body: ASR supplies the multipart POST automatically
+- Expected success status: HTTP 200
+
+A manual protocol check can be made with placeholder credentials:
+
+```bash
+curl -X POST \
+  -F "secret=YOUR_DEDICATED_TOKEN" \
+  -F "file=@recording.m4a" \
+  -F "file_name=recording.m4a" \
+  -F "note=Mobile recorder upload" \
+  https://speakr.example.com/api/v1/integrations/asr-voice-recorder/upload
 ```
 
 ### List Recordings
@@ -235,6 +437,8 @@ curl -X POST \
 GET /api/v1/recordings
 ```
 
+**Scope:** `read`
+
 **Query Parameters:**
 
 | Parameter | Type | Default | Description |
@@ -242,14 +446,20 @@ GET /api/v1/recordings
 | `page` | integer | 1 | Page number |
 | `per_page` | integer | 25 | Items per page (max: 100) |
 | `status` | string | `all` | Filter: `all`, `pending`, `processing`, `completed`, `failed` |
-| `sort_by` | string | `created_at` | Sort field: `created_at`, `meeting_date`, `title`, `file_size` |
+| `sort_by` | string | `created_at` | Sort field: `created_at`, `meeting_date`, `title`, `file_size`, `status`, `updated_at` |
 | `sort_order` | string | `desc` | Sort order: `asc`, `desc` |
 | `date_from` | string | - | Filter from date (ISO format) |
-| `date_to` | string | - | Filter to date (ISO format) |
+| `date_to` | string | - | Filter to date (ISO format); a date alone includes that whole day |
+| `date_field` | string | `created_at` | What `date_from` and `date_to` filter: `created_at` or `meeting_date` |
+| `updated_since` | string | - | Only recordings changed after this time (ISO 8601). Deletions are not listed; use the [changes feed](#changes-feed) for those. |
+| `external_system`, `external_ref`, `external_kind` | string | - | Only recordings that carry this [external reference](#external-references) of yours (`external_kind` optional) |
+| `scope` | string | `own` | `own`, `shared` (recordings other users shared with you) or `all` |
+| `owner_id` | integer | - | Only recordings of this owner |
 | `tag_id` | integer | - | Filter by tag ID |
 | `q` | string | - | Search query (title, participants) |
 | `inbox` | boolean | - | Filter by inbox status |
 | `starred` | boolean | - | Filter by starred status |
+| `archived` | boolean | - | Filter by archive status. Omitted returns archived and unarchived recordings, as before. |
 | `folder_id` | string | - | Filter by folder. Pass an integer folder ID to list recordings in that folder, or the literal `none` to list recordings not in any folder. Requires folders to be enabled. |
 
 **Response:**
@@ -283,7 +493,8 @@ GET /api/v1/recordings
       "keep_audio_only": false,
       "tags": [
         {"id": 1, "name": "Work", "color": "#3B82F6"}
-      ]
+      ],
+      "updated_at": "2024-01-15T10:05:00.000000Z"
     }
   ],
   "pagination": {
@@ -297,11 +508,146 @@ GET /api/v1/recordings
 }
 ```
 
+**Shared recordings.** With `scope=shared` or `scope=all` the list includes completed recordings other users shared with you (shared directly, through a group tag or through a group folder), as the web app's shared list does. Every item says whose it is:
+
+```json
+{
+  "is_shared": true,
+  "owner": {"id": 3, "username": "evan", "name": "Evan Ross"},
+  "share": {"id": 51, "can_edit": false, "can_reshare": false, "source": "group_tag",
+            "shared_at": "2026-09-20T10:00:00.000000Z"}
+}
+```
+
+Your own recordings have `"is_shared": false, "owner": null, "share": null`. `owner.username` and `owner.name` are `null` unless the administrator sets `SHOW_USERNAMES_IN_UI=true`. For a shared recording, `is_inbox`, `is_highlighted` and `is_archived` are your own values and `tags` are the tags you can see. With internal sharing turned off, `shared` is empty and `all` is the same as `own`.
+
+`updated_at` is the time of the last change a client can see: title, participants, notes, summary, transcript, status, dates, folder, flags, tags, events or sharing. It is present on every recording in API v1 and starts at `created_at`.
+
+### External References
+
+A reference links a recording to an item in another system, such as a calendar event or a conversation in a mail client. References are private: you see only the ones you added, and a user a recording is shared with sees only their own. Every recording in the API carries your references in `external_refs`.
+
+```json
+{
+  "id": 77,
+  "system": "mailr",
+  "kind": "event",
+  "ref": "5f1c@example.com@2026-10-06T15:00:00Z",
+  "url": "https://mail.example.com/calendar/event/5f1c",
+  "label": "Weekly sync (6 Oct)",
+  "created_at": "2026-10-06T16:02:11.000000Z"
+}
+```
+
+`system` and `kind`: 1 to 40 characters of `a-z`, `0-9`, `_`, `.`, `-`. `ref`: 1 to 500 printable characters. `url`: optional, `http://` or `https://`, at most 1000 characters. `label`: optional, at most 200 characters. At most 50 references per user per recording (`409 conflict`).
+
+```http
+GET /api/v1/recordings/{id}/external-refs
+```
+
+**Scope:** `read`
+
+```http
+POST /api/v1/recordings/{id}/external-refs
+```
+
+**Scope:** `write`
+
+Adds one reference: `201` with the new reference, or `200` with the existing one when you already added the same `system`, `kind` and `ref`.
+
+```http
+PUT /api/v1/recordings/{id}/external-refs?system=mailr
+```
+
+**Scope:** `write`
+
+Replaces your references of that system with `{"external_refs": [...]}` and returns the new list. References of other systems stay.
+
+```http
+DELETE /api/v1/recordings/{id}/external-refs/{ref_id}
+```
+
+**Scope:** `write`
+
+`204`. The writes need edit access to the recording, and a reference change counts as a recording change (`updated_at`, `fields_changed: ["external_refs"]`).
+
+To find recordings by reference, filter the list: `GET /api/v1/recordings?external_system=mailr&external_ref=<ref>`, optionally with `&external_kind=event`.
+
+### Changes Feed
+
+```http
+GET /api/v1/recordings/changes
+```
+
+**Scope:** `read`
+
+Every create, edit and delete of your recordings since a cursor, each once and in its latest state. This is the way to keep a copy of your recordings in sync without listing the whole collection.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `cursor` | string | - | `next_cursor` from the previous answer. Without it, the answer lists every recording (a full pass) and no older deletions. |
+| `limit` | integer | 100 | 1 to 500 |
+| `scope` | string | `own` | `own`, `shared` or `all`. With `shared` or `all`, a share that is removed arrives as a delete with reason `access_revoked`. |
+
+**Response:**
+
+```json
+{
+  "changes": [
+    {"type": "upsert", "recording": {"id": 412, "title": "Weekly sync", "updated_at": "2026-10-02T14:03:22.123456Z"}},
+    {"type": "delete", "id": 398, "deleted_at": "2026-10-02T14:05:00.000000Z", "reason": "deleted"}
+  ],
+  "next_cursor": "eyJ1IjoiMjAyNi0xMC0wMlQxNDowNTowMC4wMDAwMDBaIiwiayI6MSwiaSI6Mzk4fQ",
+  "has_more": false
+}
+```
+
+- `recording` in an upsert has the same fields as one item of [List Recordings](#list-recordings).
+- `reason` on a delete is `deleted` (by a user, the API or a merge), `retention` (auto-deletion) or `access_revoked` (a recording shared with you is no longer shared).
+- Changes from the last two seconds wait for the next call, so a change saved late is never skipped.
+- The cursor is opaque. Store `next_cursor` after every answer, including an answer with no changes.
+- `400` with `"code": "invalid_parameter"`: the cursor cannot be read.
+- `410` with `"code": "cursor_expired"`: the cursor is older than the deletions Speakr still keeps (`RECORDING_TOMBSTONE_DAYS`, default 90). Start again without a cursor.
+
+A sync loop:
+
+```text
+cursor = stored cursor, or none
+repeat:
+    answer = GET /api/v1/recordings/changes?cursor=<cursor>
+    if status is 410: drop the local copy's sync state, cursor = none, continue
+    apply each change: upsert replaces the recording, delete removes it
+    cursor = answer.next_cursor; store it
+    if not answer.has_more: wait (or wait for a webhook), then repeat
+```
+
+### Conditional Requests
+
+These requests send a weak `ETag` header:
+
+| Request | Answer depends on |
+|---------|-------------------|
+| `GET /api/v1/recordings/{id}` | the recording, its tags and folder, and the parameters |
+| `GET /api/v1/recordings/{id}/transcript` | the transcript, the format and, for `format=text`, your transcript template |
+| `GET /api/v1/recordings/{id}/summary` | the summary |
+| `GET /api/v1/recordings/{id}/notes` | the notes you can see |
+| `GET /api/v1/recordings/{id}/events` | the extracted events |
+| `GET /api/v1/recordings/{id}/speakers` | the speakers and the voice suggestions |
+
+Send the value back in `If-None-Match`. When nothing in the answer changed, the answer is `304 Not Modified` with no body. Treat the value as opaque. The access check comes first, so a caller without access gets `404`, never `304`. The answers carry `Cache-Control: private, no-cache`.
+
+```bash
+curl -i -H "Authorization: Bearer $TOKEN" -H 'If-None-Match: W/"t412-1790950000000000-3f2a9c0d1b7e4a55"' \
+     https://speakr.example.com/api/v1/recordings/412/transcript
+```
+
 ### Get Recording Details
 
 ```http
 GET /api/v1/recordings/{id}
 ```
+
+**Scope:** `read`
 
 **Query Parameters:**
 
@@ -365,19 +711,29 @@ GET /api/v1/recordings/{id}
 GET /api/v1/recordings/{id}/transcript
 ```
 
+**Scope:** `read`
+
 **Query Parameters:**
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `format` | string | `json` | Output format: `json`, `text`, `srt`, `vtt` |
+| `start`, `end` | number | - | JSON only: segments that overlap this window, in seconds |
+| `max_segments` | integer | - | JSON only: at most this many segments; `next_start` gives the start time of the next one |
 
 === "JSON Format"
     ```json
     {
       "format": "json",
+      "kind": "segments",
+      "duration": 1834.2,
       "segments": [
         {
+          "index": 0,
           "speaker": "Alice",
+          "speaker_label": "SPEAKER_00",
+          "speaker_id": 12,
+          "text": "Hello everyone",
           "sentence": "Hello everyone",
           "start_time": 0.0,
           "end_time": 2.5
@@ -385,6 +741,8 @@ GET /api/v1/recordings/{id}/transcript
       ]
     }
     ```
+
+    Every segment has every key above, whatever format the transcript was saved in; clients can rely on this shape. `text` and `sentence` are the same (`sentence` is kept for older clients). Times are seconds or `null`. `speaker_label` is the diarization label (also after the speaker was named), or `null` when it is not known. `speaker_id` is the id of the saved speaker the segment is linked to, else `null`; for a linked segment, `speaker` is that speaker's current name. A transcript without speaker segments returns `"kind": "plain"`, an empty `segments` list and the text in `raw`.
 
 === "Text Format"
     Uses your default transcript template:
@@ -417,6 +775,8 @@ GET /api/v1/recordings/{id}/transcript
 GET /api/v1/recordings/{id}/summary
 ```
 
+**Scope:** `read`
+
 **Response:**
 
 ```json
@@ -432,6 +792,10 @@ GET /api/v1/recordings/{id}/summary
 GET /api/v1/recordings/{id}/notes
 ```
 
+**Scope:** `read`
+
+Notes are per user. The owner gets the recording's notes. A user the recording is shared with gets only their own personal notes, never the owner's; the same holds for `notes` in the recording details and in search.
+
 **Response:**
 
 ```json
@@ -446,6 +810,8 @@ GET /api/v1/recordings/{id}/notes
 ```http
 GET /api/v1/recordings/{id}/status
 ```
+
+**Scope:** `read`
 
 **Response:**
 
@@ -475,6 +841,8 @@ GET /api/v1/recordings/{id}/status
 PATCH /api/v1/recordings/{id}
 ```
 
+**Scope:** `write`
+
 **Request Body:**
 
 ```json
@@ -486,6 +854,7 @@ PATCH /api/v1/recordings/{id}
   "meeting_date": "2024-01-15T09:00:00Z",
   "is_inbox": false,
   "is_highlighted": true,
+  "is_archived": false,
   "folder_id": 5
 }
 ```
@@ -497,6 +866,10 @@ All fields are optional. Set `folder_id` to an integer to move the recording int
 ```http
 PUT /api/v1/recordings/{id}/notes
 ```
+
+**Scope:** `write`
+
+The owner replaces the recording's notes. A user the recording is shared with, even with view access only, replaces their own personal notes; the owner's notes do not change. `notes` in `PATCH /api/v1/recordings/{id}` follows the same rule.
 
 **Request Body:**
 
@@ -512,6 +885,8 @@ PUT /api/v1/recordings/{id}/notes
 PUT /api/v1/recordings/{id}/summary
 ```
 
+**Scope:** `write`
+
 **Request Body:**
 
 ```json
@@ -520,11 +895,32 @@ PUT /api/v1/recordings/{id}/summary
 }
 ```
 
+### Delete Audio, Keep Transcript
+
+```http
+POST /api/v1/recordings/{id}/delete-audio
+```
+
+**Scope:** `delete`
+
+Deletes the recording's media file (the video, for a recording with retained video) and keeps the transcript, summary and notes. Requires the same permission as deleting the recording. Returns `409` when the audio is already removed or the recording is still processing.
+
+**Response:**
+
+```json
+{
+  "success": true,
+  "audio_deleted_at": "2026-09-29T06:50:17.968177"
+}
+```
+
 ### Delete Recording
 
 ```http
 DELETE /api/v1/recordings/{id}
 ```
+
+**Scope:** `delete`
 
 **Response:**
 
@@ -537,6 +933,123 @@ DELETE /api/v1/recordings/{id}
 
 ---
 
+## Share Links
+
+### Create or Reuse a Share Link
+
+```http
+POST /api/v1/recordings/{id}/share
+```
+
+**Scope:** `share`
+
+Only the recording's owner can create a link. Without `force_new`, the newest link of the recording is reused.
+
+```json
+{"share_summary": true, "share_notes": false, "force_new": false, "update_existing": false, "expires_in_days": 30}
+```
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `share_summary` | `true` | Show the summary on the shared page |
+| `share_notes` | `false` | Show the owner's notes. Off unless asked (the web dialog defaults to on). |
+| `force_new` | `false` | Create a new link even when one exists |
+| `update_existing` | `false` | Give a reused link the flags of this request. Without it a reused link keeps its flags, and `flags_differ` says when they differ from the request. |
+| `expires_in_days` | none | 1 to 3650; after that the link answers `404` |
+
+`201` for a new link, `200` for a reused one:
+
+```json
+{
+  "share_url": "https://speakr.example.com/share/AbC123",
+  "existing": true,
+  "flags_differ": false,
+  "share": {"id": 31, "share_summary": true, "share_notes": false,
+            "created_at": "2026-10-02T09:00:00.000000Z", "expires_at": null}
+}
+```
+
+`403` with `code` `feature_disabled` (public sharing is off), `not_permitted` (your account may not create public links) or `https_required` (the link would not be an HTTPS link: when `APP_BASE_URL` is set, its scheme decides and links use that address; otherwise the request must arrive over HTTPS, and behind a reverse proxy Speakr reads `X-Forwarded-Proto`, see `TRUSTED_PROXY_HOPS` and `TRUSTED_PROXIES`).
+
+### List Share Links
+
+```http
+GET /api/v1/recordings/{id}/shares
+```
+
+**Scope:** `share`
+
+Your links of the recording, newest first, each with its `share_url`.
+
+### Revoke a Share Link
+
+```http
+DELETE /api/v1/shares/{share_id}
+```
+
+**Scope:** `share`
+
+`204`. The link stops working at once.
+
+## Search
+
+### Search Recordings
+
+```http
+GET /api/v1/search
+```
+
+**Scope:** `read`
+
+Finds words in the titles, participants, notes, summaries and transcripts of your recordings, with the time and speaker of each transcript hit. Keyword search works on every installation; semantic search needs Inquire mode.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `q` | string | required | 2 to 500 characters. Words are matched separately; `"a quoted phrase"` stays together. Every word must appear in the recording. `%` and `_` are literal. |
+| `mode` | string | `keyword` | `keyword`, `semantic`, or `auto` (semantic when available, else keyword) |
+| `fields` | string | all | Comma list of `title`, `participants`, `notes`, `summary`, `transcript` (keyword mode) |
+| `scope` | string | `own` | `own`, `shared` or `all` (see [List Recordings](#list-recordings)) |
+| `recording_ids` | string | - | Comma list of recording ids |
+| `tag_id`, `folder_id` | - | - | As on [List Recordings](#list-recordings) |
+| `speaker` | string | - | Transcript hits of this speaker only (exact name, any case) |
+| `date_from`, `date_to` | string | - | ISO dates or date-times; a date alone includes that whole day |
+| `date_field` | string | `meeting_date` | `meeting_date` (the creation time where a recording has none) or `created_at` |
+| `limit` | integer | 20 | 1 to 50 hits |
+| `page` | integer | 1 | Keyword mode |
+
+**Response:**
+
+```json
+{
+  "query": "budget freeze",
+  "mode_used": "keyword",
+  "results": [
+    {
+      "recording_id": 412,
+      "title": "Weekly sync",
+      "meeting_date": "2026-09-29T15:00:00Z",
+      "field": "transcript",
+      "segment_index": 87,
+      "start_time": 754.2,
+      "end_time": 761.0,
+      "speaker": "Dana",
+      "text": "So the budget freeze applies to travel only.",
+      "match_spans": [[7, 13], [14, 20]],
+      "score": 0.7
+    }
+  ],
+  "page": 1,
+  "has_more": false
+}
+```
+
+- Keyword hits: the title and participants as a whole, notes and summaries per line, transcripts per segment. `text` is at most 400 characters around the first match; `match_spans` are character offsets into `text`. A transcript without speaker segments gives hits with `start_time` and `segment_index` set to `null`.
+- `score` is the share of the query words in the hit times a weight per field (title 1.0, summary 0.9, notes and participants 0.8, transcript 0.7). Ties go to the newer recording.
+- Keyword mode reads at most the 200 newest matching recordings per request.
+- Semantic hits come from the Inquire index: `field` is `transcript`, `segment_index` is `null`, `score` is the similarity. The query text is sent to the embedding model of the instance; `GET /api/v1/capabilities` reports `features.search.semantic` and `models_local`.
+- `mode=semantic` on an instance without Inquire mode: `409` with `"code": "semantic_unavailable"`.
+- Limit: 30 requests per minute per token (`API_SEARCH_RATE_LIMIT`).
+
 ## Tags
 
 ### List Tags
@@ -545,7 +1058,9 @@ DELETE /api/v1/recordings/{id}
 GET /api/v1/tags
 ```
 
-Returns both personal tags and group tags you have access to.
+**Scope:** `read`
+
+Returns both personal tags and group tags you have access to. `?name=` returns only the tag with that name (any case), so a client can find a tag by name.
 
 **Response:**
 
@@ -575,6 +1090,8 @@ Returns both personal tags and group tags you have access to.
 POST /api/v1/tags
 ```
 
+**Scope:** `write`
+
 **Request Body:**
 
 ```json
@@ -595,6 +1112,8 @@ POST /api/v1/tags
 PUT /api/v1/tags/{id}
 ```
 
+**Scope:** `write`
+
 **Request Body:**
 
 ```json
@@ -611,11 +1130,15 @@ PUT /api/v1/tags/{id}
 DELETE /api/v1/tags/{id}
 ```
 
+**Scope:** `delete`
+
 ### Add Tags to Recording
 
 ```http
 POST /api/v1/recordings/{id}/tags
 ```
+
+**Scope:** `write`
 
 **Request Body:**
 
@@ -625,11 +1148,43 @@ POST /api/v1/recordings/{id}/tags
 }
 ```
 
+Adds the tags after the ones already on the recording. Needs edit access to the recording. A group tag can be applied by the recording's owner or a group admin.
+
+**Tags that share.** A group tag with *auto-share on apply* (or *share with group lead*) shares a completed recording with the group, as in the web app: admins get edit access, members read access. A scoped token needs the `share` scope for such a tag; without it the request gets `403 insufficient_scope` and nothing changes.
+
+### Set Recording Tags
+
+```http
+PUT /api/v1/recordings/{id}/tags
+```
+
+**Scope:** `write`
+
+Sets the recording's tags to exactly this list, in this order. The access and sharing rules of Add Tags apply. Tags of other users that you cannot see stay on the recording.
+
+```json
+{"tag_ids": [3, 9]}
+```
+
+**Response:**
+
+```json
+{
+  "tags": [{"id": 3, "name": "Followed up", "color": "#10B981"}, {"id": 9, "name": "Client", "color": "#3B82F6"}],
+  "added": [9],
+  "removed": [4]
+}
+```
+
+An unknown tag, or one you cannot use, gives `400` with `"code": "invalid_parameter"` and the refused ids in `tag_ids`; nothing changes.
+
 ### Remove Tag from Recording
 
 ```http
 DELETE /api/v1/recordings/{id}/tags/{tag_id}
 ```
+
+**Scope:** `write`
 
 ---
 
@@ -640,6 +1195,10 @@ DELETE /api/v1/recordings/{id}/tags/{tag_id}
 ```http
 GET /api/v1/speakers
 ```
+
+**Scope:** `read`
+
+`?email=` returns the speaker with that address (any case).
 
 **Response:**
 
@@ -652,11 +1211,16 @@ GET /api/v1/speakers
       "use_count": 45,
       "last_used": "2024-01-15T14:30:00Z",
       "confidence_score": 0.87,
-      "has_voice_profile": true
+      "has_voice_profile": true,
+      "email": "john@example.com",
+      "aliases": ["Johnny"],
+      "updated_at": "2024-01-15T14:30:00.000000Z"
     }
   ]
 }
 ```
+
+`email` and `aliases` are contact details you give your speakers. Only you see them: they are not part of shared recordings, public shares, exports or webhooks, and they are deleted with the speaker.
 
 ### Create Speaker
 
@@ -664,13 +1228,19 @@ GET /api/v1/speakers
 POST /api/v1/speakers
 ```
 
+**Scope:** `write`
+
 **Request Body:**
 
 ```json
 {
-  "name": "Jane Smith"
+  "name": "Jane Smith",
+  "email": "jane@example.com",
+  "aliases": ["J. Smith"]
 }
 ```
+
+`email` and `aliases` are optional.
 
 ### Update Speaker
 
@@ -678,13 +1248,17 @@ POST /api/v1/speakers
 PUT /api/v1/speakers/{id}
 ```
 
-Updates the speaker name and cascades changes to all recordings.
+**Scope:** `write`
+
+Changes the name, email or aliases; send only what changes. A new name appears in every recording the speaker is in (transcript, participants, search). `email` must be an address (stored in lower case); `null` or `""` removes it. `aliases`: at most 20 names of at most 100 characters, trimmed, duplicates (any case) dropped; `[]` removes them. A name another of your speakers has gives `409`.
 
 **Request Body:**
 
 ```json
 {
-  "name": "Jane Doe"
+  "name": "Jane Doe",
+  "email": "jane@example.com",
+  "aliases": ["J. Doe"]
 }
 ```
 
@@ -694,13 +1268,17 @@ Updates the speaker name and cascades changes to all recordings.
 DELETE /api/v1/speakers/{id}
 ```
 
+**Scope:** `delete`
+
 ### Get Recording Speakers
 
 ```http
 GET /api/v1/recordings/{id}/speakers
 ```
 
-Returns speakers in the recording with voice-based identification suggestions.
+**Scope:** `read`
+
+Returns the people in the recording with voice-based identification suggestions. Each entry is one person: the diarization `label`, the name given to it (`null` while unnamed), the saved speaker it is linked to, and `email` when you own both the recording and the speaker (`null` for anyone else).
 
 **Response:**
 
@@ -711,6 +1289,7 @@ Returns speakers in the recording with voice-based identification suggestions.
       "label": "SPEAKER_00",
       "identified_name": "John Doe",
       "speaker_id": 1,
+      "email": "john@example.com",
       "segment_count": 23
     }
   ],
@@ -731,6 +1310,8 @@ Returns speakers in the recording with voice-based identification suggestions.
 ```http
 POST /api/v1/recordings/{id}/transcribe
 ```
+
+**Scope:** `process`
 
 **Request Body:**
 
@@ -773,6 +1354,8 @@ All parameters are optional.
 POST /api/v1/recordings/{id}/summarize
 ```
 
+**Scope:** `process`
+
 **Request Body:**
 
 ```json
@@ -792,6 +1375,8 @@ The custom prompt overrides the recording's tag prompts and user defaults.
 ```http
 POST /api/v1/recordings/{id}/chat
 ```
+
+**Scope:** `process`
 
 Ask questions about a recording's content using AI.
 
@@ -816,6 +1401,68 @@ Ask questions about a recording's content using AI.
 }
 ```
 
+**Sources.** With `"with_sources": true`, the transcript goes to the model with segment markers and the answer cites segments with short quotes. Citations in `response` become `[1]`, `[2]`, and `sources` lists them:
+
+```json
+{
+  "response": "The freeze covers travel only [1].",
+  "sources": [{"n": 1, "segment_index": 12, "start_time": 754.2, "end_time": 761.0,
+               "speaker": "Dana", "quote": "the budget freeze applies to travel only", "verified": true}]
+}
+```
+
+`verified` is `true` when the quote appears in that segment (ignoring case and spacing). A citation of a segment that does not exist has `segment_index: null` and `verified: false`.
+
+The notes in the chat context are the ones you can see: your own for your recordings, your personal notes for a recording shared with you. Chat sends the transcript to the chat model of the instance; `GET /api/v1/capabilities` reports `models_local`.
+
+---
+
+## Inquire
+
+### Ask Across Recordings
+
+```http
+POST /api/v1/inquire
+```
+
+**Scope:** `process`
+
+Answers a question from the recordings you can read, with Inquire's search (and the Inquire agent when the administrator turned it on). Needs Inquire mode on the instance (`403 feature_disabled` otherwise).
+
+```json
+{
+  "question": "What did we decide about the course redesign?",
+  "filters": {"recording_ids": [412, 398], "tag_ids": [], "folder_ids": [], "speakers": [], "date_from": "2026-09-01", "date_to": null},
+  "scope": "own",
+  "mode": "auto",
+  "stream": false,
+  "history": []
+}
+```
+
+- `mode`: `rag`, `agent` (`403 feature_disabled` when the agent is off) or `auto` (the agent when it is on).
+- `scope`: `own`, `shared` or `all`, as on [List Recordings](#list-recordings).
+- `stream: true` returns the server-sent events of the web app's Inquire (`delta`, `status`, `agent_step`, `agent_summary`, `error`).
+
+**Response** (`stream: false`):
+
+```json
+{
+  "answer": "The redesign moves the project to week 6 [1] and drops the midterm [2].",
+  "citations": [
+    {"n": 1, "recording_id": 412, "title": "Weekly sync", "start_time": 754, "quote": null,
+     "url": "/recordings/412?t=754"},
+    {"n": 2, "recording_id": 398, "title": "Budget review", "start_time": null, "quote": null,
+     "url": "/recordings/398"}
+  ],
+  "mode_used": "agent",
+  "steps": 4,
+  "usage": null
+}
+```
+
+Every citation names a recording you can read. The question and the matching transcript passages go to the instance's chat model.
+
 ---
 
 ## Events
@@ -826,7 +1473,9 @@ Ask questions about a recording's content using AI.
 GET /api/v1/recordings/{id}/events
 ```
 
-Returns calendar events extracted from the recording.
+**Scope:** `read`
+
+Returns calendar events extracted from the recording. The `events` in [Get Recording Details](#get-recording-details) are the same objects.
 
 **Response:**
 
@@ -835,15 +1484,27 @@ Returns calendar events extracted from the recording.
   "events": [
     {
       "id": 1,
+      "recording_id": 412,
       "title": "Follow-up Meeting",
-      "start_datetime": "2024-01-22T10:00:00Z",
-      "end_datetime": "2024-01-22T11:00:00Z",
+      "start_datetime": "2024-01-22T10:00:00",
+      "end_datetime": "2024-01-22T11:00:00",
+      "floating": true,
       "description": "Discuss project progress",
-      "location": "Conference Room A"
+      "location": "Conference Room A",
+      "attendees": [
+        {"name": "Dana Lee", "email": null},
+        {"name": "Priya Shah", "email": "priya@example.org"}
+      ],
+      "reminder_minutes": 15,
+      "created_at": "2024-01-15T10:05:00"
     }
   ]
 }
 ```
+
+- `floating: true`: `start_datetime` and `end_datetime` are wall-clock times as said in the recording, without a time zone. Show them as they are, in the user's own zone.
+- `attendees` are objects: a name, an address, or both. A name the transcript gave without an address has `email: null`.
+- Before v0.10.11-alpha, `attendees` in the recording details were plain strings.
 
 ### Download Events as ICS
 
@@ -851,7 +1512,9 @@ Returns calendar events extracted from the recording.
 GET /api/v1/recordings/{id}/events/ics
 ```
 
-Returns an ICS file containing all events from the recording.
+**Scope:** `read`
+
+Returns an ICS file containing all events from the recording. Times are floating (no zone). Attendees with an address are `ATTENDEE` entries; names without an address are listed at the end of the description. `reminder_minutes` becomes an alarm.
 
 ---
 
@@ -862,6 +1525,8 @@ Returns an ICS file containing all events from the recording.
 ```http
 GET /api/v1/recordings/{id}/audio
 ```
+
+**Scope:** `read`
 
 **Query Parameters:**
 
@@ -878,6 +1543,8 @@ GET /api/v1/recordings/{id}/audio
 ```http
 PATCH /api/v1/recordings/batch
 ```
+
+**Scope:** `write`
 
 **Request Body:**
 
@@ -917,6 +1584,8 @@ Supported `updates` fields: `is_inbox`, `is_highlighted`, `add_tag_ids`, `remove
 DELETE /api/v1/recordings/batch
 ```
 
+**Scope:** `delete`
+
 **Request Body:**
 
 ```json
@@ -930,6 +1599,8 @@ DELETE /api/v1/recordings/batch
 ```http
 POST /api/v1/recordings/batch/transcribe
 ```
+
+**Scope:** `process`
 
 **Request Body:**
 
@@ -955,6 +1626,8 @@ Folders can be personal or group-scoped. Personal folders are editable only by t
 ```http
 GET /api/v1/folders
 ```
+
+**Scope:** `read`
 
 Returns personal folders plus any group folders you have access to.
 
@@ -998,6 +1671,8 @@ Returns personal folders plus any group folders you have access to.
 GET /api/v1/folders/{id}
 ```
 
+**Scope:** `read`
+
 Returns a single folder. You must own a personal folder, or be a member of the group for a group folder. The response is the folder object above (with `can_edit`).
 
 ### Create Folder
@@ -1005,6 +1680,8 @@ Returns a single folder. You must own a personal folder, or be a member of the g
 ```http
 POST /api/v1/folders
 ```
+
+**Scope:** `write`
 
 **Request Body:**
 
@@ -1031,6 +1708,8 @@ Only `name` is required. Set `group_id` to create a group folder (you must be an
 ```http
 PATCH /api/v1/folders/{id}
 PUT   /api/v1/folders/{id}
+
+**Scope:** `write`
 ```
 
 Accepts the same fields as create; all are optional. Only the folder owner (personal) or a group admin (group folder) may update. Returns the updated folder.
@@ -1040,6 +1719,8 @@ Accepts the same fields as create; all are optional. Only the folder owner (pers
 ```http
 DELETE /api/v1/folders/{id}
 ```
+
+**Scope:** `delete`
 
 Recordings in the deleted folder are unassigned (their `folder_id` becomes `null`); they are not deleted. Only the folder owner (personal) or a group admin (group folder) may delete.
 
@@ -1061,6 +1742,8 @@ Recordings in the deleted folder are unassigned (their `folder_id` becomes `null
 ```http
 GET /api/v1/transcription
 ```
+
+**Scope:** `read`
 
 Returns the active transcription connector, the optional fields it accepts, the admin-curated list of selectable models, and the configured default model. Use this to drive client UIs and to know which values are valid for the `transcription_model` override on `/recordings/{id}/transcribe` and `/recordings/upload`.
 
@@ -1094,7 +1777,7 @@ Returns the active transcription connector, the optional fields it accepts, the 
 Webhooks deliver event notifications to an external URL when things happen to your recordings. Each webhook is owned by the user who creates it. The number of webhooks per user is capped (default 10, configurable by the administrator via `WEBHOOK_MAX_PER_USER`).
 
 !!! info "Delivery security and reliability"
-    Each delivery is signed with an HMAC-SHA256 signature sent in the `Speakr-Signature` header (formatted as `sha256=<hex>`), computed over the raw request body using the webhook's secret. Deliveries also carry `Speakr-Delivery-Id` (a UUID for idempotency), `Speakr-Event` (the event type), and `Speakr-Timestamp` headers. Failed deliveries are retried automatically; after a configurable number of consecutive failures (`WEBHOOK_AUTOPAUSE_FAILURES`, default 10) the webhook is auto-paused (`auto_paused: true`, `enabled: false`). Re-enabling it manually clears the auto-pause flag.
+    Each delivery is signed twice with the webhook's secret: `Speakr-Signature-V2` (`t=<send time>,v1=<hex>`, HMAC-SHA256 of `"<t>." + raw body`; verify this one when present) and `Speakr-Signature` (`sha256=<hex>` of the raw body). Deliveries also carry `Speakr-Delivery-Id` (a UUID for idempotency; answer `2xx` to a repeat), `Speakr-Event`, `Speakr-Attempt`, and `Speakr-Timestamp` (not signed). `recording.updated` fires for every visible change, from the web app or the API. Failed deliveries are retried automatically; after a configurable number of consecutive failures (`WEBHOOK_AUTOPAUSE_FAILURES`, default 10) the webhook is auto-paused (`auto_paused: true`, `enabled: false`). Re-enabling it manually clears the auto-pause flag.
 
 For administrator-level configuration and receiver setup, see the [Webhooks admin guide](../admin-guide/webhooks.md).
 
@@ -1113,6 +1796,8 @@ These are the event types a webhook can subscribe to:
 | `recording.events.extracted` | Calendar events are extracted |
 | `recording.updated` | A recording is updated |
 | `recording.deleted` | A recording is deleted |
+| `recording.share.created` | A public share link is created |
+| `recording.share.revoked` | A public share link is revoked |
 | `webhook.test` | A manual test delivery (see Test Webhook below) |
 
 ### List Webhooks
@@ -1120,6 +1805,8 @@ These are the event types a webhook can subscribe to:
 ```http
 GET /api/v1/webhooks
 ```
+
+**Scope:** `webhooks`
 
 **Response:**
 
@@ -1165,6 +1852,8 @@ The webhook's HMAC `secret` is **never** returned by this endpoint. It is shown 
 POST /api/v1/webhooks
 ```
 
+**Scope:** `webhooks`
+
 **Request Body:**
 
 ```json
@@ -1205,6 +1894,8 @@ POST /api/v1/webhooks
 GET /api/v1/webhooks/{id}
 ```
 
+**Scope:** `webhooks`
+
 Returns the webhook object (without the secret).
 
 ### Update Webhook
@@ -1212,6 +1903,8 @@ Returns the webhook object (without the secret).
 ```http
 PATCH /api/v1/webhooks/{id}
 ```
+
+**Scope:** `webhooks`
 
 **Request Body** (all fields optional):
 
@@ -1233,6 +1926,8 @@ When provided, `events` must be a non-empty array of known event types. Setting 
 DELETE /api/v1/webhooks/{id}
 ```
 
+**Scope:** `webhooks`
+
 Returns `204 No Content`.
 
 ### Rotate Secret
@@ -1241,6 +1936,8 @@ Returns `204 No Content`.
 POST /api/v1/webhooks/{id}/rotate-secret
 ```
 
+**Scope:** `webhooks`
+
 Generates a fresh HMAC secret and returns the webhook object with the new `secret` included once. Existing deliveries already signed with the old secret are not re-signed.
 
 ### Test Webhook
@@ -1248,6 +1945,8 @@ Generates a fresh HMAC secret and returns the webhook object with the new `secre
 ```http
 POST /api/v1/webhooks/{id}/test
 ```
+
+**Scope:** `webhooks`
 
 Enqueues a synthetic `webhook.test` delivery against this single webhook so you can verify reachability before subscribing to production events. The webhook must be enabled (otherwise `409`).
 
@@ -1258,6 +1957,8 @@ Enqueues a synthetic `webhook.test` delivery against this single webhook so you 
 ```http
 GET /api/v1/webhooks/{id}/deliveries
 ```
+
+**Scope:** `webhooks`
 
 **Query Parameters:**
 
@@ -1297,6 +1998,8 @@ Delivery `status` is one of `pending`, `success`, `failed` (retryable), or `perm
 GET /api/v1/webhooks/{id}/deliveries/{delivery_id}
 ```
 
+**Scope:** `webhooks`
+
 Returns a single delivery. This response additionally includes the full serialized `payload` (the exact JSON body that was/will be POSTed) for debugging.
 
 ### Replay Delivery
@@ -1304,6 +2007,8 @@ Returns a single delivery. This response additionally includes the full serializ
 ```http
 POST /api/v1/webhooks/{id}/deliveries/{delivery_id}/replay
 ```
+
+**Scope:** `webhooks`
 
 Re-enqueues the delivery as a brand-new attempt with the same payload (with a fresh `event_id` and timestamp, plus a `replayed_from` reference to the original). Returns the new delivery object with `202`.
 
@@ -1315,9 +2020,12 @@ All endpoints return consistent error responses:
 
 ```json
 {
-  "error": "Error message description"
+  "error": "Error message description",
+  "code": "insufficient_scope"
 }
 ```
+
+`error` is written in the interface language of the account that owns the token (Account > Interface Language), and in English when none is set. `code` is a machine-readable value that is the same in every language, for example `insufficient_scope`, `invalid_parameter` or `not_found`. A client is built on `code` and the HTTP status, not on the text of `error`. Errors that pass on the text of an unexpected exception carry no `code`.
 
 **Common HTTP Status Codes:**
 
@@ -1327,23 +2035,51 @@ All endpoints return consistent error responses:
 | `201` | Created |
 | `400` | Bad Request - Invalid parameters |
 | `401` | Unauthorized - Invalid or missing token |
-| `403` | Forbidden - No permission for this resource |
-| `404` | Not Found - Resource doesn't exist |
+| `403` | Forbidden - You can see the recording but this request needs more (edit access, ownership, a target folder), or the token lacks a scope (`insufficient_scope`) |
+| `404` | Not Found - Resource doesn't exist. A recording you cannot see gets the same answer as an id that does not exist, in single and batch requests |
+| `429` | Too Many Requests - Rate limit reached; wait `Retry-After` seconds |
 | `500` | Internal Server Error |
 
 ---
 
 ## Rate Limits
 
-API endpoints are rate-limited to prevent abuse:
+Requests made with an API token are held by two limits for each kind of request. Both are counted separately for each endpoint:
 
-| Endpoint Type | Limit |
-|---------------|-------|
-| Stats | 60 requests/minute |
-| GET endpoints | 100 requests/minute |
-| PATCH/DELETE | 30 requests/minute |
-| Processing operations | 10 requests/minute |
-| Batch operations | 10 requests/minute |
+- **Token limit.** Each token has its own budget, so two integrations with their own tokens do not share it.
+- **Account limit.** On each endpoint, all tokens of one account draw on one budget, so a further token adds no throughput there.
+
+| Kind | Endpoints | Token limit | Account limit |
+|------|-----------|-------------|---------------|
+| Read | Endpoints that need only `read` | 120 requests/minute (`API_TOKEN_RATE_LIMIT_READ`) | 240 requests/minute (`API_USER_RATE_LIMIT_READ`) |
+| Write | Endpoints that need `write`, `upload`, `share`, `delete`, `webhooks` or `account` | 30 requests/minute (`API_TOKEN_RATE_LIMIT_WRITE`) | 60 requests/minute (`API_USER_RATE_LIMIT_WRITE`) |
+| Process | Endpoints that need `process` | 10 requests/minute (`API_TOKEN_RATE_LIMIT_PROCESS`) | 20 requests/minute (`API_USER_RATE_LIMIT_PROCESS`) |
+
+An account limit that is not set is twice the token limit of the same kind, so a client with a single token is held by its token limit. Because both limits are per endpoint, a client that polls several endpoints, such as a mail client during a sync, is never refused by the account limit while each endpoint stays within its token limit. The limits apply to full-access and scoped tokens alike. A request that the token limit refuses does not count against the account limit.
+
+A request over a limit gets `429` with a `Retry-After` header in seconds. The body names the limit that ran out:
+
+```json
+{
+  "error": "Rate limit reached for your account: 240 per minute (read requests on this endpoint), shared by all your API tokens.",
+  "code": "account_rate_limit_exceeded",
+  "limit": "240 per 1 minute"
+}
+```
+
+`code` is `token_rate_limit_exceeded` for the token limit and `account_rate_limit_exceeded` for the account limit. Responses also carry `X-RateLimit-Limit`, `X-RateLimit-Remaining` and `X-RateLimit-Reset`; while no limit is exceeded, these headers describe the token limit only. Base a client on the `429` body, not on the header values.
+
+Requests from the web interface keep the per-address limits of the application (1000 per hour and 5000 per day). The [ASR Voice Recorder upload](#asr-voice-recorder-upload) carries its token in the form body, so neither limit applies to it; that endpoint keeps its own per-address limit.
+
+**Several worker processes.** By default the counters are kept in the memory of each worker process. The standard image starts three gunicorn workers, so each limit, the login and registration limits included, is in effect up to about three times its configured value. With `RATELIMIT_STORAGE_URI` set to a Redis or Valkey server, the limits are exact. The image includes the Redis client. The server is run as a separate container, for example in the same Docker Compose file as Speakr:
+
+```yaml
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+```
+
+with `RATELIMIT_STORAGE_URI=redis://redis:6379/0` in `.env`. The counters need no persistence, so no volume is required. While the server is unreachable, counting falls back to the memory of each process and requests are served as before. A Memcached URI (`memcached://`) is also accepted, in an image with the `pymemcache` package added; Speakr does not start with a backend URI whose client is missing.
 
 ---
 

@@ -8,6 +8,7 @@ import logging
 import os
 from datetime import datetime
 from sqlalchemy import func
+from sqlalchemy.orm import query_expression, validates
 from src.database import db
 from src.utils import md_to_html
 
@@ -22,9 +23,23 @@ class Recording(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     # Title will now often be AI-generated, maybe start with filename?
     title = db.Column(db.String(200), nullable=True)  # Allow Null initially
+    # Where the title came from (#412): 'user' (typed in a form, edit or API),
+    # 'auto' (title step: AI, naming template or filename). NULL for recordings
+    # from before #412 and for placeholders; see utils.titles.title_is_user_chosen.
+    title_source = db.Column(db.String(16), nullable=True)
     participants = db.Column(db.String(500))
     notes = db.Column(db.Text)
+    # 1 or 0 from the list page query (src/services/recording_list.py), so
+    # to_list_dict can report has_notes without loading the notes text (#508).
+    # None when the query did not compute it.
+    list_has_notes = query_expression()
     transcription = db.Column(db.Text, nullable=True)
+    # Language the transcription service reported for THIS recording, as an
+    # ISO 639-1 code. Recorded at transcription time rather than read from the
+    # user's preference, which is a live setting and would describe today's
+    # configuration rather than the audio. None when the backend did not
+    # report one, or reported something that is not a language code.
+    transcription_language = db.Column(db.String(20), nullable=True)
     summary = db.Column(db.Text, nullable=True)
     status = db.Column(db.String(50), default='PENDING')  # PENDING, PROCESSING, SUMMARIZING, COMPLETED, FAILED
     audio_path = db.Column(db.String(500))
@@ -34,9 +49,17 @@ class Recording(db.Model):
     original_filename = db.Column(db.String(500), nullable=True)  # Store the original uploaded filename
     is_inbox = db.Column(db.Boolean, default=True)  # New recordings are marked as inbox by default
     is_highlighted = db.Column(db.Boolean, default=False)  # Recordings can be highlighted by the user
+    is_archived = db.Column(db.Boolean, default=False)  # Hidden from the main list, nothing deleted (#394)
     mime_type = db.Column(db.String(100), nullable=True)
     audio_duration_seconds = db.Column(db.Float, nullable=True)  # Cached audio duration to avoid materializing remote storage during serialization
     completed_at = db.Column(db.DateTime, nullable=True)
+    # Last change a client can see (mailr spec G2); set by the before_flush
+    # listener in src/services/recording_changes.py, never by hand.
+    updated_at = db.Column(db.DateTime, nullable=True, index=True)
+    # API upload retries (mailr spec G8): a repeat with the same key by the same
+    # user within 24 hours returns this recording. Unique per user
+    # (ux_recording_user_idem, #476); an expired key is cleared before reuse.
+    upload_idempotency_key = db.Column(db.String(100), nullable=True)
     processing_time_seconds = db.Column(db.Integer, nullable=True)
     transcription_duration_seconds = db.Column(db.Integer, nullable=True)  # Time taken for transcription
     # Cached audio duration in seconds, populated at transcription
@@ -62,6 +85,11 @@ class Recording(db.Model):
 
     # Speaker embeddings from diarization (JSON dict mapping speaker IDs to 256-dimensional vectors)
     speaker_embeddings = db.Column(db.JSON, nullable=True)
+    # Voice embedding space the embeddings above came from (NULL: legacy space)
+    speaker_embeddings_space_id = db.Column(db.Integer, nullable=True)
+    # Diarization label -> the name it was assigned, so a later rename can
+    # still find the label's embedding after the transcript shows names.
+    speaker_label_map = db.Column(db.JSON, nullable=True)
 
     # Per-recording prompt-template variables (e.g. {"agenda": "...", "attendees": "..."}).
     # Substituted into {{name}} placeholders in the resolved summary prompt at summarisation time.
@@ -73,6 +101,12 @@ class Recording(db.Model):
     # used and pre-fill them on reprocess (issue #309). Null = none were applied.
     resolved_hotwords = db.Column(db.Text, nullable=True)
     resolved_initial_prompt = db.Column(db.Text, nullable=True)
+
+    # Rendered auto-export filename WITHOUT the .md extension (#348). Set on
+    # first export and authoritative from then on: re-exports overwrite this
+    # file and deletion renames it. Null = legacy "recording_{id}" naming, so
+    # existing deployments keep working with their existing files.
+    export_filename = db.Column(db.String(500), nullable=True)
 
     # Folder relationship (one-to-many: a recording belongs to at most one folder)
     folder_id = db.Column(db.Integer, db.ForeignKey('folder.id', ondelete='SET NULL'), nullable=True, index=True)
@@ -86,7 +120,7 @@ class Recording(db.Model):
         """Get tags ordered by the order they were added to this recording."""
         return [assoc.tag for assoc in sorted(self.tag_associations, key=lambda x: x.order)]
 
-    def get_visible_tags(self, viewer_user):
+    def get_visible_tags(self, viewer_user, member_group_ids=None):
         """
         Get tags that are visible to a specific user viewing this recording.
 
@@ -99,6 +133,9 @@ class Recording(db.Model):
 
         Args:
             viewer_user: User object viewing the recording (or None for backward compatibility)
+            member_group_ids: optional set of the viewer's group ids, when a list
+                has read them once for its page (see group_ids_of); otherwise
+                each group tag costs one membership query
 
         Returns:
             List of Tag objects visible to the viewer
@@ -117,10 +154,13 @@ class Recording(db.Model):
         for tag in self.tags:
             # Group tags: visible if viewer is a member of the group
             if tag.group_id:
-                membership = GroupMembership.query.filter_by(
-                    group_id=tag.group_id,
-                    user_id=viewer_user.id
-                ).first()
+                if member_group_ids is not None:
+                    membership = tag.group_id in member_group_ids
+                else:
+                    membership = GroupMembership.query.filter_by(
+                        group_id=tag.group_id,
+                        user_id=viewer_user.id
+                    ).first()
                 if membership:
                     visible_tags.append(tag)
             # Personal tags: visible only to tag creator
@@ -129,6 +169,15 @@ class Recording(db.Model):
                     visible_tags.append(tag)
 
         return visible_tags
+
+    @validates('title')
+    def _clip_title(self, key, value):
+        # The column holds 200 characters; PostgreSQL refuses a longer value,
+        # so a long title from the API, a naming template or the AI title
+        # step is shortened here, whatever path set it
+        if isinstance(value, str) and len(value) > 200:
+            return value[:200]
+        return value
 
     def get_user_notes(self, user):
         """
@@ -268,24 +317,34 @@ class Recording(db.Model):
             }
         return None
 
-    def _serialize_tags_and_folder(self, viewer_user, share_map=None):
+    def _serialize_tags_and_folder(self, viewer_user, share_map=None, batch=None):
         """Build (tags, folder, folder_id) for a viewer, applying #314 rules.
 
-        For a recording the viewer does NOT own, only the tag/folder that GRANTED
-        access (the share-reason, from the InternalShare row) is surfaced, each
-        flagged ``is_foreign: True`` so the UI can mark it and keep it
-        non-filterable. The owner's other tags/folder are never leaked. Owners
-        (and the no-viewer backward-compat case) see their tags/folder normally.
+        For a recording the viewer does NOT own, the share-reason (from the
+        InternalShare row) is surfaced and flagged ``is_foreign: True`` so the
+        UI can mark it and keep it non-filterable.  A group-tag share also
+        surfaces the other tags on this recording from that same group: group
+        tags are shared context for its members, unlike the owner's personal
+        tags.  Tags from other groups and the owner's personal tags/folder are
+        never leaked. Owners (and the no-viewer backward-compat case) see their
+        tags/folder normally.
 
         share_map: optional {recording_id: InternalShare} to avoid an N+1 query
         in list views; falls back to a per-recording lookup when not provided.
+        batch: optional RecordingListBatch with the page's visible tags and
+        tag/folder counts (D#483).
         """
-        visible_tags = self.get_visible_tags(viewer_user)
+        if batch is not None:
+            visible_tags = batch.visible_tags(self)
+            tag_dict, folder_dict = batch.tag_dict, batch.folder_dict
+        else:
+            visible_tags = self.get_visible_tags(viewer_user)
+            tag_dict, folder_dict = (lambda tag: tag.to_dict()), (lambda folder: folder.to_dict())
         is_foreign = viewer_user is not None and self.user_id != viewer_user.id
 
         if not is_foreign:
-            tags = [tag.to_dict() for tag in visible_tags] if visible_tags else []
-            folder = self.folder.to_dict() if self.folder else None
+            tags = [tag_dict(tag) for tag in visible_tags] if visible_tags else []
+            folder = folder_dict(self.folder) if self.folder else None
             return tags, folder, self.folder_id
 
         from src.models.sharing import InternalShare
@@ -299,19 +358,35 @@ class Recording(db.Model):
         reason_folder_id = getattr(share, 'source_folder_id', None) if share else None
 
         tags = []
-        if reason_tag_id:
-            for tag in visible_tags:
-                if tag.id == reason_tag_id:
-                    td = tag.to_dict()
-                    td['is_foreign'] = True
-                    tags.append(td)
+        reason_tag = next((tag for tag in visible_tags if tag.id == reason_tag_id), None)
+        if reason_tag:
+            if share and share.source_type == 'group_tag' and reason_tag.group_id:
+                # Group tags are shared metadata for their own group.  Include
+                # only the tags from the group that granted access, so a
+                # recipient never learns the recording's tags from another
+                # group they may also belong to.
+                tags_to_surface = [
+                    tag for tag in visible_tags if tag.group_id == reason_tag.group_id
+                ]
+            else:
+                tags_to_surface = [reason_tag]
+
+            for tag in tags_to_surface:
+                td = tag_dict(tag)
+                td['is_foreign'] = True
+                tags.append(td)
         if reason_folder_id and self.folder_id == reason_folder_id and self.folder:
-            folder = self.folder.to_dict()
+            folder = folder_dict(self.folder)
             folder['is_foreign'] = True
             return tags, folder, self.folder_id
         return tags, None, None
 
-    def to_list_dict(self, viewer_user=None, duplicate_info_map=None, share_map=None):
+    def updated_at_z(self):
+        """updated_at (created_at before the first change) as ISO 8601 with Z."""
+        value = self.updated_at or self.created_at
+        return value.strftime('%Y-%m-%dT%H:%M:%S.%fZ') if value else None
+
+    def to_list_dict(self, viewer_user=None, duplicate_info_map=None, share_map=None, batch=None):
         """
         Lightweight dict for list views - excludes expensive HTML conversions.
 
@@ -319,21 +394,33 @@ class Recording(db.Model):
             viewer_user: User viewing the recording (for tag visibility filtering)
             share_map: optional {recording_id: InternalShare} for #314 share-reason
                 resolution without an N+1 query.
+            batch: optional RecordingListBatch (src/services/recording_list.py)
+                built for viewer_user over the page: share counts, duplicates,
+                visible tags and tag/folder counts come from it instead of
+                per-row queries (D#483).
         """
         # Import here to avoid circular dependencies
         from src.models.sharing import InternalShare, Share
 
-        # Count internal shares for this recording
-        shared_with_count = db.session.query(func.count(InternalShare.id)).filter(
-            InternalShare.recording_id == self.id
-        ).scalar() or 0
+        if batch is not None:
+            shared_with_count = batch.shared_with_counts.get(self.id, 0)
+            public_share_count = batch.public_share_counts.get(self.id, 0)
+            duplicate_info = batch.duplicate_info(self)
+            if share_map is None:
+                share_map = batch.share_map
+        else:
+            # Count internal shares for this recording
+            shared_with_count = db.session.query(func.count(InternalShare.id)).filter(
+                InternalShare.recording_id == self.id
+            ).scalar() or 0
 
-        # Count public shares (link shares) for this recording
-        public_share_count = db.session.query(func.count(Share.id)).filter(
-            Share.recording_id == self.id
-        ).scalar() or 0
+            # Count public shares (link shares) for this recording
+            public_share_count = db.session.query(func.count(Share.id)).filter(
+                Share.recording_id == self.id
+            ).scalar() or 0
+            duplicate_info = self._dup_from_map_or_query(duplicate_info_map)
 
-        tags_ser, folder_ser, folder_id_ser = self._serialize_tags_and_folder(viewer_user, share_map)
+        tags_ser, folder_ser, folder_id_ser = self._serialize_tags_and_folder(viewer_user, share_map, batch)
 
         return {
             'id': self.id,
@@ -341,17 +428,21 @@ class Recording(db.Model):
             'participants': self.participants,
             # Cheap boolean (full notes text is excluded from the list for
             # lightness) — lets the merge modal offer this recording as a notes
-            # source without loading every recording's notes.
-            'has_notes': bool(self.notes and self.notes.strip()),
+            # source without loading every recording's notes. List pages
+            # compute it in SQL (list_has_notes) and leave notes unloaded.
+            'has_notes': (bool(self.notes and self.notes.strip()) if self.list_has_notes is None
+                          else bool(self.list_has_notes)),
             'status': self.status,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'completed_at': self.completed_at.isoformat() if self.completed_at else None,
+            'updated_at': self.updated_at_z(),
             'meeting_date': self.meeting_date.isoformat() if self.meeting_date else None,
             'file_size': self.file_size,
             'original_filename': self.original_filename,
             'mime_type': self.mime_type,  # cheap column read; lets the sidebar mark video recordings without opening them
             'is_inbox': self.is_inbox,
             'is_highlighted': self.is_highlighted,
+            'is_archived': bool(self.is_archived),
             'audio_deleted_at': self.audio_deleted_at.isoformat() if self.audio_deleted_at else None,
             'audio_available': self.audio_deleted_at is None,
             # True only when a playable audio file actually exists yet. A merge
@@ -362,7 +453,7 @@ class Recording(db.Model):
             'folder_id': folder_id_ser,
             'folder': folder_ser,
             'tags': tags_ser,
-            'duplicate_info': self._dup_from_map_or_query(duplicate_info_map),
+            'duplicate_info': duplicate_info,
             'shared_with_count': shared_with_count,
             'public_share_count': public_share_count,
             'audio_duration': self.get_audio_duration(),
@@ -389,7 +480,7 @@ class Recording(db.Model):
             return {'total_copies': entry['total_copies'], 'copies': copies}
         return self.get_duplicate_info()
 
-    def to_dict(self, include_html=True, viewer_user=None, duplicate_info_map=None, share_map=None):
+    def to_dict(self, include_html=True, viewer_user=None, duplicate_info_map=None, share_map=None, batch=None):
         """
         Full dict with optional HTML conversion for notes/summary.
 
@@ -398,24 +489,38 @@ class Recording(db.Model):
             viewer_user: User viewing the recording (for tag visibility filtering)
             share_map: optional {recording_id: InternalShare} for #314 share-reason
                 resolution without an N+1 query.
+            batch: optional RecordingListBatch built for viewer_user over the
+                list: share counts, duplicates, visible tags, tag/folder counts
+                and the viewer's notes come from it instead of per-row queries.
+                A duplicate_info_map, when given, still decides duplicate_info.
         """
         # Import here to avoid circular dependencies
         from src.models.sharing import InternalShare, Share
 
-        # Count internal shares for this recording
-        shared_with_count = db.session.query(func.count(InternalShare.id)).filter(
-            InternalShare.recording_id == self.id
-        ).scalar() or 0
+        if batch is not None:
+            shared_with_count = batch.shared_with_counts.get(self.id, 0)
+            public_share_count = batch.public_share_counts.get(self.id, 0)
+            if share_map is None:
+                share_map = batch.share_map
+            user_notes = batch.user_notes(self) if viewer_user is not None else self.notes
+            duplicate_info = (self._dup_from_map_or_query(duplicate_info_map) if duplicate_info_map is not None
+                              else batch.duplicate_info(self))
+        else:
+            # Count internal shares for this recording
+            shared_with_count = db.session.query(func.count(InternalShare.id)).filter(
+                InternalShare.recording_id == self.id
+            ).scalar() or 0
 
-        # Count public shares (link shares) for this recording
-        public_share_count = db.session.query(func.count(Share.id)).filter(
-            Share.recording_id == self.id
-        ).scalar() or 0
+            # Count public shares (link shares) for this recording
+            public_share_count = db.session.query(func.count(Share.id)).filter(
+                Share.recording_id == self.id
+            ).scalar() or 0
 
-        tags_ser, folder_ser, folder_id_ser = self._serialize_tags_and_folder(viewer_user, share_map)
+            # Get user-specific notes
+            user_notes = self.get_user_notes(viewer_user)
+            duplicate_info = self._dup_from_map_or_query(duplicate_info_map)
 
-        # Get user-specific notes
-        user_notes = self.get_user_notes(viewer_user)
+        tags_ser, folder_ser, folder_id_ser = self._serialize_tags_and_folder(viewer_user, share_map, batch)
 
         data = {
             'id': self.id,
@@ -423,10 +528,12 @@ class Recording(db.Model):
             'participants': self.participants,
             'notes': user_notes,
             'transcription': self.transcription,
+            'transcription_language': self.transcription_language,
             'summary': self.summary,
             'status': self.status,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'completed_at': self.completed_at.isoformat() if self.completed_at else None,
+            'updated_at': self.updated_at_z(),
             'processing_time_seconds': self.processing_time_seconds,
             'transcription_duration_seconds': self.transcription_duration_seconds,
             'summarization_duration_seconds': self.summarization_duration_seconds,
@@ -436,6 +543,7 @@ class Recording(db.Model):
             'user_id': self.user_id,
             'is_inbox': self.is_inbox,
             'is_highlighted': self.is_highlighted,
+            'is_archived': bool(self.is_archived),
             'mime_type': self.mime_type,
             'audio_deleted_at': self.audio_deleted_at.isoformat() if self.audio_deleted_at else None,
             'audio_available': self.audio_deleted_at is None,
@@ -448,7 +556,7 @@ class Recording(db.Model):
             'prompt_variables': self.prompt_variables or {},
             'resolved_hotwords': self.resolved_hotwords,
             'resolved_initial_prompt': self.resolved_initial_prompt,
-            'duplicate_info': self._dup_from_map_or_query(duplicate_info_map),
+            'duplicate_info': duplicate_info,
             'shared_with_count': shared_with_count,
             'public_share_count': public_share_count,
             'keep_audio_only': self.keep_audio_only,
@@ -482,6 +590,8 @@ class TranscriptChunk(db.Model):
     # Composite index for efficient speaker name lookups scoped to user
     __table_args__ = (
         db.Index('idx_user_speaker_name', 'user_id', 'speaker_name'),
+        # Chunks are read and deleted by recording, in order (D#441)
+        db.Index('ix_transcript_chunk_recording', 'recording_id', 'chunk_index'),
     )
 
     # Relationships
@@ -500,3 +610,21 @@ class TranscriptChunk(db.Model):
             'speaker_name': self.speaker_name,
             'created_at': self.created_at.isoformat() if self.created_at else None
         }
+
+
+class RecordingTombstone(db.Model):
+    """A recording a user can no longer see, for the changes feed (mailr spec G2).
+
+    No foreign key to the recording: the row outlives it. Written by the
+    before_flush listener in src/services/recording_changes.py; pruned after
+    RECORDING_TOMBSTONE_DAYS.
+    """
+    __tablename__ = 'recording_tombstone'
+
+    id = db.Column(db.Integer, primary_key=True)
+    recording_id = db.Column(db.Integer, nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id', ondelete='CASCADE'), nullable=False)
+    deleted_at = db.Column(db.DateTime, nullable=False, index=True)
+    reason = db.Column(db.String(20), nullable=False, default='deleted')  # deleted | retention | access_revoked
+
+    __table_args__ = (db.Index('ix_recording_tombstone_user_deleted', 'user_id', 'deleted_at'),)

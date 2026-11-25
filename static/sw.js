@@ -1,9 +1,15 @@
-const CACHE_NAME = 'Speakr-cache-v4';
+// The registration URL carries the app version as ?v=<version> (see
+// app.modular.js). Deriving the cache name from it gives every release its
+// own cache namespace, so the activate handler below clears the previous
+// release's app shell instead of serving it forever (issue #357).
+const APP_VERSION = new URLSearchParams(self.location.search).get('v') || 'v5';
+const CACHE_NAME = `Speakr-cache-${APP_VERSION}`;
 const ASSETS_TO_CACHE = [
   '/',
   '/static/offline.html',
   '/static/manifest.json',
   '/static/css/styles.css',
+  '/static/css/tailwind.css',
   '/static/js/app.modular.js',
   '/static/js/i18n.js',
   '/static/js/csrf-refresh.js',
@@ -11,7 +17,6 @@ const ASSETS_TO_CACHE = [
   '/static/img/icon-512x512.png',
   '/static/img/favicon.ico',
   // Local vendor assets (no external CDN dependencies)
-  '/static/vendor/js/tailwind.min.js',
   '/static/vendor/js/vue.global.js',
   '/static/vendor/js/marked.min.js',
   '/static/vendor/js/easymde.min.js',
@@ -176,7 +181,24 @@ self.addEventListener('activate', (event) => {
             return caches.delete(name);
           })
       );
-    }).then(() => {
+    }).then(async () => {
+      // Purge any media responses cached by previous service worker versions
+      // within the SAME cache namespace (#374): a cached 200 for /audio/<id>
+      // would be served to the media element's Range requests and stall
+      // playback persistently for that user.
+      try {
+        const cache = await caches.open(CACHE_NAME);
+        const keys = await cache.keys();
+        await Promise.all(keys.map((req) => {
+          const p = new URL(req.url).pathname;
+          if (p.startsWith('/audio/') || p.startsWith('/share/audio/') || p.startsWith('/speakers/snippet-audio/')) {
+            return cache.delete(req);
+          }
+          return Promise.resolve();
+        }));
+      } catch (e) {
+        console.warn('Service Worker: media cache purge failed:', e);
+      }
       console.log('Service Worker: Activated and old caches cleared.');
       return self.clients.claim(); // Take control of all open clients
     })
@@ -193,6 +215,21 @@ self.addEventListener('fetch', (event) => {
     return; // Or simply return to let the browser handle it
   }
 
+  // Media streams must bypass the service worker entirely (#374). The media
+  // element manages its own Range requests; proxying them through the Cache
+  // API breaks playback: cache.put() rejects 206 responses, a cached 200
+  // served to a Range request wedges the media pipeline, and the inner
+  // fetch() ignores the element's aborts, leaking held-open connections.
+  // Returning without respondWith lets the browser handle these natively.
+  if (request.headers.has('range') ||
+      request.destination === 'audio' ||
+      request.destination === 'video' ||
+      url.pathname.startsWith('/audio/') ||
+      url.pathname.startsWith('/share/audio/') ||
+      url.pathname.startsWith('/speakers/snippet-audio/')) {
+    return;
+  }
+
   // Serve API calls from /api/ with stale-while-revalidate
   // (excluding auth-related endpoints)
   if (url.pathname.startsWith('/api/')) {
@@ -205,13 +242,6 @@ self.addEventListener('fetch', (event) => {
     return;
   }
   
-  // Serve /audio/<id> requests with cache-first, then network.
-  // These are media files and can be large, so cache-first is good.
-  if (url.pathname.startsWith('/audio/')) {
-    event.respondWith(cacheFirst(request));
-    return;
-  }
-
   // Handle navigation requests (HTML pages) with network-first, then cache, then offline page.
   if (request.mode === 'navigate') {
     event.respondWith(networkFirst(request));
@@ -230,12 +260,13 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // For static assets listed in ASSETS_TO_CACHE, use cache-first.
-  // This ensures that if an asset path is directly requested, it's served from cache if possible.
-  // We need to match against the origin + pathname for ASSETS_TO_CACHE.
+  // For static assets listed in ASSETS_TO_CACHE, use stale-while-revalidate:
+  // the cached copy keeps loads fast (and works offline), while the
+  // background refetch means a stale shell self-heals on the next load
+  // instead of being pinned until the service worker itself changes.
   const requestPath = url.origin === self.origin ? url.pathname : request.url;
   if (ASSETS_TO_CACHE.includes(requestPath)) {
-    event.respondWith(cacheFirst(request));
+    event.respondWith(staleWhileRevalidate(request));
     return;
   }
 

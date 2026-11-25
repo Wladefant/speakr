@@ -1,3 +1,24 @@
+/* Page-to-page navigation: a short cross-fade between same-origin pages in
+   browsers with cross-document View Transitions (Chrome and Edge 126+, Safari
+   18.2+); elsewhere this rule has no effect. styles.css is loaded on every page,
+   and both pages of a navigation have to opt in. In-page changes (modals,
+   the loading overlay) are not affected. */
+@view-transition {
+    navigation: auto;
+}
+
+::view-transition-old(root),
+::view-transition-new(root) {
+    animation-duration: 150ms;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    ::view-transition-old(root),
+    ::view-transition-new(root) {
+        animation: none;
+    }
+}
+
 body.unloaded {
     opacity: 0;
     transition: opacity 0.5s ease-in-out;
@@ -21,7 +42,7 @@ body.unloaded {
     --bg-danger-hover: #b91c1c; /* red-700 */
     --bg-danger-light: #fce4e4; /* muted red */
     --bg-info-light: #c3d9f7; /* muted blue */
-    --bg-warn-light: #d4e8f5; /* soft blue */
+    --bg-warn-light: #fef3c7; /* amber-100 */
     --bg-success-light: #c6f0dc; /* muted green */
     --bg-pending-light: #eeeeec; /* stone */
     --bg-input: #fafbfc; /* slightly gray white */
@@ -36,7 +57,7 @@ body.unloaded {
     --text-danger: #b91c1c; /* red-700 */
     --text-danger-strong: #991b1b; /* red-800 */
     --text-info-strong: #1e40af; /* blue-800 */
-    --text-warn-strong: #0369a1; /* sky-700 - friendly blue tone */
+    --text-warn-strong: #b45309; /* amber-700 */
     --text-success-strong: #065f46; /* green-800 */
     --text-pending-strong: #44403c; /* stone-700 */
 
@@ -160,7 +181,7 @@ body.unloaded {
     --bg-danger-hover: #ef4444; /* red-500 */
     --bg-danger-light: #7f1d1d; /* red-900 */
     --bg-info-light: #1e3a8a; /* blue-900 */
-    --bg-warn-light: #164e63; /* cyan-800 - soft, friendly dark blue */
+    --bg-warn-light: #78350f; /* amber-900 */
     --bg-success-light: #064e3b; /* green-900 */
     --bg-pending-light: #292524; /* stone-800 */
     --bg-input: #374151; /* gray-700 */
@@ -175,7 +196,7 @@ body.unloaded {
     --text-danger: #f87171; /* red-400 */
     --text-danger-strong: #fca5a5; /* red-300 */
     --text-info-strong: #93c5fd; /* blue-300 */
-    --text-warn-strong: #67e8f9; /* cyan-300 - soft, friendly cyan text */
+    --text-warn-strong: #fcd34d; /* amber-300 */
     --text-success-strong: #6ee7b7; /* green-300 */
     --text-pending-strong: #d6d3d1; /* stone-300 */
 
@@ -443,7 +464,10 @@ main {
     padding-right: 6px; /* Space for scrollbar */
     min-height: 0; /* Added for robust flex scrolling */
 }
-.progress-popup { position: fixed; bottom: 1rem; left: 1rem; z-index: 100; transition: all 0.3s ease-in-out; min-width: 300px; max-width: 400px; border-radius: 12px; overflow: hidden; }
+/* z-index comes from the template's utility class (z-50; DOM-order ties
+   with sidebar/modals) — do not set one here, a higher value would let the
+   popup cover modal footers again. */
+.progress-popup { position: fixed; bottom: 1rem; left: 1rem; transition: all 0.3s ease-in-out; min-width: 300px; max-width: 400px; border-radius: 12px; overflow: hidden; }
 .progress-popup.minimized { transform: translateY(calc(100% - 45px)); }
 .progress-list-item { display: grid; grid-template-columns: auto 1fr auto; gap: 0.5rem; align-items: center; }
 .progress-list-item .truncate { 
@@ -4651,4 +4675,380 @@ select:disabled {
    extend edge-to-edge. No card chrome. */
 .recording-row {
     position: relative;
+}
+
+/* Chat timestamp chips: the recording chat cites moments as bracketed
+   transcript timestamps; they render as clickable pills (same visual
+   language as Inquire citation chips) that seek the in-view player. */
+.chat-ts-chip {
+    display: inline-block;
+    background-color: var(--bg-accent);
+    color: var(--text-accent);
+    border: 1px solid var(--border-accent, var(--border-secondary));
+    border-radius: 9999px;
+    padding: 0.14em 0.55em;
+    font-size: 0.78em;
+    /* Baseline-align the chip's own text with the surrounding sentence and
+       let the pill wrap it symmetrically. Unlike a fixed -0.35em nudge on a
+       tall inline-block (the first attempt), this stays optically in-line at
+       every bubble font size and layout. */
+    line-height: 1.1;
+    vertical-align: baseline;
+    font-family: inherit;
+    cursor: pointer;
+    margin: 0 0.1em;
+    white-space: nowrap;
+}
+.chat-ts-chip::before {
+    content: "\25B8";  /* small play triangle */
+    margin-right: 0.3em;
+    font-size: 0.9em;
+}
+.chat-ts-chip:hover {
+    border-color: var(--border-focus);
+}
+
+/* ------------------------------------------------------------------ */
+/* Identify Speakers modal (templates/modals/speaker-modal.html, #395) */
+/* ------------------------------------------------------------------ */
+
+.spk-modal .spk-tab {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--sp-1);
+    padding: var(--sp-2);
+    font-size: 0.75rem;
+    font-weight: 500;
+    color: var(--text-muted);
+    border-bottom: 2px solid transparent;
+    min-width: 0;
+}
+.spk-modal .spk-tab span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.spk-modal .spk-tab.is-active { color: var(--text-accent); border-bottom-color: var(--bg-button); }
+
+.spk-modal .spk-toolbar {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    padding: var(--sp-3) var(--sp-4);
+    border-bottom: var(--border-hairline) solid var(--border-primary);
+    flex-shrink: 0;
+}
+.spk-modal .spk-toolbar select { flex: 1; min-width: 0; }
+
+.spk-modal .spk-list {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    padding: var(--sp-2);
+}
+
+/* A speaker's color class sets a readable text color in both themes;
+   the dot and share bar reuse it. */
+.spk-modal .spk-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 9999px;
+    background-color: currentColor;
+    flex-shrink: 0;
+}
+
+.spk-modal .spk-row {
+    padding: var(--sp-2) var(--sp-3);
+    border-radius: var(--radius-md);
+    border: var(--border-hairline) solid transparent;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 2px;
+}
+.spk-modal .spk-row:hover { background: var(--bg-tertiary); }
+.spk-modal .spk-row.is-selected {
+    background: var(--bg-tertiary);
+    border-color: var(--border-accent, var(--bg-button));
+}
+.spk-modal .spk-row.is-minor { margin-left: var(--sp-3); }
+
+.spk-modal .spk-row-head { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; }
+.spk-modal .spk-label {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.spk-modal .spk-repeat { font-size: 9px; padding: 1px 6px; }
+.spk-modal .spk-me {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    cursor: pointer;
+    flex-shrink: 0;
+}
+
+.spk-modal .spk-row-stats { display: flex; align-items: center; gap: var(--sp-2); min-height: 24px; }
+.spk-modal .spk-share {
+    flex: 1;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--bg-tertiary);
+    overflow: hidden;
+    display: block;
+}
+.spk-modal .spk-row.is-selected .spk-share,
+.spk-modal .spk-row:hover .spk-share { background: var(--bg-secondary); }
+.spk-modal .spk-share > span {
+    display: block;
+    height: 100%;
+    background-color: currentColor;
+    border-radius: 2px;
+}
+
+.spk-modal .spk-name { cursor: default; display: flex; flex-direction: column; gap: 4px; }
+.spk-modal .spk-voice-pill {
+    position: absolute;
+    right: 4px;
+    top: 50%;
+    transform: translateY(-50%);
+    height: 20px;
+    padding: 0 8px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 10px;
+    border-radius: 4px;
+    background: var(--bg-button);
+    color: var(--text-button);
+}
+.spk-modal .spk-voice-pill:hover { background: var(--bg-button-hover, var(--bg-button)); }
+
+.spk-modal .spk-options {
+    list-style: none;
+    margin: 0;
+    padding: var(--sp-1);
+    border: var(--border-hairline) solid var(--border-primary);
+    border-radius: var(--radius-md);
+    background: var(--bg-secondary);
+    max-height: 220px;
+    overflow-y: auto;
+}
+.spk-modal .spk-option {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    padding: 6px var(--sp-2);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    font-size: 0.8125rem;
+}
+.spk-modal .spk-option i { width: 12px; font-size: 10px; color: var(--text-muted); }
+.spk-modal .spk-option-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-primary); }
+.spk-modal .spk-option:hover,
+.spk-modal .spk-option.is-active { background: var(--bg-accent); }
+.spk-modal .spk-option.is-taken .spk-option-name { color: var(--text-muted); }
+
+.spk-modal .spk-spelling { display: flex; align-items: center; gap: var(--sp-2); }
+.spk-modal .spk-merge { width: 100%; }
+
+.spk-modal .spk-minor-header {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: var(--sp-2) var(--sp-3);
+    margin: var(--sp-2) 0 2px;
+    border-top: var(--border-hairline) solid var(--border-primary);
+}
+.spk-modal .spk-minor-toggle {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 2px var(--sp-2);
+    text-align: left;
+    color: var(--text-primary);
+}
+.spk-modal .spk-minor-toggle i { font-size: 10px; width: 10px; color: var(--text-muted); }
+
+.spk-modal .spk-add { margin-top: var(--sp-3); }
+
+.spk-modal .spk-right { padding: var(--sp-4); gap: var(--sp-3); }
+
+.spk-modal .spk-player { display: flex; align-items: center; gap: var(--sp-2); }
+.spk-modal .spk-play {
+    width: 32px;
+    height: 32px;
+    border-radius: 9999px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg-button);
+    color: var(--text-button);
+    flex-shrink: 0;
+}
+.spk-modal .spk-play:hover { background: var(--bg-button-hover, var(--bg-button)); }
+.spk-modal .spk-time {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    white-space: nowrap;
+}
+.spk-modal .spk-seek {
+    flex: 1;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--bg-tertiary);
+    cursor: pointer;
+    overflow: hidden;
+}
+.spk-modal .spk-seek > div { height: 100%; background: var(--bg-button); border-radius: 3px; }
+.spk-modal .spk-volume { width: 72px; accent-color: var(--bg-button); }
+.spk-modal .spk-video { max-height: 30vh; object-fit: contain; background: #000; }
+
+.spk-modal .spk-filter {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    min-height: 36px;
+    padding: var(--sp-1) var(--sp-3);
+    border-radius: var(--radius-md);
+    background: var(--bg-tertiary);
+    flex-shrink: 0;
+    min-width: 0;
+}
+.spk-modal .spk-filter-actions { margin-left: auto; display: flex; align-items: center; gap: var(--sp-1); flex-shrink: 0; }
+
+.spk-modal .spk-seg {
+    display: grid;
+    grid-template-columns: auto minmax(0, 7rem) minmax(0, 1fr) auto;
+    align-items: start;
+    column-gap: var(--sp-2);
+    margin-bottom: 2px;
+    padding: 6px var(--sp-2);
+    border-radius: var(--radius-sm);
+}
+.spk-modal .spk-seg:hover { background: var(--bg-tertiary); }
+.spk-modal .spk-seg.is-playing { background: var(--bg-accent); }
+.spk-modal .spk-seg.is-dimmed { opacity: 0.45; }
+.spk-modal .spk-seg-time {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.6875rem;
+    color: var(--text-muted);
+    padding-top: 2px;
+    font-variant-numeric: tabular-nums;
+}
+.spk-modal .spk-seg-time:hover { color: var(--text-accent); }
+.spk-modal .spk-seg-speaker {
+    justify-self: start;
+    max-width: 100%;
+    font-size: 0.75rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.spk-modal .spk-seg-text {
+    font-size: 0.875rem;
+    line-height: 1.55;
+    color: var(--text-primary);
+    cursor: pointer;
+}
+.spk-modal .spk-seg-actions { display: flex; gap: 2px; }
+.spk-modal .spk-seg-reassign { grid-column: 2 / -1; margin-top: var(--sp-1); max-width: 18rem; }
+
+@media (hover: hover) and (min-width: 640px) {
+    .spk-modal .spk-seg-actions { opacity: 0; transition: opacity 0.15s; }
+    .spk-modal .spk-seg:hover .spk-seg-actions,
+    .spk-modal .spk-seg:focus-within .spk-seg-actions { opacity: 1; }
+}
+
+@media (max-width: 639px) {
+    .spk-modal .spk-seg { grid-template-columns: auto minmax(0, 1fr) auto; }
+    .spk-modal .spk-seg-speaker { grid-column: 2; grid-row: 1; }
+    .spk-modal .spk-seg-text { grid-column: 1 / -1; }
+    .spk-modal .spk-seg-actions { grid-column: 3; grid-row: 1; }
+    .spk-modal .spk-right { padding: var(--sp-3); }
+}
+
+
+/* Right-to-left text (#414). Each paragraph takes its direction from its
+   first letter, so Arabic, Hebrew, Persian or Urdu aligns right inside the
+   left-to-right interface, and a transcript or summary that switches
+   language changes direction line by line. No language setting is needed. */
+.speaker-text,
+.speaker-bubble-content,
+.transcript-segment,
+.spk-seg-text,
+.bidi-auto,
+:is(.prose-flush, .prose, .summary-box, .notes-box, .notes-preview, .bidi-auto) :is(p, li, h1, h2, h3, h4, h5, h6, blockquote, td, th, dt, dd) {
+    unicode-bidi: plaintext;
+    text-align: start;
+}
+
+/* Header usage meters (#413): with both the token budget and a storage
+   quota, the two sit one above the other, compact. */
+.usage-meters--stacked .usage-meter { padding-top: 0; padding-bottom: 0; font-size: 10px; line-height: 1.2; gap: 0.3rem; }
+.usage-meters--stacked .usage-meter span { min-width: 2.2rem; text-align: right; font-variant-numeric: tabular-nums; }
+.usage-meters--stacked .usage-meter > div { height: 3px; }
+
+/* Find and replace bar of the transcript editors (#440) */
+.find-replace-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--sp-2);
+    padding: var(--sp-2) var(--sp-4);
+    border-bottom: var(--border-hairline) solid var(--border-primary);
+    background: var(--bg-secondary);
+    flex-shrink: 0;
+}
+.find-replace-bar__fields {
+    display: flex;
+    flex: 1 1 22rem;
+    gap: var(--sp-2);
+    min-width: 0;
+}
+.find-replace-bar__field {
+    position: relative;
+    flex: 1 1 0;
+    min-width: 0;
+}
+.find-replace-bar__field .field {
+    padding-left: 1.75rem;
+    padding-right: 4.5rem;
+}
+.find-replace-bar__icon {
+    position: absolute;
+    left: 0.6rem;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    pointer-events: none;
+}
+.find-replace-bar__count {
+    position: absolute;
+    right: 0.6rem;
+    top: 50%;
+    transform: translateY(-50%);
+    pointer-events: none;
+    white-space: nowrap;
+}
+.find-replace-bar__replace {
+    flex: 1 1 0;
+    min-width: 0;
+}
+.find-replace-bar__actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--sp-1);
+}
+.find-replace-toggle[aria-pressed="true"] {
+    background: var(--bg-accent);
+    color: var(--text-accent);
 }

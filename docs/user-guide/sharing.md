@@ -27,7 +27,7 @@ Your Speakr administrator must enable internal sharing before this feature becom
 
 When viewing any recording you own, look for the blue users icon button in the toolbar. Clicking this opens the share modal where you can search for colleagues and configure access permissions.
 
-The search functionality makes finding the right person quick and intuitive. Type at least two characters of a username to see matching results. The system filters out your own name since you can't share recordings with yourself, and shows only other users in your instance.
+Type at least two characters of a username or email address to search. Up to ten matching people are listed. People who already have access to the recording are left out, and so is your own account. When usernames are hidden on your instance, you type the exact username instead.
 
 Before sharing, consider what level of access makes sense for this collaboration. Speakr offers three permission levels that build on each other, letting you grant exactly the access needed without oversharing control.
 
@@ -37,11 +37,15 @@ Before sharing, consider what level of access makes sense for this collaboration
 
 **Re-share Permissions** grant the highest level of access short of full ownership. Recipients can do everything editors can do, plus share the recording with additional users and manage those shares by revoking access. This creates a chain of trust where you empower certain colleagues to extend access as needed. However, even with re-share permissions, recipients cannot delete the recording - only the original owner can do that.
 
-To share with view-only access, simply search for the user and click their name in the results. For edit or re-share permissions, check the appropriate boxes before clicking the username. The share takes effect immediately, and the recipient gains access to the recording in their main interface.
+Click a person in the results to select them. Up to 25 people can be selected at a time, and the selected names appear under the search box; the x beside a name removes it from the selection. Check **Allow editing** or **Allow re-sharing** as needed, then click **Share with selected**. Everyone selected receives the same permissions, and nobody is shared with until that button is clicked. The checkboxes keep their state until the share window is closed, so a second group of people can be added with the same permissions. A person who already has access keeps their current permissions. The share takes effect immediately, and the recipient gains access to the recording in their main interface.
+
+When usernames are hidden, type one exact username and click **Add**.
 
 ### Managing Your Shares
 
 The unified share modal shows everyone who has access to a recording, making it easy to track and control sharing. Each entry displays the recipient's name, their permissions level, and when you granted access. The red user-times icon lets you instantly revoke access when collaboration ends or circumstances change.
+
+To change a person's permissions, click **Change permissions** (the user-gear icon) beside their name, check or clear **Allow editing** and **Allow re-sharing**, and click **Save**. The colored labels (Edit, Reshare, View) show the current permissions and are not buttons. The recording stays in the recipient's list with their personal notes. You can turn on a permission only if you hold it yourself, and only for shares you made. Turning off re-sharing does not remove the shares that person has already made; revoke their access to remove those. Shares made through a group tag or group folder follow the group and cannot be changed here.
 
 Revoking access is immediate and thorough. When you revoke someone's access, they lose the ability to view the recording, and any personal notes they created on the shared recording are removed. This ensures complete separation when collaboration ends.
 
@@ -154,9 +158,13 @@ The "Share Notes" option controls whether your personal notes are visible. These
 
 Once you've selected your options, click "Create Share Link" to generate the secure URL. The link appears immediately in the modal, ready to copy to your clipboard. This link is permanent until you explicitly revoke it, so recipients can bookmark it for future reference.
 
+### Share Links from Other Tools
+
+Integrations can create, list and revoke share links through the API (see [Share Links](api-reference.md#share-links)) with a token that has the `share` scope. A link created there shares the summary only unless notes are asked for, can expire after a number of days, and an existing link keeps its settings unless the request asks to change them.
+
 ## What Recipients Experience
 
-![Shared Recording View](../assets/images/screenshots/Share link.png)
+![Shared Recording View](../assets/images/screenshots/share-link.png)
 
 When someone clicks your share link, they're taken to a streamlined view of your recording designed for easy consumption without distractions. The interface is clean and professional, branded with Speakr but showing only the content you've chosen to share.
 
@@ -170,11 +178,11 @@ At the bottom of the page, recipients see a subtle footer indicating the content
 
 ## Managing Your Shared Recordings
 
-![Shared Transcripts](../assets/images/screenshots/share-summary-view.png)
+![Shared Transcripts](../assets/images/screenshots/settings-shared-transcripts.png)
 
 All your shared recordings are centrally managed through the Shared Transcripts section in your account settings. This gives you a complete overview of everything you've shared and with whom.
 
-The shared transcripts list shows each recording you've shared, when you created the share link, and what options you selected (summary and/or notes). Each entry includes the full share URL that you can copy again if needed - perhaps you've lost the original link or need to reshare with additional people.
+The list has three sections: your public links, the recordings you have shared with other users and groups, and the recordings shared with you. See [Shared Transcripts Tab](settings.md#shared-transcripts-tab). For public links, it shows each recording you've shared, when you created the share link, and what options you selected (summary and/or notes). Each entry includes the full share URL that you can copy again if needed - perhaps you've lost the original link or need to reshare with additional people.
 
 You can modify what's included in a share by toggling the summary and notes checkboxes directly in this interface. These changes take effect immediately for anyone accessing the link. This is useful when you initially share just the transcription but later decide to include the summary, or when you want to remove notes that are no longer relevant.
 
